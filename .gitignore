@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Local config, state, and generated data
+config.toml
+*.local.toml
+outputs/
+work/
+downloads/
+download-archive.txt
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Test and tool caches
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local agent/session metadata
+.agents/
+.codex/
+
+# OS/editor noise
+.DS_Store
+*~
