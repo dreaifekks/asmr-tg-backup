@@ -81,6 +81,7 @@ Commands:
 /sub add [live|channel] <@handle|channel_id> [name]
 /sub del <id>
 /sub list
+/source_filter [regex|off|reset]
 /stats
 /start
 /help
@@ -91,6 +92,8 @@ Examples:
 ```text
 /sub add @nightmare
 /sub add channel @nightmare Nightmare
+/source_filter "ASMR|sleep"
+/source_filter reset
 /sub del live@nightmare
 ```
 
@@ -101,6 +104,12 @@ yt-dlp --print "%(channel_id)s" "https://www.youtube.com/@handle"
 ```
 
 and stores the resolved `UC...` id for official feed polling.
+
+Source filtering applies before polling feeds. The default is `/ASMR/i`, so only
+sources whose feed id or name matches `ASMR` case-insensitively are polled until
+the bot changes it. Use `/source_filter <regex>` to set a case-insensitive
+regular expression, `/source_filter off` to poll every source, or
+`/source_filter reset` to restore `/ASMR/i`.
 
 Telegram captions are generated as:
 

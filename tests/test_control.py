@@ -6,6 +6,7 @@ from unittest import mock
 
 from ytb_tg_backup.config import load_config
 from ytb_tg_backup.control import ControlBot
+from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
 from ytb_tg_backup.store import Store
 
 
@@ -70,7 +71,44 @@ default_routes = ["live"]
             help_text = bot._execute("/help", message)
             self.assertIn("/sub add", help_text)
             self.assertIn("Default route is live", help_text)
+            self.assertIn("Default source filter is /ASMR/i", help_text)
             self.assertIn("Push caption", help_text)
+
+    def test_source_filter_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[control]
+enabled = true
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            message = {"from": {"id": 123}, "chat": {"id": -100}}
+
+            self.assertIn("source_filter=/ASMR/i", bot._execute("/source_filter", message))
+
+            reply = bot._execute('/source_filter "ASMR|sleep"', message)
+            self.assertIn("source_filter=/ASMR|sleep/i", reply)
+            self.assertEqual(store.get_bot_state(SOURCE_FILTER_STATE_KEY), "ASMR|sleep")
+
+            invalid = bot._execute('/source_filter "["', message)
+            self.assertIn("error: invalid source regex", invalid)
+            self.assertEqual(store.get_bot_state(SOURCE_FILTER_STATE_KEY), "ASMR|sleep")
+
+            off = bot._execute("/sub filter off", message)
+            self.assertIn("source_filter=off", off)
+            self.assertEqual(store.get_bot_state(SOURCE_FILTER_STATE_KEY), "")
+
+            reset = bot._execute("/filter reset", message)
+            self.assertIn("source_filter=/ASMR/i", reset)
+            self.assertEqual(store.get_bot_state(SOURCE_FILTER_STATE_KEY), "ASMR")
 
     def test_empty_allowlists_deny_all(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -8,6 +8,12 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from .config import Config
+from .source_filter import (
+    DEFAULT_SOURCE_FILTER_PATTERN,
+    SOURCE_FILTER_STATE_KEY,
+    compile_source_filter,
+    format_source_filter,
+)
 from .store import Store
 from .youtube import resolve_channel_id
 
@@ -49,6 +55,7 @@ class ControlBot:
                     {"command": "start", "description": "Show help"},
                     {"command": "help", "description": "Show help"},
                     {"command": "sub", "description": "Manage subscriptions"},
+                    {"command": "source_filter", "description": "Filter sources by regex"},
                     {"command": "stats", "description": "Show backup counts"},
                 ]
             },
@@ -88,6 +95,8 @@ class ControlBot:
             return self._sub_del(args)
         if command in {"/sub_list", "/list"}:
             return self._sub_list()
+        if command in {"/source_filter", "/filter"}:
+            return self._source_filter(args)
         if command in {"/stats", "/count"}:
             return self._stats()
         return self._help()
@@ -103,6 +112,8 @@ class ControlBot:
             return self._sub_del(rest)
         if action in {"list", "ls"}:
             return self._sub_list()
+        if action in {"filter", "source_filter"}:
+            return self._source_filter(rest)
         return self._help()
 
     def _sub_add_short(self, args: list[str], message: dict[str, Any]) -> str:
@@ -177,7 +188,7 @@ class ControlBot:
         return f"not found: {sub_id}"
 
     def _sub_list(self) -> str:
-        lines = ["subscriptions:"]
+        lines = [f"source_filter={format_source_filter(self._source_filter_pattern())}", "subscriptions:"]
         static_channels = [channel for channel in self.config.channels if channel.enabled]
         for channel in static_channels:
             lines.append(
@@ -186,9 +197,45 @@ class ControlBot:
         for sub in self.store.list_subscriptions():
             state = "on" if sub.enabled else "off"
             lines.append(f"- {sub.id} [db:{state}] {sub.name} {sub.channel_id} routes={','.join(sub.routes)}")
-        if len(lines) == 1:
+        if len(lines) == 2:
             lines.append("(none)")
         return "\n".join(lines)
+
+    def _source_filter(self, args: list[str]) -> str:
+        if not args or args[0].lower() in {"status", "show"}:
+            return "\n".join(
+                [
+                    f"source_filter={format_source_filter(self._source_filter_pattern())}",
+                    "usage: /source_filter <regex|off|reset>",
+                    "matching is regex-based and case-insensitive",
+                ]
+            )
+
+        action = args[0].lower()
+        if action in {"off", "disable", "disabled", "none", "all", "clear"}:
+            self.store.set_bot_state(SOURCE_FILTER_STATE_KEY, "")
+            return "source_filter=off; all sources enabled"
+        if action in {"reset", "default"}:
+            self.store.set_bot_state(SOURCE_FILTER_STATE_KEY, DEFAULT_SOURCE_FILTER_PATTERN)
+            return f"source_filter={format_source_filter(DEFAULT_SOURCE_FILTER_PATTERN)}"
+        if action == "set":
+            args = args[1:]
+            if not args:
+                return "usage: /source_filter set <regex>"
+
+        pattern = " ".join(args)
+        try:
+            compile_source_filter(pattern)
+        except ValueError as exc:
+            return f"error: {exc}"
+        self.store.set_bot_state(SOURCE_FILTER_STATE_KEY, pattern)
+        return f"source_filter={format_source_filter(pattern)}"
+
+    def _source_filter_pattern(self) -> str | None:
+        pattern = self.store.get_bot_state(SOURCE_FILTER_STATE_KEY)
+        if pattern is None:
+            return DEFAULT_SOURCE_FILTER_PATTERN
+        return pattern or None
 
     def _stats(self) -> str:
         summary = self.store.backup_summary()
@@ -221,9 +268,11 @@ class ControlBot:
                 "Manage:",
                 "/sub del <id>",
                 "/sub list",
+                "/source_filter <regex|off|reset>",
                 "/stats",
                 "",
                 "Default route is live. IDs are generated like live@handle or channel@handle.",
+                "Default source filter is /ASMR/i. Matching is regex-based and case-insensitive.",
                 "Push caption: title, YouTube URL, then #tag.",
             ]
         )

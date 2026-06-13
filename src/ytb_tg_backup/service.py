@@ -12,6 +12,14 @@ from .config import ChannelConfig, Config, expand_channel_feeds
 from .control import ControlBot
 from .downloader import Downloader, WAIT_LIVE_STATUSES
 from .feed import fetch_feed, parse_feed
+from .source_filter import (
+    DEFAULT_SOURCE_FILTER_PATTERN,
+    SOURCE_FILTER_STATE_KEY,
+    compile_source_filter,
+    entry_matches_source_filter,
+    format_source_filter,
+    row_matches_source_filter,
+)
 from .store import Store
 from .telegram import TelegramUploader, TelegramUploadError
 
@@ -60,6 +68,13 @@ class BackupService:
 
     def poll_once(self, *, process: bool) -> None:
         self.initialize()
+        source_filter_pattern = self._source_filter_pattern()
+        try:
+            source_filter = compile_source_filter(source_filter_pattern)
+        except ValueError as exc:
+            self.logger.warning("%s; falling back to %s", exc, format_source_filter(DEFAULT_SOURCE_FILTER_PATTERN))
+            source_filter_pattern = DEFAULT_SOURCE_FILTER_PATTERN
+            source_filter = compile_source_filter(source_filter_pattern)
         for feed in self._all_feeds():
             if not feed.enabled:
                 self.logger.debug("feed disabled id=%s", feed.id)
@@ -79,10 +94,20 @@ class BackupService:
             feed_seeded = self.store.has_entries_for_feed(feed.id)
             new_count = 0
             ignored_seed_count = 0
-            for index, entry in enumerate(entries):
+            filtered_count = 0
+            matching_index = 0
+            for entry in entries:
+                if not entry_matches_source_filter(entry, source_filter):
+                    filtered_count += 1
+                    self.store.upsert_entry(
+                        entry,
+                        status="ignored",
+                        last_error=f"source filter ignored: {format_source_filter(source_filter_pattern)}",
+                    )
+                    continue
                 status = "seen"
                 last_error = None
-                if not feed_seeded and index > 0:
+                if not feed_seeded and matching_index > 0:
                     status = "ignored"
                     last_error = "initial feed seed ignored; kept latest entry only"
                 if self.store.upsert_entry(entry, status=status, last_error=last_error):
@@ -90,12 +115,14 @@ class BackupService:
                         ignored_seed_count += 1
                     else:
                         new_count += 1
+                matching_index += 1
             self.logger.info(
-                "feed id=%s entries=%d new=%d ignored_seed=%d",
+                "feed id=%s entries=%d new=%d ignored_seed=%d filtered=%d",
                 feed.id,
                 len(entries),
                 new_count,
                 ignored_seed_count,
+                filtered_count,
             )
 
         if process:
@@ -103,12 +130,30 @@ class BackupService:
 
     def process_pending(self) -> None:
         self._log_startup_warnings()
+        source_filter_pattern = self._source_filter_pattern()
+        try:
+            source_filter = compile_source_filter(source_filter_pattern)
+        except ValueError as exc:
+            self.logger.warning("%s; falling back to %s", exc, format_source_filter(DEFAULT_SOURCE_FILTER_PATTERN))
+            source_filter_pattern = DEFAULT_SOURCE_FILTER_PATTERN
+            source_filter = compile_source_filter(source_filter_pattern)
         rows = self.store.list_pending(
             limit=self.config.app.max_items_per_poll,
             max_attempts=self.config.app.max_attempts,
             include_downloaded=self.config.telegram.enabled,
         )
         for row in rows:
+            if not row_matches_source_filter(row, source_filter):
+                video_id = str(row["video_id"])
+                reason = f"source filter ignored: {format_source_filter(source_filter_pattern)}"
+                self.logger.info(
+                    "pending video filtered out video_id=%s feed_id=%s source_filter=%s",
+                    video_id,
+                    row["feed_id"],
+                    format_source_filter(source_filter_pattern),
+                )
+                self.store.mark_ignored(video_id, reason)
+                continue
             self._process_row(row)
 
     def _process_row(self, row: sqlite3.Row) -> None:
@@ -215,3 +260,9 @@ class BackupService:
         ]
         feeds.extend(expand_channel_feeds(self.config.rsshub, dynamic_channels, prefix="db:"))
         return feeds
+
+    def _source_filter_pattern(self) -> str | None:
+        pattern = self.store.get_bot_state(SOURCE_FILTER_STATE_KEY)
+        if pattern is None:
+            return DEFAULT_SOURCE_FILTER_PATTERN
+        return pattern or None

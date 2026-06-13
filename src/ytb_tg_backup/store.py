@@ -253,6 +253,13 @@ class Store:
         )
         self.conn.commit()
 
+    def mark_ignored(self, video_id: str, reason: str) -> None:
+        self.conn.execute(
+            "UPDATE videos SET status = 'ignored', last_error = ?, next_retry_at = NULL WHERE video_id = ?",
+            (reason, video_id),
+        )
+        self.conn.commit()
+
     def mark_downloaded(self, video_id: str, file_path: Path, file_size: int) -> None:
         self.conn.execute(
             """
@@ -312,17 +319,24 @@ class Store:
         }
 
     def get_bot_offset(self) -> int:
-        row = self.conn.execute("SELECT value FROM bot_state WHERE key = 'last_update_id'").fetchone()
-        return int(row["value"]) if row else 0
+        value = self.get_bot_state("last_update_id")
+        return int(value) if value is not None else 0
 
     def set_bot_offset(self, update_id: int) -> None:
+        self.set_bot_state("last_update_id", str(update_id))
+
+    def get_bot_state(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_bot_state(self, key: str, value: str) -> None:
         self.conn.execute(
             """
             INSERT INTO bot_state(key, value)
-            VALUES ('last_update_id', ?)
+            VALUES (?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """,
-            (str(update_id),),
+            (key, value),
         )
         self.conn.commit()
 
