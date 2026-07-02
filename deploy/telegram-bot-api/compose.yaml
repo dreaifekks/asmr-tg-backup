@@ -11,7 +11,7 @@ services:
       TELEGRAM_LOCAL: "1"
       TELEGRAM_STAT: "1"
     ports:
-      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:${TELEGRAM_BOT_API_PORT:-18081}:8081"
       - "127.0.0.1:8082:8082"
     volumes:
       - telegram-bot-api-data:/var/lib/telegram-bot-api

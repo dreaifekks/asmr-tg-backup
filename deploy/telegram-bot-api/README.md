@@ -5,7 +5,7 @@ Reusable Docker Compose service for a local Telegram Bot API endpoint.
 It is intended to be shared by local services on the same host. The compose file
 binds the API and stats ports to `127.0.0.1` only:
 
-- Bot API: `http://127.0.0.1:8081`
+- Bot API: `http://127.0.0.1:18081`
 - Stats: `http://127.0.0.1:8082`
 
 Do not expose the stats port outside localhost; it can include bot details.
@@ -37,14 +37,14 @@ curl -sS http://127.0.0.1:8082
 Point Bot API clients at:
 
 ```text
-http://127.0.0.1:8081
+http://127.0.0.1:18081
 ```
 
 For `ytb-tg-backup`, set:
 
 ```toml
 [telegram]
-api_base = "http://127.0.0.1:8081"
+api_base = "http://127.0.0.1:18081"
 max_upload_bytes = 1990000000
 ```
 

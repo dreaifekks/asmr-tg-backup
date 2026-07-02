@@ -86,5 +86,5 @@ Tests should mock network calls, Telegram API calls, and subprocess calls to `yt
 - Do not commit `.venv/`, `__pycache__/`, `*.egg-info/`, `config.toml`, `outputs/`, `work/`, SQLite files, downloads, or archives.
 - Do not run commands that contact YouTube, Telegram, or download media unless the user asked for live operations.
 - The systemd unit expects the repo at `~/dev/ytb-tg-backup` and config at `~/.config/ytb-tg-backup/config.toml`.
-- The local Telegram Bot API compose service lives in `deploy/telegram-bot-api`; set `telegram.api_base = "http://127.0.0.1:8081"` when using it.
+- The local Telegram Bot API compose service lives in `deploy/telegram-bot-api`; set `telegram.api_base = "http://127.0.0.1:18081"` when using it.
 - If `git status` says this is not a repository while an empty `.git/` directory exists, inspect `.git/`; initialize or replace it only after the user agrees to that repository operation.
