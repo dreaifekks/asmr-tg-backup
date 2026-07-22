@@ -1,5 +1,5 @@
 [Unit]
-Description=YouTube to Telegram backup worker
+Description=Public media archive and Telegram delivery worker
 After=network-online.target
 Wants=network-online.target
 
@@ -9,7 +9,18 @@ WorkingDirectory=%h/dev/ytb-tg-backup
 ExecStart=%h/dev/ytb-tg-backup/.venv/bin/python -m ytb_tg_backup run --config %h/.config/ytb-tg-backup/config.toml
 Restart=always
 RestartSec=10
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=30s
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-%h/.config/ytb-tg-backup/env
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=default.target

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ytb-tg-backup"
-version = "0.1.0"
-description = "Poll YouTube official channel feeds, archive videos with yt-dlp, and optionally upload them to Telegram."
+version = "0.2.0"
+description = "Discover public media from provider-backed origins, archive it with yt-dlp, and optionally deliver it to Telegram."
 license = {file = "LICENSE"}
 requires-python = ">=3.11"
 dependencies = []

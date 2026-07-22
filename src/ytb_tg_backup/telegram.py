@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -11,7 +12,9 @@ from .config import TelegramConfig
 
 
 class TelegramUploadError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, uncertain: bool = False):
+        super().__init__(message)
+        self.uncertain = uncertain
 
 
 class TelegramUploader:
@@ -49,33 +52,34 @@ class TelegramUploader:
         endpoint = f"{self.config.api_base.rstrip('/')}/bot{self.config.bot_token}/{method}"
         caption = self._caption(title=title, url=url, feed_name=feed_name, video_id=video_id)
         upload_filename = _upload_filename(file_path=file_path, title=title, video_id=video_id)
+        upload_timeout_seconds = int(getattr(self.config, "upload_timeout_seconds", 7200))
 
         with tempfile.TemporaryDirectory(prefix="ytb-tg-upload-") as tmp:
-            safe_path = Path(tmp) / f"{video_id}{file_path.suffix.lower()}"
-            try:
-                safe_path.hardlink_to(file_path)
-            except OSError:
-                shutil.copy2(file_path, safe_path)
+            safe_id = _safe_path_component(video_id)
+            safe_path = Path(tmp) / f"{safe_id}{file_path.suffix.lower()}"
+            upload_path = _safe_upload_path(file_path, safe_path)
             safe_thumbnail_path = None
             if thumbnail_path is not None and thumbnail_path.exists() and method in {"sendAudio", "sendDocument", "sendVideo"}:
-                safe_thumbnail_path = Path(tmp) / f"{video_id}.thumb.jpg"
-                try:
-                    safe_thumbnail_path.hardlink_to(thumbnail_path)
-                except OSError:
-                    shutil.copy2(thumbnail_path, safe_thumbnail_path)
+                safe_thumbnail_path = _safe_upload_path(
+                    thumbnail_path,
+                    Path(tmp) / f"{safe_id}.thumb.jpg",
+                )
 
             cmd = [
                 "curl",
+                "--config",
+                "-",
                 "--fail-with-body",
                 "--silent",
                 "--show-error",
                 "--request",
                 "POST",
-                endpoint,
+                "--write-out",
+                "\n%{http_code}",
                 "--form-string",
                 f"chat_id={self.config.chat_id}",
                 "-F",
-                f"{file_field}=@{safe_path};filename={upload_filename}",
+                f"{file_field}=@{upload_path};filename={upload_filename}",
             ]
             if safe_thumbnail_path is not None:
                 cmd.extend(["-F", f"thumbnail=@{safe_thumbnail_path};filename=thumbnail.jpg"])
@@ -84,14 +88,50 @@ class TelegramUploader:
             if method == "sendVideo":
                 cmd.extend(["--form-string", "supports_streaming=true"])
 
-            completed = subprocess.run(cmd, check=True, text=True, capture_output=True)
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    input=_curl_stdin_config(endpoint),
+                    timeout=upload_timeout_seconds,
+                )
+            except subprocess.TimeoutExpired:
+                raise TelegramUploadError(
+                    f"Telegram upload timed out after {upload_timeout_seconds} seconds",
+                    uncertain=True,
+                ) from None
+            except subprocess.CalledProcessError as exc:
+                response_body, http_status = _split_curl_output(exc.stdout or exc.output or "")
+                detail = _redact_bot_token(exc.stderr or response_body, self.config.bot_token)
+                suffix = f": {detail[:500]}" if detail else ""
+                ambiguous_http = http_status == 408 or (http_status is not None and http_status >= 500)
+                raise TelegramUploadError(
+                    f"Telegram upload command failed with exit code {exc.returncode}{suffix}",
+                    uncertain=ambiguous_http or exc.returncode not in {3, 5, 6, 7, 22, 60, 77},
+                ) from None
+        response_body, _ = _split_curl_output(completed.stdout)
         try:
-            payload = json.loads(completed.stdout)
+            payload = json.loads(response_body)
         except json.JSONDecodeError as exc:
-            raise TelegramUploadError(f"Telegram returned non-JSON response: {completed.stdout[:200]}") from exc
+            response = _redact_bot_token(response_body[:200], self.config.bot_token)
+            raise TelegramUploadError(
+                f"Telegram returned non-JSON response: {response}",
+                uncertain=True,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise TelegramUploadError("Telegram returned a non-object response", uncertain=True)
         if not payload.get("ok"):
-            raise TelegramUploadError(f"Telegram upload failed: {payload}")
-        return int(payload["result"]["message_id"])
+            error_payload = _redact_bot_token(str(payload), self.config.bot_token)
+            raise TelegramUploadError(f"Telegram upload failed: {error_payload}")
+        try:
+            return int(payload["result"]["message_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TelegramUploadError(
+                "Telegram reported success without a valid message_id",
+                uncertain=True,
+            ) from exc
 
     def _upload_target(self) -> tuple[str, str]:
         if self.config.send_as_document:
@@ -104,8 +144,16 @@ class TelegramUploader:
 
     def _caption(self, *, title: str, url: str, feed_name: str, video_id: str) -> str:
         tag = _tag_from_feed_name(feed_name)
-        body = f"{title}\n\n{url}"
-        caption = f"{body}\n\n#{tag}" if tag else body
+        try:
+            caption = self.config.caption_template.format(
+                title=title,
+                url=url,
+                feed_name=feed_name,
+                video_id=video_id,
+                tag=tag,
+            )
+        except (KeyError, ValueError) as exc:
+            raise TelegramUploadError(f"invalid telegram.caption_template: {exc}") from None
         return caption[:1024]
 
 
@@ -120,7 +168,7 @@ def _tag_from_feed_name(feed_name: str) -> str:
 
 def _upload_filename(*, file_path: Path, title: str, video_id: str) -> str:
     date = _date_from_path(file_path) or "unknown-date"
-    clean_title = _clean_filename(title) or video_id
+    clean_title = _clean_filename(title) or _clean_filename(video_id) or "media"
     suffix = file_path.suffix.lower() or ".m4a"
     return f"{date}_{clean_title}{suffix}"
 
@@ -135,3 +183,38 @@ def _clean_filename(value: str, limit: int = 120) -> str:
     cleaned = "".join(" " if char.isspace() else char for char in cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
     return cleaned[:limit].rstrip(" .")
+
+
+def _safe_upload_path(source: Path, safe_path: Path) -> Path:
+    try:
+        safe_path.hardlink_to(source)
+    except OSError:
+        try:
+            safe_path.symlink_to(source.resolve())
+        except OSError:
+            return source
+    return safe_path
+
+
+def _curl_stdin_config(endpoint: str) -> str:
+    escaped_endpoint = endpoint.replace("\\", "\\\\").replace('"', '\\"')
+    return f'url = "{escaped_endpoint}"\n'
+
+
+def _redact_bot_token(value: str, bot_token: str) -> str:
+    if not bot_token:
+        return value
+    return value.replace(bot_token, "<redacted>")
+
+
+def _safe_path_component(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}", value) and value not in {".", ".."}:
+        return value
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _split_curl_output(value: str) -> tuple[str, int | None]:
+    body, separator, status_text = value.rpartition("\n")
+    if separator and len(status_text) == 3 and status_text.isdigit():
+        return body, int(status_text)
+    return value, None

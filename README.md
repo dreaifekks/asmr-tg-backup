@@ -1,23 +1,100 @@
 # ytb-tg-backup
 
-Small background service for polling YouTube official channel feeds, downloading new videos as audio files with `yt-dlp`, and optionally uploading the archived files to a Telegram channel.
+Background service for discovering public media from provider-backed origins,
+archiving it with `yt-dlp`, and optionally delivering the archived files to
+Telegram. The built-in providers are YouTube official channel feeds, generic
+RSS feeds, and Twitch public VODs through the Helix API.
 
-The normal config shape is a YouTube channel list. Each item expands to the official YouTube Atom feed:
+YouTube members-only discovery and authentication are outside the main worker's
+public-origin path.
 
-```text
-https://www.youtube.com/feeds/videos.xml?channel_id=UC...
-```
+## Providers and origins
+
+A provider is the implementation that knows how to discover remote media. An
+origin is one configured channel, broadcaster, or feed handled by that
+provider. Media identity is namespaced by provider, content kind, and external
+ID, while `origin_items` records every origin that discovered it. This prevents
+same-looking YouTube and Twitch IDs from colliding and prevents one origin from
+overwriting another origin's association.
+
+Use `[[origins]]` for new configuration:
 
 ```toml
-[[channels]]
-id = "some-asmr-channel"
-name = "Some ASMR Channel"
-channel_id = "UC..."
-routes = ["live"]
-enabled = true
+[[origins]]
+id = "youtube-example"
+provider = "youtube"
+kind = "uploads"
+name = "Example YouTube channel"
+external_id = "UC_CHANNEL_ID"
+bootstrap = "latest"
+enabled = false
+
+[[origins]]
+id = "twitch-example"
+provider = "twitch"
+kind = "vods"
+name = "Example Twitch ASMR"
+external_id = "twitch_login_or_numeric_broadcaster_id"
+bootstrap = "latest"
+enabled = false
 ```
 
-`channel_id` must be the real `UC...` channel id for static TOML config. The control bot can accept `@handle` and resolves it to a `UC...` id with `yt-dlp` before saving. `routes` are kept as subscription intent/display labels; the official feed URL is the same for `live` and `channel`.
+Supported built-in shapes are:
+
+- `provider = "youtube"`, `kind = "uploads"`: `external_id` is a real
+  `UC...` channel ID.
+- `provider = "twitch"`, `kind = "vods"`: public archived broadcasts;
+  `external_id` may be a numeric broadcaster ID, login, or `@login`.
+- `provider = "twitch"` also understands `highlights` and `uploads` kinds.
+- `provider = "rss"`, `kind = "feed"`: `external_id` is the feed URL.
+
+RSS media URLs must use HTTP(S) and resolve only to public addresses. Set an
+origin's `allowed_media_hosts` array when the expected media hosts are known.
+`allow_private_media = true` is an explicit opt-in for trusted local feeds and
+should not be used for untrusted input.
+
+`bootstrap = "latest"` keeps only the newest matching item eligible when an
+origin is first seen. `bootstrap = "all"` allows backfill; Twitch bounds each
+poll with `[twitch].max_pages_per_poll` and refuses to advance its checkpoint if
+that bound is reached before a safe stopping point. Changing an existing origin
+from `latest` to `all` is treated as an explicit backfill request: persisted seed
+items are reactivated and that origin's discovery checkpoint is reset once.
+
+The legacy `[[channels]]` and `[[feeds]]` config forms remain accepted and are
+translated to origins at load time. The Telegram control panel manages dynamic
+YouTube and Twitch origins; the old `/sub` commands remain as YouTube-compatible
+aliases.
+
+## Twitch public VOD credentials
+
+Keep Twitch credentials out of TOML. The config contains environment variable
+names only:
+
+```toml
+[twitch]
+client_id_env = "TWITCH_CLIENT_ID"
+access_token_env = "TWITCH_ACCESS_TOKEN"
+client_secret_env = "TWITCH_CLIENT_SECRET"
+request_timeout_seconds = 30
+max_pages_per_poll = 3
+```
+
+Set `TWITCH_CLIENT_ID` and either:
+
+- `TWITCH_ACCESS_TOKEN` for an existing token, or
+- `TWITCH_CLIENT_SECRET` so the service can obtain and refresh an app access
+  token with the client-credentials flow.
+
+For an interactive shell:
+
+```bash
+export TWITCH_CLIENT_ID='<client-id>'
+export TWITCH_CLIENT_SECRET='<client-secret>'
+```
+
+For systemd, put the assignments in the mode-`0600` file
+`~/.config/ytb-tg-backup/env`. The shipped user unit loads this optional file.
+Do not commit it.
 
 ## First setup
 
@@ -26,58 +103,118 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -e .
 cp config.example.toml config.toml
+chmod 600 config.toml
 ytb-tg-backup init --config config.toml
 ytb-tg-backup poll --config config.toml --once
 ```
-
-## Development
-
-```bash
-python3 -m unittest discover -s tests
-```
-
-If the package is not installed in the active environment, run tests with:
-
-```bash
-PYTHONPATH=src python3 -m unittest discover -s tests
-```
-
-Keep real `config.toml` files out of git; they can contain Telegram bot tokens,
-chat IDs, and host-specific paths. Generated data, local state, virtualenvs, and
-Python build artifacts are covered by `.gitignore`.
 
 Required host tools:
 
 - `python3 >= 3.11`
 - `yt-dlp`
-- `curl`
+- `curl` when Telegram delivery is enabled
 
-`ffmpeg` is recommended for high-quality YouTube downloads that need separate video/audio merging. If it is not available, set `download.ffmpeg = ""` and use a single-file format such as `best[height<=720][ext=mp4]/best[height<=720]/best`.
+`ffmpeg` and `ffprobe` are recommended for audio extraction, media merging,
+upload-size reduction, and thumbnail conversion.
 
-For live streams, the default behavior is archive-after-VOD: while `yt-dlp` reports `is_live`, `is_upcoming`, or `post_live`, the item stays in `waiting_ready` and is retried later. The service does not try to record the live stream in real time.
+## State and automatic migration
 
-## Control bot
+State lives below `[app].data_dir` in `state.db`, `downloads/`, and the yt-dlp
+archive file. Schema v2 stores `origins`, `media_items`, `origin_items`, `jobs`,
+`artifacts`, and `deliveries` separately.
 
-The same Telegram bot can manage dynamic subscriptions from a restricted user/chat/topic. Dynamic subscriptions are stored in SQLite and are merged with any static `[[channels]]` in the TOML config.
+Opening an existing v1 database automatically:
 
-```toml
-[control]
-enabled = true
-poll_interval_seconds = 10
-delete_webhook_on_startup = true
-default_routes = ["live"]
-allowed_user_ids = ["123456789"]
-allowed_chat_ids = ["-1001234567890"]
-allowed_message_thread_ids = ["42"]
-```
+1. creates `state.db.bak-v1-<UTC timestamp>` before changing the schema;
+2. migrates existing videos, subscriptions, files, retries, and Telegram
+   message IDs into the v2 tables;
+3. retains the old tables as `videos_v1` and `subscriptions_v1`; and
+4. creates compatibility views named `videos` and `subscriptions`.
 
-The allowlists are OR-based: a command is allowed when the user id, chat id, or topic id matches any configured allowlist. If all three allowlists are empty, all commands are denied.
+The migration is versioned and idempotent. The backup is created with mode
+`0600`; keep it until the migrated service has been verified.
 
-The control bot uses Telegram `getUpdates`; when `delete_webhook_on_startup = true`, startup calls `deleteWebhook` with `drop_pending_updates=false` so polling can work without discarding queued updates.
+## Download and delivery jobs
 
-Commands:
+Discovery only creates or updates media and queues work. Downloading and
+Telegram delivery are separate leased jobs with independent failure counts:
 
 ```text
+origin discovery -> download job -> master artifact -> telegram_delivery job -> delivery record
+```
+
+An upload failure does not discard the master artifact or restart the download.
+`run` keeps source polling on the main thread, runs Telegram control long
+polling on its own thread, and starts `[app].worker_count` background workers.
+Workers atomically claim jobs and renew their leases while long subprocesses
+run. Expired download leases return to retry; an expired Telegram delivery
+lease becomes `uncertain` because Telegram has no idempotency key and the
+remote message may already exist.
+
+`uncertain` is deliberately not retried automatically. Inspect the destination
+and logs before changing or requeueing that job, otherwise a duplicate Telegram
+message may be sent. It is visible in `ytb-tg-backup status` and the job table.
+
+Live, upcoming, and post-live media are deferred without consuming the failure
+budget until a VOD is ready. Probe and download failures do consume the budget.
+
+Important worker and timeout settings are:
+
+```toml
+[app]
+worker_count = 1
+worker_poll_interval_seconds = 2
+job_lease_seconds = 900
+
+[download]
+probe_timeout_seconds = 180
+download_timeout_seconds = 21600
+ffmpeg_timeout_seconds = 7200
+
+[telegram]
+upload_timeout_seconds = 7200
+
+[twitch]
+request_timeout_seconds = 30
+```
+
+The lease heartbeat renews a running job periodically. Keep
+`job_lease_seconds >= 30`; external-command timeouts bound hung work independently
+of the lease.
+
+## Telegram control panel
+
+Use `/panel` (or `/start`) for the normal workflow. The bot creates one panel
+message with an inline keyboard and edits that same message while navigating:
+
+- view provider-neutral origins and their polling errors;
+- add YouTube uploads or Twitch public VOD audio origins;
+- enable, disable, or confirm deletion of bot-managed origins;
+- view media/job statistics; and
+- inspect, set, disable, or reset the global source filter.
+
+Adding a source or entering a filter requires one user text message. The bot
+stores the pending action and then returns to the existing panel message; it
+does not create a new bot response for every navigation action. Panel state is
+scoped by user, chat, and message thread and survives service restarts.
+
+Panel data is read from the materialized `panel_snapshots` row instead of
+re-running all status queries for every button press. SQLite triggers mark that
+row dirty whenever origins, discovery state, media, jobs, artifacts, deliveries,
+or the source filter change. It is rebuilt on the next panel read and maintained
+at least every 30 seconds by the control loop. The control bot uses Telegram
+long polling, so `poll_interval_seconds = 10` is the server-side long-poll
+window, not an added 0-10 second delay before handling an update.
+
+Equivalent command interfaces remain available:
+
+```text
+/panel
+/origin add youtube <@handle|channel_id> [name]
+/origin add twitch [vods|highlights|uploads] <login|user_id> [name]
+/origin list
+/origin enable|disable <origin_id>
+/origin del <origin_id>
 /sub add [live|channel] <@handle|channel_id> [name]
 /sub del <id>
 /sub list
@@ -87,59 +224,78 @@ Commands:
 /help
 ```
 
-Examples:
+Twitch credentials are never accepted from a Telegram message. A Twitch origin
+added without service credentials is saved disabled; configure the environment,
+restart the service, and enable it from the panel. Config-managed origins are
+visible but read-only in the panel. Deleting a bot-managed origin retains its
+historical media, artifacts, and delivery records.
 
-```text
-/sub add @nightmare
-/sub add channel @nightmare Nightmare
-/source_filter "ASMR|sleep"
-/source_filter reset
-/sub del live@nightmare
+Authorization is an AND across every configured dimension. An empty dimension
+is ignored, but each non-empty allowlist must match the incoming message. If all
+three allowlists are empty, all commands are denied. For example, configuring a
+user and chat requires both that user and that chat; adding a topic also requires
+the matching topic.
+
+```toml
+[control]
+enabled = true
+# Telegram getUpdates long-poll window; accepted range is 1-30 seconds.
+poll_interval_seconds = 10
+delete_webhook_on_startup = true
+default_routes = ["live"]
+allowed_user_ids = ["123456789"]
+allowed_chat_ids = ["-1001234567890"]
+allowed_message_thread_ids = ["42"]
 ```
 
-For `/sub add @handle`, the bot runs:
+Prefer at least `allowed_user_ids`; a chat-only allowlist intentionally permits
+every member of that allowed chat. The default source filter is `/ASMR/i`. Use
+`/source_filter off` to allow every source or `/source_filter reset` to restore
+the default.
+
+## Telegram delivery
+
+Uploads remain disabled until `[telegram].enabled = true` and a bot token and
+destination are configured. For large archives, use the local Telegram Bot API
+service under `deploy/telegram-bot-api` or choose a smaller download format.
+Files above `telegram.max_upload_bytes` are reduced when possible; an
+unshrinkable oversize file is blocked rather than retried forever.
+
+Caption templates may use `{title}`, `{url}`, `{feed_name}`, `{video_id}`, and
+`{tag}`. Downloaded files are stored below provider-specific directories such as
+`downloads/youtube/` and `downloads/twitch/`, with separate yt-dlp archive files
+per provider. The default Twitch profile selects the best audio stream and
+extracts it to M4A; the source video is not retained. Telegram therefore sends
+the audio master directly unless it must derive a smaller audio artifact to fit
+the configured upload limit.
+
+## Permissions and user service
+
+The service enforces mode `0700` on its data/download directories and `0600` on
+SQLite state and migration backups. Keep the real TOML config and environment
+file at `0600`. The shipped systemd unit also uses `UMask=0077` and several
+hardening options.
 
 ```bash
-yt-dlp --print "%(channel_id)s" "https://www.youtube.com/@handle"
-```
-
-and stores the resolved `UC...` id for official feed polling.
-
-Source filtering applies before polling feeds. The default is `/ASMR/i`, so only
-sources whose feed id or name matches `ASMR` case-insensitively are polled until
-the bot changes it. Use `/source_filter <regex>` to set a case-insensitive
-regular expression, `/source_filter off` to poll every source, or
-`/source_filter reset` to restore `/ASMR/i`.
-
-Telegram captions are generated as:
-
-```text
-Video title
-
-YouTube URL
-
-#tag
-```
-
-When `download.write_thumbnail = true` and `ffmpeg` is available, downloaded YouTube thumbnails are converted to Telegram-compatible JPEG cover art and uploaded with the `sendAudio` message.
-
-## Telegram upload choices
-
-The default Telegram Bot API endpoint has small upload limits. For real video archiving, either:
-
-- run a local Telegram Bot API server from `deploy/telegram-bot-api` and set `telegram.api_base`, or
-- lower `download.format` so files fit your configured `telegram.max_upload_bytes`.
-
-Uploads are disabled until `telegram.enabled = true` and a bot token/chat id are configured.
-
-## User systemd service
-
-```bash
-mkdir -p ~/.config/systemd/user
+mkdir -p ~/.config/systemd/user ~/.config/ytb-tg-backup
+chmod 700 ~/.config/ytb-tg-backup
 cp deploy/ytb-tg-backup.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now ytb-tg-backup.service
 journalctl --user -u ytb-tg-backup.service -f
 ```
 
-The service expects the repo at `~/dev/ytb-tg-backup` and config at `~/.config/ytb-tg-backup/config.toml`.
+The unit expects the repo at `~/dev/ytb-tg-backup` and config at
+`~/.config/ytb-tg-backup/config.toml`. SIGTERM stops new claims and gives worker
+threads up to 15 seconds to drain; systemd then bounds the whole control group
+with `TimeoutStopSec=30s`.
+
+## Development
+
+```bash
+PYTHONPATH=src python3 -m unittest discover -s tests
+```
+
+Tests should mock provider APIs, Telegram calls, and media subprocesses. Keep
+real `config.toml`, secrets, state databases, downloads, and migration backups
+out of git.

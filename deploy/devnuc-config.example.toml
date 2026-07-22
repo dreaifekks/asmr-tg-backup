@@ -1,22 +1,38 @@
 [app]
-data_dir = "/home/dreaife/.local/share/ytb-tg-backup"
+data_dir = "/home/your-user/.local/share/ytb-tg-backup"
 poll_interval_seconds = 1800
 download_delay_seconds = 300
 max_items_per_poll = 3
 max_attempts = 5
 retry_seconds = 1800
 live_retry_seconds = 900
+worker_count = 1
+worker_poll_interval_seconds = 2
+job_lease_seconds = 900
 log_level = "INFO"
 
-[[channels]]
-id = "asmr-placeholder"
-name = "ASMR placeholder"
-channel_id = "UC_CHANNEL_ID"
-routes = ["live"]
+[[origins]]
+id = "youtube-placeholder"
+provider = "youtube"
+kind = "uploads"
+name = "YouTube ASMR placeholder"
+external_id = "UC_CHANNEL_ID"
+bootstrap = "latest"
+enabled = false
+
+# Public Twitch VOD placeholder. Supply the credentials only through the
+# environment variables named in [twitch].
+[[origins]]
+id = "twitch-placeholder"
+provider = "twitch"
+kind = "vods"
+name = "Twitch ASMR placeholder"
+external_id = "twitch_login_or_numeric_broadcaster_id"
+bootstrap = "latest"
 enabled = false
 
 [download]
-yt_dlp = "/home/dreaife/dev/ytb-tg-backup/.venv/bin/yt-dlp"
+yt_dlp = "/home/your-user/dev/ytb-tg-backup/.venv/bin/yt-dlp"
 ffmpeg = "/usr/bin/ffmpeg"
 format = "bestaudio/best"
 merge_output_format = ""
@@ -28,7 +44,18 @@ archive_file = "download-archive.txt"
 restrict_filenames = false
 write_info_json = true
 write_thumbnail = true
+probe_timeout_seconds = 180
+download_timeout_seconds = 21600
+ffmpeg_timeout_seconds = 7200
 extra_args = []
+
+# Twitch keeps audio only; no source video master is retained.
+[download.provider_profiles.twitch]
+format = "bestaudio/best"
+merge_output_format = ""
+extract_audio = true
+audio_format = "m4a"
+audio_quality = "0"
 
 [telegram]
 enabled = false
@@ -38,13 +65,27 @@ api_base = "https://api.telegram.org"
 media_type = "audio"
 send_as_document = false
 max_upload_bytes = 52428800
+upload_timeout_seconds = 7200
 caption_template = "{title}\n\n{url}\n\n#{tag}"
+
+# Configure the user service with a mode-0600 EnvironmentFile containing
+# TWITCH_CLIENT_ID and either TWITCH_ACCESS_TOKEN or TWITCH_CLIENT_SECRET.
+[twitch]
+client_id_env = "TWITCH_CLIENT_ID"
+access_token_env = "TWITCH_ACCESS_TOKEN"
+client_secret_env = "TWITCH_CLIENT_SECRET"
+request_timeout_seconds = 30
+max_pages_per_poll = 3
 
 [control]
 enabled = false
+# Telegram getUpdates long-poll window; accepted range is 1-30 seconds.
 poll_interval_seconds = 10
 delete_webhook_on_startup = true
 default_routes = ["live"]
+# /panel is a single edited inline-keyboard message; its state survives restarts.
+# Authorization requires every configured dimension to match. Empty dimensions
+# are ignored, and an entirely empty set denies every command.
 allowed_user_ids = []
 allowed_chat_ids = []
 allowed_message_thread_ids = []

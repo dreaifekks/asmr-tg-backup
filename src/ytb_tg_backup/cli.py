@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
 
 from .config import load_config
@@ -51,7 +52,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"initialized {config.db_path}")
         return 0
     if args.command == "run":
-        service.run_forever()
+        previous_handlers: dict[signal.Signals, object] = {}
+
+        def request_stop(_signum, _frame) -> None:
+            service.stop()
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, request_stop)
+        try:
+            service.run_forever()
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
         return 0
     if args.command == "poll":
         service.poll_once(process=not args.no_process)

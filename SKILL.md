@@ -1,18 +1,22 @@
 ---
 name: ytb-tg-backup
-description: Use when working on ytb-tg-backup, a Python CLI and background worker that polls YouTube official channel Atom feeds, downloads new videos with yt-dlp, tracks state in SQLite, optionally uploads archives to Telegram, and provides a Telegram control bot for subscriptions.
+description: Use when working on ytb-tg-backup, a Python CLI and leased background worker that discovers public YouTube, RSS, and Twitch media through provider-backed origins, archives it with yt-dlp, stores provider-neutral state in SQLite, and optionally delivers artifacts to Telegram.
 ---
 
 # ytb-tg-backup
 
 ## Project Shape
 
-- Python 3.11+ package under `src/ytb_tg_backup`; console entrypoint is `ytb-tg-backup = ytb_tg_backup.cli:main`.
-- Runtime Python dependencies are intentionally empty; host tools do the external work.
-- Required host tools: `yt-dlp` for probing, downloading, and resolving `@handle` channel IDs; `curl` for Telegram uploads.
-- Recommended host tools: `ffmpeg` and `ffprobe` for audio extraction, size reduction, and thumbnail conversion.
-- Main config is `config.toml`, copied from `config.example.toml`. Treat real configs, Telegram bot tokens, chat IDs, and local paths as secrets.
-- State lives under `[app].data_dir`: `state.db`, `downloads/`, and `download-archive.txt`.
+- Python 3.11+ package under `src/ytb_tg_backup`; console entrypoint is
+  `ytb-tg-backup = ytb_tg_backup.cli:main`.
+- Runtime Python dependencies are intentionally empty. Host tools perform media
+  and Telegram work: `yt-dlp`, `curl`, and preferably `ffmpeg`/`ffprobe`.
+- Main config is `config.toml`, copied from `config.example.toml`. Never commit a
+  real config, Telegram token/chat ID, Twitch credential, or environment file.
+- State lives under `[app].data_dir`: `state.db`, provider-specific downloads,
+  and the yt-dlp archive file.
+- New source configuration uses `[[origins]]`. Legacy `[[channels]]` and
+  `[[feeds]]` are translated to origins and remain supported.
 
 ## Quick Start
 
@@ -21,11 +25,14 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -e .
 cp config.example.toml config.toml
+chmod 600 config.toml
 ytb-tg-backup init --config config.toml
 ytb-tg-backup status --config config.toml
 ```
 
-Use `ytb-tg-backup poll --config config.toml --once --no-process` to fetch feeds and enqueue items without downloading. Use `ytb-tg-backup poll --config config.toml --once` only when the user expects real YouTube probing/download work and the config is safe.
+Use `ytb-tg-backup poll --config config.toml --once --no-process` for discovery
+without running jobs. Use `poll --once` or `process` only when the user expects
+real probing, downloading, transcoding, or Telegram work.
 
 For local imports without an editable install:
 
@@ -35,56 +42,142 @@ PYTHONPATH=src python3 -m ytb_tg_backup status --config config.toml
 
 ## Test
 
-After `pip install -e .`:
-
-```bash
-python3 -m unittest discover -s tests
-```
-
-Without installing the package:
-
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-Tests should mock network calls, Telegram API calls, and subprocess calls to `yt-dlp`, `curl`, or `ffmpeg`. Use temporary `data_dir` values instead of the user's real config/state.
+Tests must mock provider APIs, Telegram API calls, and subprocess calls to
+`yt-dlp`, `curl`, or `ffmpeg`. Use temporary `data_dir` values and synthetic v1
+databases instead of the user's real state.
+
+## Provider and Origin Model
+
+- An `Origin` is one configured channel, broadcaster, or feed. `provider`
+  selects the discovery adapter and `kind` selects the remote collection.
+- Supported public adapters are YouTube official feeds, generic RSS, and Twitch
+  Helix. Twitch `kind = "vods"` maps to public archived broadcasts.
+- RSS media URLs are validated as public HTTP(S) destinations before both
+  discovery and download. Use an origin `allowed_media_hosts` list where
+  possible; private destinations require the explicit `allow_private_media`
+  opt-in.
+- A media item is unique by `(provider, content_kind, external_id)`. The
+  `origin_items` join preserves all origins that discovered it and stores
+  per-origin filtering/bootstrap decisions.
+- `bootstrap = "latest"` keeps only the newest matching item eligible on first
+  discovery; `all` permits backfill. Twitch bounds a backfill poll with
+  `[twitch].max_pages_per_poll`.
+- Public Twitch discovery reads `TWITCH_CLIENT_ID` and either
+  `TWITCH_ACCESS_TOKEN` or `TWITCH_CLIENT_SECRET` through the environment names
+  configured in `[twitch]`. Keep secret values out of TOML.
 
 ## Code Map
 
-- `src/ytb_tg_backup/cli.py`: argparse CLI commands: `init`, `run`, `poll`, `process`, `status`, and `enqueue`.
-- `src/ytb_tg_backup/config.py`: TOML loading and dataclass defaults. `[[channels]]` expand to YouTube official Atom feed URLs; `[[feeds]]` is the raw RSS escape hatch.
-- `src/ytb_tg_backup/service.py`: orchestration for feed polling, queue processing, live/VOD waiting, downloading, shrinking, thumbnail prep, Telegram upload, and control bot polling.
-- `src/ytb_tg_backup/store.py`: SQLite schema and state transitions for `videos`, `subscriptions`, and bot offset state.
-- `src/ytb_tg_backup/feed.py`: Atom/RSS parsing and YouTube video ID extraction.
-- `src/ytb_tg_backup/youtube.py`: official feed URL creation and `UC...` channel ID resolution from `@handle` or URL.
-- `src/ytb_tg_backup/downloader.py`: `yt-dlp` and `ffmpeg` subprocess integration.
-- `src/ytb_tg_backup/telegram.py`: Telegram Bot API upload via `curl`.
-- `src/ytb_tg_backup/control.py`: Telegram `getUpdates` control bot for `/sub` and `/stats`.
-- `scripts/`: one-off migration and repair utilities for configs, subscriptions, and initial seed rows.
-- `deploy/`: user systemd unit and optional local Telegram Bot API Docker Compose service.
+- `src/ytb_tg_backup/cli.py`: `init`, `run`, `poll`, `process`, `status`, and
+  YouTube-compatible manual `enqueue` commands.
+- `src/ytb_tg_backup/config.py`: TOML dataclasses, legacy config translation,
+  worker/timeout settings, origins, and Twitch environment lookup.
+- `src/ytb_tg_backup/models.py`: provider-neutral origin, media candidate,
+  discovery result, and claimed-job values.
+- `src/ytb_tg_backup/sources.py`: adapter registry plus YouTube, RSS, and Twitch
+  Helix discovery and Twitch app-token refresh.
+- `src/ytb_tg_backup/service.py`: polling scheduler, control loop, worker pool,
+  lease heartbeat, and download/delivery job handlers.
+- `src/ytb_tg_backup/store.py`: schema migrations; origins, media, jobs,
+  artifacts, deliveries; atomic job claiming; compatibility APIs/views; and
+  the trigger-invalidated `panel_snapshots` materialized panel row.
+- `src/ytb_tg_backup/feed.py`: Atom/RSS parsing and YouTube ID extraction.
+- `src/ytb_tg_backup/youtube.py`: official feed URL creation and safe channel
+  ID resolution.
+- `src/ytb_tg_backup/downloader.py`: provider-namespaced `yt-dlp` downloads and
+  bounded `yt-dlp`/`ffmpeg` subprocesses, per-provider formats, and independent
+  archive files. Twitch defaults to an M4A audio master and does not retain the
+  source video.
+- `src/ytb_tg_backup/telegram.py`: bounded Telegram upload via `curl`, with the
+  token supplied through stdin rather than the process command line.
+- `src/ytb_tg_backup/control.py`: provider-neutral `/origin` management and a
+  persistent single-message Telegram inline-keyboard panel for origins,
+  filtering, and statistics. It reads the cached panel snapshot and receives
+  updates through Telegram long polling. Legacy `/sub` remains a YouTube alias.
+- `scripts/`: one-off config/state repair utilities.
+- `deploy/`: hardened user systemd unit and optional local Telegram Bot API.
 
-## State Flow
+## State and Job Flow
 
-- Feed entries are inserted as `seen`; on a feed's first poll, only the newest entry stays `seen` and older seed entries become `ignored`.
-- Processing waits for `[app].download_delay_seconds`, probes with `yt-dlp`, and keeps live/upcoming/post-live items in `waiting_ready`.
-- A successful download becomes `downloaded`.
-- If Telegram is disabled, `downloaded` is the terminal local archive state.
-- If Telegram is enabled, upload success becomes `uploaded`; oversized unshrinkable files become `blocked`; retryable errors become `failed` with `next_retry_at`.
+```text
+origin discovery -> download job -> master artifact -> telegram_delivery job -> delivery record
+```
+
+- Download and Telegram delivery have independent job rows, failure budgets,
+  retry schedules, and lease ownership. An upload error must not re-download an
+  existing master artifact.
+- `run` leaves source polling on the main thread, starts one control long-poll
+  thread, and starts `[app].worker_count` job threads. Each thread owns its
+  SQLite connection. Job workers atomically claim either job type and renew
+  leases in a heartbeat thread.
+- Live/not-ready media is deferred without consuming the failure budget. Probe,
+  download, transcode, and definitive Telegram failures consume their own job's
+  budget.
+- An expired download lease becomes retryable. An expired or response-ambiguous
+  Telegram delivery becomes `uncertain` and is not claimed automatically,
+  because Telegram does not provide an idempotency key. Verify the destination
+  before any operator requeue.
+- Relevant settings are `[app].worker_count`,
+  `worker_poll_interval_seconds`, `job_lease_seconds`;
+  `[download].probe_timeout_seconds`, `download_timeout_seconds`,
+  `ffmpeg_timeout_seconds`; `[telegram].upload_timeout_seconds`; and
+  `[twitch].request_timeout_seconds`.
+
+## Schema Migration
+
+- `Store.initialize()` automatically detects an existing v1 `videos` or
+  `subscriptions` table before applying schema v2.
+- It first creates one `state.db.bak-v1-<UTC timestamp>` SQLite backup, migrates
+  legacy jobs/artifacts/deliveries, renames old tables to `videos_v1` and
+  `subscriptions_v1`, and creates read compatibility views.
+- Migration versions are recorded in `schema_migrations`; repeated initialize
+  calls must not create another v1 backup or duplicate rows.
+- `panel_snapshots` is an additive schema-v2 cache. Triggers mark it dirty on
+  relevant table/filter changes; control-loop maintenance refreshes it at least
+  every 30 seconds, and the panel refresh buttons force a rebuild.
+- Do not delete the backup or old tables until the migrated runtime has been
+  checked against the real database.
+
+## Control Authorization
+
+- Authorization requires every configured dimension to match: user, chat, and
+  message thread are combined with AND.
+- An empty dimension is ignored. If all three allowlists are empty, all control
+  commands are denied.
+- Prefer `allowed_user_ids`. A chat-only configuration intentionally authorizes
+  every member of that allowed chat.
+- Preserve this behavior in `tests/test_control.py`; do not restore the former
+  OR semantics.
 
 ## Change Checklist
 
-- Config changes: update dataclasses in `config.py`, `load_config`, `config.example.toml`, README/SKILL docs when user-facing, and `tests/test_config.py`.
-- CLI changes: update `cli.py`, README examples, and add or adjust tests.
-- Feed parsing changes: update `feed.py` and `tests/test_feed.py`.
-- Download/subprocess changes: update `downloader.py` and mock subprocesses in tests.
-- Telegram upload changes: update `telegram.py` and `tests/test_telegram.py`.
-- Control bot changes: update `control.py` and `tests/test_control.py`; preserve allowlist behavior where user/chat/topic allowlists are OR-based and empty allowlists deny all commands.
-- Store/schema changes: update `store.py`, add migration or compatibility handling when existing SQLite state matters, and cover the state transition in tests.
+- Config changes: update `config.py`, both example TOMLs, README/SKILL, and
+  `tests/test_config.py`.
+- Adapter changes: update `models.py`/`sources.py`, mock all network paths, and
+  cover provider ID collisions plus multi-origin discovery.
+- Worker changes: preserve atomic claims, lease-token checks, heartbeat renewal,
+  independent failure budgets, and stale-delivery `uncertain` behavior.
+- Store changes: add a versioned migration and synthetic old-database tests;
+  never silently replace or discard an existing `state.db`.
+- Telegram changes: keep the bot token out of argv/errors and distinguish
+  ambiguous results from definitive failures.
+- Control changes: preserve all-configured-dimensions-must-match authorization.
 
 ## Operations Notes
 
-- Do not commit `.venv/`, `__pycache__/`, `*.egg-info/`, `config.toml`, `outputs/`, `work/`, SQLite files, downloads, or archives.
-- Do not run commands that contact YouTube, Telegram, or download media unless the user asked for live operations.
-- The systemd unit expects the repo at `~/dev/ytb-tg-backup` and config at `~/.config/ytb-tg-backup/config.toml`.
-- The local Telegram Bot API compose service lives in `deploy/telegram-bot-api`; set `telegram.api_base = "http://127.0.0.1:18081"` when using it.
-- If `git status` says this is not a repository while an empty `.git/` directory exists, inspect `.git/`; initialize or replace it only after the user agrees to that repository operation.
+- Do not run live provider, media, or Telegram operations unless requested.
+- Keep data/download directories at `0700`; keep config, environment, SQLite,
+  and migration backup files at `0600`. The shipped unit uses `UMask=0077`.
+- For systemd Twitch credentials, use a mode-`0600` `EnvironmentFile` outside
+  the repository and add it through the installed user-unit configuration.
+- The unit expects the repo at `~/dev/ytb-tg-backup` and config at
+  `~/.config/ytb-tg-backup/config.toml`.
+- The local Telegram Bot API service is under `deploy/telegram-bot-api`; set
+  `telegram.api_base = "http://127.0.0.1:18081"` when using it.
+- Do not commit `.venv/`, `__pycache__/`, `*.egg-info/`, real configs,
+  environment files, SQLite/WAL files, downloads, archives, or migration
+  backups.

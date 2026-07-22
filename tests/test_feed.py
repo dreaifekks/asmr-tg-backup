@@ -1,6 +1,18 @@
 import unittest
+from unittest import mock
 
-from ytb_tg_backup.feed import _quote_url_for_request, extract_video_id, parse_feed
+from ytb_tg_backup.feed import MAX_FEED_BYTES, _quote_url_for_request, extract_video_id, fetch_feed, parse_feed
+
+
+class _LargeResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self, size: int = -1):
+        return b"x" * (MAX_FEED_BYTES + 1)
 
 
 class FeedParsingTest(unittest.TestCase):
@@ -46,6 +58,11 @@ class FeedParsingTest(unittest.TestCase):
     def test_quote_url_for_youtube_feed_query(self):
         url = _quote_url_for_request("https://www.youtube.com/feeds/videos.xml?channel_id=UC123")
         self.assertEqual(url, "https://www.youtube.com/feeds/videos.xml?channel_id=UC123")
+
+    def test_fetch_feed_rejects_oversized_response(self):
+        with mock.patch("ytb_tg_backup.feed.urlopen", return_value=_LargeResponse()):
+            with self.assertRaisesRegex(ValueError, "feed response exceeds"):
+                fetch_feed("https://example.invalid/feed.xml")
 
 
 if __name__ == "__main__":

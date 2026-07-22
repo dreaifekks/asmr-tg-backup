@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
 YT_NS = "{http://www.youtube.com/xml/schemas/2015}"
+MAX_FEED_BYTES = 10 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -28,14 +29,18 @@ class FeedEntry:
 def fetch_feed(url: str, timeout: int = 30) -> bytes:
     request = Request(_quote_url_for_request(url), headers={"User-Agent": "ytb-tg-backup/0.1"})
     with urlopen(request, timeout=timeout) as response:
-        return response.read()
+        payload = response.read(MAX_FEED_BYTES + 1)
+    if len(payload) > MAX_FEED_BYTES:
+        raise ValueError(f"feed response exceeds {MAX_FEED_BYTES} bytes")
+    return payload
 
 
 def parse_feed(xml_bytes: bytes, feed_id: str, feed_name: str) -> list[FeedEntry]:
     root = ET.fromstring(xml_bytes)
     if _strip_ns(root.tag) == "rss":
         nodes = root.findall("./channel/item")
-        return [_parse_rss_item(node, feed_id, feed_name) for node in nodes if _parse_rss_item(node, feed_id, feed_name)]
+        parsed = [_parse_rss_item(node, feed_id, feed_name) for node in nodes]
+        return [item for item in parsed if item is not None]
 
     entries = root.findall(f"{ATOM_NS}entry")
     if not entries and _strip_ns(root.tag) == "feed":
@@ -45,14 +50,16 @@ def parse_feed(xml_bytes: bytes, feed_id: str, feed_name: str) -> list[FeedEntry
 
 
 def _parse_atom_entry(node: ET.Element, feed_id: str, feed_name: str) -> FeedEntry | None:
-    video_id = _first_text(node, [f"{YT_NS}videoId", "videoId"])
+    youtube_video_id = _first_text(node, [f"{YT_NS}videoId", "videoId"])
     entry_id = _first_text(node, [f"{ATOM_NS}id", "id"])
     title = _first_text(node, [f"{ATOM_NS}title", "title"]) or "(untitled)"
     link = _atom_link(node)
-    video_id = video_id or extract_video_id(entry_id or "") or extract_video_id(link or "")
+    video_id = youtube_video_id or extract_video_id(entry_id or "") or extract_video_id(link or "") or entry_id or link
     if not video_id:
         return None
-    url = link or f"https://www.youtube.com/watch?v={video_id}"
+    url = link or (f"https://www.youtube.com/watch?v={video_id}" if youtube_video_id else "")
+    if not url:
+        return None
     return FeedEntry(
         feed_id=feed_id,
         feed_name=feed_name,
@@ -68,15 +75,16 @@ def _parse_rss_item(node: ET.Element, feed_id: str, feed_name: str) -> FeedEntry
     title = _first_text(node, ["title"]) or "(untitled)"
     link = _first_text(node, ["link"]) or ""
     guid = _first_text(node, ["guid"]) or ""
-    video_id = _first_text(node, [f"{YT_NS}videoId", "videoId"]) or extract_video_id(link) or extract_video_id(guid)
-    if not video_id:
+    youtube_video_id = _first_text(node, [f"{YT_NS}videoId", "videoId"]) or extract_video_id(link) or extract_video_id(guid)
+    video_id = youtube_video_id or guid or link
+    if not video_id or not link:
         return None
     return FeedEntry(
         feed_id=feed_id,
         feed_name=feed_name,
         video_id=video_id,
         title=title,
-        url=link or f"https://www.youtube.com/watch?v={video_id}",
+        url=link,
         published_at=_normalize_datetime(_first_text(node, ["pubDate", "published"])),
         updated_at=_normalize_datetime(_first_text(node, ["updated"])),
     )

@@ -11,6 +11,25 @@ from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
 
 
 class BackupServiceTest(unittest.TestCase):
+    def test_initialize_hardens_all_provider_archive_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{tmp_path}"')
+            config = load_config(config_path)
+            service = BackupService(config)
+            youtube_archive = service.downloader.archive_file_for_provider("youtube")
+            twitch_archive = service.downloader.archive_file_for_provider("twitch")
+            for path in (youtube_archive, twitch_archive):
+                path.write_text("seed")
+                path.chmod(0o666)
+
+            service.initialize()
+
+            self.assertEqual(youtube_archive.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(twitch_archive.stat().st_mode & 0o777, 0o600)
+            service.store.close()
+
     def test_initial_feed_seed_keeps_only_latest_entry_seen(self):
         xml = b"""<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom">
@@ -56,13 +75,16 @@ enabled = true
             service = BackupService(config)
             with mock.patch("ytb_tg_backup.service.fetch_feed", return_value=xml):
                 service.poll_once(process=False)
+                service.poll_once(process=False)
 
             conn = sqlite3.connect(config.db_path)
             rows = conn.execute("SELECT video_id, status FROM videos ORDER BY published_at DESC").fetchall()
+            job_count = conn.execute("SELECT COUNT(*) FROM jobs WHERE job_type='download'").fetchone()[0]
             conn.close()
             service.store.close()
 
         self.assertEqual(rows, [("latest1", "seen"), ("older22", "ignored"), ("oldest3", "ignored")])
+        self.assertEqual(job_count, 1)
 
     def test_source_filter_defaults_to_case_insensitive_asmr(self):
         source_match_xml = b"""<?xml version="1.0" encoding="UTF-8"?>

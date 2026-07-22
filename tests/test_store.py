@@ -46,6 +46,18 @@ class StoreTest(unittest.TestCase):
             self.assertTrue(created)
             self.assertEqual(len(store.list_subscriptions()), 1)
             self.assertEqual(store.list_subscriptions()[0].routes, ["live"])
+            store.upsert_entry(
+                FeedEntry(
+                    feed_id="db:asmr",
+                    feed_name="ASMR",
+                    video_id="old-channel-video",
+                    title="Old channel video",
+                    url="https://www.youtube.com/watch?v=old-channel-video",
+                    published_at=None,
+                    updated_at=None,
+                )
+            )
+            store.record_origin_poll_success("db:asmr", cursor="old-channel-watermark")
 
             updated = store.upsert_subscription(
                 sub_id="asmr",
@@ -56,6 +68,8 @@ class StoreTest(unittest.TestCase):
             )
             self.assertFalse(updated)
             self.assertEqual(store.list_subscriptions()[0].channel_id, "@asmr2")
+            self.assertFalse(store.origin_has_items("db:asmr"))
+            self.assertIsNone(store.get_origin_checkpoint("db:asmr"))
 
             self.assertEqual(store.get_bot_offset(), 0)
             store.set_bot_offset(42)
