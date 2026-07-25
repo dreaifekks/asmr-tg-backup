@@ -23,9 +23,9 @@ external_id = "UC_CHANNEL_ID"
 bootstrap = "latest"
 enabled = false
 
-# Public Twitch archived broadcasts discovered through the Helix API. The
-# broadcaster may be a numeric user ID, login, or @login. Credentials are read
-# from the environment variables named in [twitch], never from this example.
+# Twitch archived broadcasts or active live streams discovered through Helix.
+# The broadcaster may be a numeric user ID, login, or @login. Credentials are
+# read from the environment variables named in [twitch], never from this example.
 [[origins]]
 id = "twitch-example"
 provider = "twitch"
@@ -34,6 +34,9 @@ name = "Example Twitch ASMR broadcaster"
 external_id = "twitch_login_or_numeric_broadcaster_id"
 bootstrap = "latest"
 enabled = false
+# Optional per-origin override. "vod" discovers the archived broadcast after
+# the stream; "live" checks /helix/streams and records while the channel is live.
+# recording_mode = "live"
 
 # Legacy [[channels]] and [[feeds]] remain supported and are translated into
 # origins at load time. Prefer [[origins]] for new configuration.
@@ -77,7 +80,8 @@ ffmpeg_timeout_seconds = 7200
 extra_args = []
 
 # Twitch also archives audio only. It keeps a provider-specific yt-dlp archive
-# file and download directory, but does not retain the source video.
+# file and download directory, but does not retain the source video. This
+# profile is used for both VOD downloads and live recordings.
 [download.provider_profiles.twitch]
 format = "bestaudio/best"
 merge_output_format = ""
@@ -96,7 +100,7 @@ max_upload_bytes = 52428800
 upload_timeout_seconds = 7200
 caption_template = "{title}\n\n{url}\n\n#{tag}"
 
-# Public Twitch VOD discovery requires TWITCH_CLIENT_ID plus either an existing
+# Twitch VOD/live discovery requires TWITCH_CLIENT_ID plus either an existing
 # TWITCH_ACCESS_TOKEN or TWITCH_CLIENT_SECRET for app-token creation/refresh.
 # Put secret values in the process environment or a mode-0600 systemd
 # EnvironmentFile; do not add client_id/access_token/client_secret values here.
@@ -106,11 +110,25 @@ access_token_env = "TWITCH_ACCESS_TOKEN"
 client_secret_env = "TWITCH_CLIENT_SECRET"
 request_timeout_seconds = 30
 max_pages_per_poll = 3
+# "vod" waits for an archived broadcast. "live" detects an active stream with
+# Helix Get Streams and starts yt-dlp immediately. An origin-level
+# recording_mode overrides this fallback default. Telegram-panel origins store
+# their selected per-channel mode in SQLite instead of changing this file.
+recording_mode = "vod"
+live_poll_interval_seconds = 30
+live_retry_seconds = 15
+live_worker_count = 1
+# 0 means no fixed wall-clock limit; service stop and lease loss still terminate
+# yt-dlp cleanly and leave the job retryable.
+live_download_timeout_seconds = 0
 
 [control]
 enabled = false
 # Telegram getUpdates long-poll window; accepted range is 1-30 seconds.
 poll_interval_seconds = 10
+# Close the inline panel after this many seconds without a valid interaction.
+# Each button press or accepted text input renews the timer. 0 disables expiry.
+panel_idle_timeout_seconds = 3600
 delete_webhook_on_startup = true
 default_routes = ["live"]
 # /panel uses one edited Telegram message. Pending panel input and its message

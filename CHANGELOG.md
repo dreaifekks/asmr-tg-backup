@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+## 0.2.1 - 2026-07-25
+
+- Add configurable Twitch `vod` versus `live` recording. Live mode polls Helix
+  Get Streams on a dedicated fast schedule and records the channel immediately
+  with yt-dlp, avoiding subscriber-only VOD lockout after the broadcast.
+- Let the Telegram panel choose `live` or `vod` when adding each Twitch channel,
+  display the effective mode, and switch bot-managed channels without restart.
+- Expire Telegram control panels after one idle hour by default, remove the old
+  inline keyboard, and reject callbacks from closed or superseded messages.
+- Isolate long-running Twitch recordings from normal downloads and Telegram
+  delivery with a dedicated worker lane, unlimited-by-default live timeout,
+  lease-aware process cancellation, and duplicate VOD suppression by stream ID.
+- Reset stale poll checkpoints when switching recording modes, reconnect the
+  same active stream without consuming its failure budget, and arbitrate
+  live/VOD completion transactionally to prevent duplicate delivery.
+- Preserve finalized fragments across service stops and transient network
+  failures, normalize mixed interrupted/finished containers, then merge the
+  recording segments when the stream ends.
+
 ## 0.2.0 - 2026-07-22
 
 - Generalize discovery around provider-backed origins for YouTube, RSS, and

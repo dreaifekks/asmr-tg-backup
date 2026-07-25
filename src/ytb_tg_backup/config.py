@@ -100,12 +100,18 @@ class TwitchConfig:
     oauth_base: str = "https://id.twitch.tv/oauth2"
     request_timeout_seconds: int = 30
     max_pages_per_poll: int = 3
+    recording_mode: str = "vod"
+    live_poll_interval_seconds: int = 30
+    live_retry_seconds: int = 15
+    live_worker_count: int = 1
+    live_download_timeout_seconds: int = 0
 
 
 @dataclass(frozen=True)
 class ControlConfig:
     enabled: bool = False
     poll_interval_seconds: int = 10
+    panel_idle_timeout_seconds: int = 3600
     delete_webhook_on_startup: bool = True
     default_routes: list[str] = field(default_factory=lambda: ["live"])
     allowed_user_ids: list[str] = field(default_factory=list)
@@ -232,6 +238,10 @@ def load_config(path: str | Path) -> Config:
     client_id_env = str(twitch_raw.get("client_id_env", "TWITCH_CLIENT_ID"))
     access_token_env = str(twitch_raw.get("access_token_env", "TWITCH_ACCESS_TOKEN"))
     client_secret_env = str(twitch_raw.get("client_secret_env", "TWITCH_CLIENT_SECRET"))
+    recording_mode = _twitch_recording_mode(
+        twitch_raw.get("recording_mode", TwitchConfig.recording_mode),
+        label="twitch.recording_mode",
+    )
     twitch = TwitchConfig(
         client_id=str(twitch_raw.get("client_id") or os.environ.get(client_id_env, "")),
         access_token=str(twitch_raw.get("access_token") or os.environ.get(access_token_env, "")),
@@ -240,12 +250,24 @@ def load_config(path: str | Path) -> Config:
         oauth_base=str(twitch_raw.get("oauth_base", "https://id.twitch.tv/oauth2")).rstrip("/"),
         request_timeout_seconds=max(1, int(twitch_raw.get("request_timeout_seconds", 30))),
         max_pages_per_poll=max(1, int(twitch_raw.get("max_pages_per_poll", 3))),
+        recording_mode=recording_mode,
+        live_poll_interval_seconds=max(5, int(twitch_raw.get("live_poll_interval_seconds", 30))),
+        live_retry_seconds=max(1, int(twitch_raw.get("live_retry_seconds", 15))),
+        live_worker_count=max(1, int(twitch_raw.get("live_worker_count", 1))),
+        live_download_timeout_seconds=max(
+            0,
+            int(twitch_raw.get("live_download_timeout_seconds", 0)),
+        ),
     )
 
     control_raw = raw.get("control", {})
     control = ControlConfig(
         enabled=bool(control_raw.get("enabled", False)),
         poll_interval_seconds=max(1, min(30, int(control_raw.get("poll_interval_seconds", 10)))),
+        panel_idle_timeout_seconds=max(
+            0,
+            int(control_raw.get("panel_idle_timeout_seconds", 3600)),
+        ),
         delete_webhook_on_startup=bool(control_raw.get("delete_webhook_on_startup", True)),
         default_routes=[str(route).strip("/") for route in control_raw.get("default_routes", ["live"])],
         allowed_user_ids=[str(item) for item in control_raw.get("allowed_user_ids", [])],
@@ -294,6 +316,16 @@ def _load_origins(
             for key, value in item.items()
             if key not in {"id", "provider", "kind", "name", "external_id", "url", "enabled", "bootstrap", "credential_ref"}
         }
+        if provider == "twitch" and "recording_mode" in options:
+            if kind != "vods":
+                raise ValueError(
+                    f"origin {origin_id!r} recording_mode is only valid for "
+                    "Twitch kind='vods'"
+                )
+            options["recording_mode"] = _twitch_recording_mode(
+                options["recording_mode"],
+                label=f"origin {origin_id!r} recording_mode",
+            )
         origins.append(
             Origin(
                 id=origin_id,
@@ -349,6 +381,13 @@ def _default_origin_kind(provider: str) -> str:
     if provider == "twitch":
         return "vods"
     return "feed"
+
+
+def _twitch_recording_mode(value: object, *, label: str) -> str:
+    mode = str(value).lower().strip()
+    if mode not in {"vod", "live"}:
+        raise ValueError(f"{label} must be 'vod' or 'live'")
+    return mode
 
 
 def _load_download_profiles(raw_profiles: dict[str, Any]) -> dict[str, DownloadProfile]:

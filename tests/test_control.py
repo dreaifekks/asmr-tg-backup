@@ -1,4 +1,6 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import json
 import logging
 import tempfile
 import unittest
@@ -8,6 +10,21 @@ from ytb_tg_backup.config import load_config
 from ytb_tg_backup.control import ControlBot, _origin_token
 from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
 from ytb_tg_backup.store import Store
+
+
+def _current_panel_callback(
+    calls: list[tuple[str, dict]],
+    base_callback_data: str,
+) -> str:
+    for method, payload in reversed(calls):
+        if method not in {"sendMessage", "editMessageText"}:
+            continue
+        for row in payload["reply_markup"]["inline_keyboard"]:
+            for button in row:
+                callback_data = str(button.get("callback_data") or "")
+                if callback_data.partition("~")[0] == base_callback_data:
+                    return callback_data
+    raise AssertionError(f"panel callback not found: {base_callback_data}")
 
 
 class ControlBotTest(unittest.TestCase):
@@ -37,7 +54,10 @@ allowed_user_ids = ["123"]
                 bot,
                 "_api",
                 return_value={"ok": True, "result": []},
-            ) as api:
+            ) as api, mock.patch.object(
+                bot,
+                "expire_idle_panels",
+            ) as expire_idle_panels:
                 bot.process_once()
 
             api.assert_called_once_with(
@@ -49,6 +69,7 @@ allowed_user_ids = ["123"]
                 },
                 request_timeout_seconds=15,
             )
+            expire_idle_panels.assert_called_once_with()
 
     def test_authorization_and_sub_add(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -149,19 +170,49 @@ allowed_user_ids = ["123"]
                 "/origin add twitch highlights @streamer Twitch ASMR",
                 message,
             )
+            twitch_vod_reply = bot._execute(
+                "/origin add twitch @vodstreamer Twitch VOD",
+                message,
+            )
 
             self.assertIn("youtube/uploads", youtube_reply)
             self.assertIn("twitch/highlights", twitch_reply)
+            self.assertIn("twitch/vods", twitch_vod_reply)
+            self.assertIn("mode=vod", twitch_vod_reply)
             rows = store.list_origin_statuses()
             self.assertEqual(
                 {(row["provider"], row["kind"], row["external_id"]) for row in rows},
                 {
                     ("youtube", "uploads", "UCyoutube1111111111111111"),
                     ("twitch", "highlights", "streamer"),
+                    ("twitch", "vods", "vodstreamer"),
                 },
             )
-            twitch_id = next(str(row["id"]) for row in rows if row["provider"] == "twitch")
+            twitch_id = next(
+                str(row["id"])
+                for row in rows
+                if row["provider"] == "twitch" and row["kind"] == "highlights"
+            )
+            twitch_vod_id = next(
+                str(row["id"])
+                for row in rows
+                if row["provider"] == "twitch" and row["kind"] == "vods"
+            )
             self.assertIn("twitch/highlights", bot._execute("/origin list", message))
+            self.assertIn(
+                "recording mode=live",
+                bot._execute(f"/origin mode {twitch_vod_id} live", message),
+            )
+            vod_options = json.loads(
+                str(
+                    store.conn.execute(
+                        "SELECT options_json FROM origins WHERE id=?",
+                        (twitch_vod_id,),
+                    ).fetchone()["options_json"]
+                )
+            )
+            self.assertEqual(vod_options["recording_mode"], "live")
+            self.assertIn("mode=live", bot._execute("/origin list", message))
             self.assertIn("disabled", bot._execute(f"/origin disable {twitch_id}", message))
             self.assertIn("enabled", bot._execute(f"/origin enable {twitch_id}", message))
             self.assertIn("deleted origin", bot._execute(f"/origin del {twitch_id}", message))
@@ -205,13 +256,28 @@ allowed_chat_ids = ["-100"]
 
             with mock.patch.object(bot, "_api", side_effect=fake_api):
                 bot._handle_update({"message": command_message})
+                add_twitch_callback = _current_panel_callback(calls, "p:addtw")
                 bot._handle_update(
                     {
                         "callback_query": {
                             "id": "cb-add",
                             "from": {"id": 123},
                             "message": panel_message,
-                            "data": "p:addtw",
+                            "data": add_twitch_callback,
+                        }
+                    }
+                )
+                live_mode_callback = _current_panel_callback(
+                    calls,
+                    "p:addtwmode:live",
+                )
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-add-mode",
+                            "from": {"id": 123},
+                            "message": panel_message,
+                            "data": live_mode_callback,
                         }
                     }
                 )
@@ -230,16 +296,73 @@ allowed_chat_ids = ["-100"]
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0]["provider"], "twitch")
                 self.assertFalse(bool(rows[0]["enabled"]))
+                options = json.loads(str(rows[0]["options_json"]))
+                self.assertEqual(options["recording_mode"], "live")
                 token = _origin_token(str(rows[0]["id"]))
+                live_panel = next(
+                    payload
+                    for method, payload in reversed(calls)
+                    if method == "editMessageText"
+                )
+                live_callbacks = {
+                    button["callback_data"].partition("~")[0]
+                    for row in live_panel["reply_markup"]["inline_keyboard"]
+                    for button in row
+                }
+                self.assertIn("🔴 LIVE", live_panel["text"])
+                self.assertIn(f"p:twmode:{token}:vod", live_callbacks)
+                switch_to_vod_callback = _current_panel_callback(
+                    calls,
+                    f"p:twmode:{token}:vod",
+                )
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-mode-vod",
+                            "from": {"id": 123},
+                            "message": panel_message,
+                            "data": switch_to_vod_callback,
+                        }
+                    }
+                )
+                switched_options = json.loads(
+                    str(
+                        store.conn.execute(
+                            "SELECT options_json FROM origins WHERE id=?",
+                            (rows[0]["id"],),
+                        ).fetchone()["options_json"]
+                    )
+                )
+                self.assertEqual(switched_options["recording_mode"], "vod")
+                vod_panel = next(
+                    payload
+                    for method, payload in reversed(calls)
+                    if method == "editMessageText"
+                )
+                vod_callbacks = {
+                    button["callback_data"].partition("~")[0]
+                    for row in vod_panel["reply_markup"]["inline_keyboard"]
+                    for button in row
+                }
+                self.assertIn("📼 VOD", vod_panel["text"])
+                self.assertIn(f"p:twmode:{token}:live", vod_callbacks)
+                delete_ask_callback = _current_panel_callback(
+                    calls,
+                    f"p:delask:{token}",
+                )
                 bot._handle_update(
                     {
                         "callback_query": {
                             "id": "cb-delete-ask",
                             "from": {"id": 123},
                             "message": panel_message,
-                            "data": f"p:delask:{token}",
+                            "data": delete_ask_callback,
                         }
                     }
+                )
+                delete_callback = _current_panel_callback(
+                    calls,
+                    f"p:delete:{token}",
                 )
                 bot._handle_update(
                     {
@@ -247,7 +370,7 @@ allowed_chat_ids = ["-100"]
                             "id": "cb-delete",
                             "from": {"id": 123},
                             "message": panel_message,
-                            "data": f"p:delete:{token}",
+                            "data": delete_callback,
                         }
                     }
                 )
@@ -256,9 +379,293 @@ allowed_chat_ids = ["-100"]
             self.assertEqual(store.list_origin_statuses(), [])
             self.assertEqual(sum(method == "sendMessage" for method, _ in calls), 1)
             edits = [payload for method, payload in calls if method == "editMessageText"]
-            self.assertGreaterEqual(len(edits), 4)
+            self.assertGreaterEqual(len(edits), 6)
             self.assertTrue(all(payload["message_id"] == 500 for payload in edits))
             self.assertTrue(all("inline_keyboard" in payload["reply_markup"] for payload in edits))
+            self.assertTrue(
+                any(
+                    "p:addtwmode:live"
+                    in {
+                        button["callback_data"].partition("~")[0]
+                        for row in payload["reply_markup"]["inline_keyboard"]
+                        for button in row
+                    }
+                    for payload in edits
+                )
+            )
+
+    def test_panel_closes_after_one_idle_hour_and_reopens_on_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "test-token"
+
+[control]
+enabled = true
+panel_idle_timeout_seconds = 3600
+allowed_user_ids = ["123"]
+allowed_chat_ids = ["-100"]
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            calls: list[tuple[str, dict]] = []
+
+            def fake_api(method: str, payload: dict) -> dict:
+                calls.append((method, payload))
+                if method == "sendMessage":
+                    return {"ok": True, "result": {"message_id": 500}}
+                return {"ok": True, "result": True}
+
+            command_message = {
+                "message_id": 10,
+                "from": {"id": 123},
+                "chat": {"id": -100},
+                "text": "/panel",
+            }
+            panel_message = {"message_id": 500, "chat": {"id": -100}}
+            started_at = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
+
+            with mock.patch.object(bot, "_api", side_effect=fake_api), mock.patch(
+                "ytb_tg_backup.control._utcnow",
+                return_value=started_at,
+            ):
+                bot._handle_update({"message": command_message})
+
+            state_key = bot._panel_state_key(command_message)
+            state = json.loads(str(store.get_bot_state(state_key)))
+            self.assertTrue(state["active"])
+            self.assertEqual(state["last_activity_at"], started_at.isoformat())
+            self.assertEqual(
+                state["expires_at"],
+                (started_at + timedelta(hours=1)).isoformat(),
+            )
+
+            activity_at = started_at + timedelta(minutes=45)
+            stats_callback = _current_panel_callback(calls, "p:stats")
+            with mock.patch.object(bot, "_api", side_effect=fake_api), mock.patch(
+                "ytb_tg_backup.control._utcnow",
+                return_value=activity_at,
+            ):
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-stats",
+                            "from": {"id": 123},
+                            "message": panel_message,
+                            "data": stats_callback,
+                        }
+                    }
+                )
+
+            renewed = json.loads(str(store.get_bot_state(state_key)))
+            self.assertEqual(renewed["last_activity_at"], activity_at.isoformat())
+            self.assertEqual(
+                renewed["expires_at"],
+                (activity_at + timedelta(hours=1)).isoformat(),
+            )
+            expired_home_callback = _current_panel_callback(calls, "p:home")
+            calls.clear()
+            with mock.patch.object(bot, "_api", side_effect=fake_api), mock.patch(
+                "ytb_tg_backup.control._utcnow",
+                return_value=activity_at + timedelta(seconds=1),
+            ):
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-old-revision",
+                            "from": {"id": 123},
+                            "message": panel_message,
+                            "data": stats_callback,
+                        }
+                    }
+                )
+            self.assertEqual([method for method, _ in calls], ["answerCallbackQuery"])
+            self.assertIn("已经刷新", calls[0][1]["text"])
+
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                self.assertEqual(
+                    bot.expire_idle_panels(
+                        now=activity_at + timedelta(minutes=59, seconds=59)
+                    ),
+                    0,
+                )
+
+            calls.clear()
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                self.assertEqual(
+                    bot.expire_idle_panels(now=activity_at + timedelta(hours=1)),
+                    1,
+                )
+            closed = json.loads(str(store.get_bot_state(state_key)))
+            self.assertFalse(closed["active"])
+            self.assertEqual(closed["view"], "closed")
+            close_call = next(
+                payload
+                for method, payload in calls
+                if method == "editMessageText"
+            )
+            self.assertIn("控制面板已自动关闭", close_call["text"])
+            self.assertEqual(
+                close_call["reply_markup"],
+                {"inline_keyboard": []},
+            )
+
+            calls.clear()
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-expired",
+                            "from": {"id": 123},
+                            "message": panel_message,
+                            "data": expired_home_callback,
+                        }
+                    }
+                )
+            self.assertEqual([method for method, _ in calls], ["answerCallbackQuery"])
+            self.assertTrue(calls[0][1]["show_alert"])
+
+            reopened_at = activity_at + timedelta(hours=1, seconds=1)
+            calls.clear()
+            with mock.patch.object(bot, "_api", side_effect=fake_api), mock.patch(
+                "ytb_tg_backup.control._utcnow",
+                return_value=reopened_at,
+            ):
+                bot._handle_update({"message": command_message})
+
+            reopened = json.loads(str(store.get_bot_state(state_key)))
+            self.assertTrue(reopened["active"])
+            self.assertEqual(reopened["last_activity_at"], reopened_at.isoformat())
+            self.assertTrue(
+                any(
+                    method == "editMessageText"
+                    and "Media Backup 控制面板" in payload["text"]
+                    for method, payload in calls
+                )
+            )
+
+            current_stats_callback = _current_panel_callback(calls, "p:stats")
+            calls.clear()
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-old-message",
+                            "from": {"id": 123},
+                            "message": {"message_id": 499, "chat": {"id": -100}},
+                            "data": current_stats_callback,
+                        }
+                    }
+                )
+            self.assertEqual([method for method, _ in calls], ["answerCallbackQuery"])
+            self.assertIn("不是你当前的会话", calls[0][1]["text"])
+
+    def test_panel_remains_closed_when_expiry_message_edit_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "test-token"
+
+[control]
+enabled = true
+panel_idle_timeout_seconds = 3600
+allowed_user_ids = ["123"]
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            message = {"from": {"id": 123}, "chat": {"id": -100}}
+            state_key = bot._panel_state_key(message)
+            started_at = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
+            store.set_bot_state(
+                state_key,
+                json.dumps(
+                    {
+                        "active": True,
+                        "chat_id": -100,
+                        "message_id": 500,
+                        "last_activity_at": started_at.isoformat(),
+                        "view": "home",
+                    }
+                ),
+            )
+
+            with mock.patch.object(
+                bot,
+                "_api",
+                side_effect=RuntimeError("Telegram unavailable"),
+            ):
+                self.assertEqual(
+                    bot.expire_idle_panels(now=started_at + timedelta(hours=1)),
+                    1,
+                )
+
+            state = json.loads(str(store.get_bot_state(state_key)))
+            self.assertFalse(state["active"])
+            self.assertEqual(state["view"], "closed")
+
+    def test_panel_idle_expiry_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "test-token"
+
+[control]
+enabled = true
+panel_idle_timeout_seconds = 0
+allowed_user_ids = ["123"]
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            message = {
+                "message_id": 10,
+                "from": {"id": 123},
+                "chat": {"id": -100},
+                "text": "/panel",
+            }
+            started_at = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
+
+            with mock.patch.object(
+                bot,
+                "_api",
+                return_value={"ok": True, "result": {"message_id": 500}},
+            ), mock.patch(
+                "ytb_tg_backup.control._utcnow",
+                return_value=started_at,
+            ):
+                bot._handle_update({"message": message})
+
+            state = json.loads(
+                str(store.get_bot_state(bot._panel_state_key(message)))
+            )
+            self.assertNotIn("expires_at", state)
+            self.assertEqual(
+                bot.expire_idle_panels(now=started_at + timedelta(days=365)),
+                0,
+            )
 
     def test_source_filter_command(self):
         with tempfile.TemporaryDirectory() as tmp:

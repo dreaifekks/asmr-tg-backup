@@ -15,7 +15,14 @@ import uuid
 
 from .config import Config
 from .control import ControlBot
-from .downloader import Downloader, WAIT_LIVE_STATUSES
+from .downloader import (
+    DownloadCancelled,
+    DownloadResult,
+    Downloader,
+    LiveDownloadError,
+    ProbeResult,
+    WAIT_LIVE_STATUSES,
+)
 from .feed import fetch_feed
 from .models import ClaimedJob, MediaCandidate, Origin
 from .source_filter import (
@@ -25,8 +32,13 @@ from .source_filter import (
     format_source_filter,
     text_matches_source_filter,
 )
-from .sources import SourceError, SourceRegistry, validate_public_media_url
-from .store import Store
+from .sources import (
+    SourceError,
+    SourceRegistry,
+    twitch_recording_mode,
+    validate_public_media_url,
+)
+from .store import Store, future_iso, now_iso
 from .telegram import TelegramUploader, TelegramUploadError
 
 
@@ -39,11 +51,7 @@ class BackupService:
         self.downloader = Downloader(config, self.logger)
         self.telegram = TelegramUploader(config.telegram)
         self.control_bot = ControlBot(config, self.store, self.logger)
-        self.sources = SourceRegistry(
-            config.twitch,
-            youtube_fetcher=lambda url: fetch_feed(url),
-            rss_fetcher=lambda url: fetch_feed(url),
-        )
+        self.sources = self._new_source_registry()
         self._stop_event = threading.Event()
 
     @property
@@ -102,12 +110,37 @@ class BackupService:
         workers = [
             threading.Thread(
                 target=self._worker_loop,
-                args=(index,),
+                args=(index, "standard"),
                 name=f"backup-worker-{index}",
                 daemon=True,
             )
             for index in range(self.config.app.worker_count)
         ]
+        workers.extend(
+            threading.Thread(
+                target=self._worker_loop,
+                args=(index, "live"),
+                name=f"twitch-live-worker-{index}",
+                daemon=True,
+            )
+            for index in range(self.config.twitch.live_worker_count)
+        )
+        workers.extend(
+            (
+                threading.Thread(
+                    target=self._source_poll_loop,
+                    args=(False, self.config.app.poll_interval_seconds),
+                    name="source-poll-worker",
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=self._source_poll_loop,
+                    args=(True, self.config.twitch.live_poll_interval_seconds),
+                    name="twitch-live-poll-worker",
+                    daemon=True,
+                ),
+            )
+        )
         if self.config.control.enabled:
             workers.append(
                 threading.Thread(
@@ -119,21 +152,11 @@ class BackupService:
         for worker in workers:
             worker.start()
 
-        next_feed_poll = 0.0
         try:
-            while not self._stop_event.is_set():
-                now = time.monotonic()
-                if now >= next_feed_poll:
-                    try:
-                        self.poll_once(process=False)
-                    except Exception:
-                        self.logger.exception("source poll cycle failed")
-                    finally:
-                        next_feed_poll = now + self.config.app.poll_interval_seconds
-                self._stop_event.wait(1)
+            self._stop_event.wait()
         finally:
             self._stop_event.set()
-            drain_deadline = time.monotonic() + 15
+            drain_deadline = time.monotonic() + 25
             for worker in workers:
                 worker.join(timeout=max(0.0, drain_deadline - time.monotonic()))
                 if worker.is_alive():
@@ -144,27 +167,108 @@ class BackupService:
 
     def poll_once(self, *, process: bool) -> None:
         self.initialize()
-        source_filter_pattern, source_filter = self._compiled_source_filter()
-        for origin in self._all_origins():
-            if not origin.enabled:
-                self.logger.debug("origin disabled id=%s", origin.id)
-                continue
-            if not self.store.origin_poll_due(origin.id):
-                continue
-            self._poll_origin(origin, source_filter_pattern, source_filter)
+        self._poll_origins(live_recording=None)
 
         if process:
             self.process_pending()
 
-    def _poll_origin(self, origin: Origin, source_filter_pattern: str | None, source_filter) -> None:
-        try:
-            result = self.sources.get(origin.provider, origin.kind).discover(
+    def _source_poll_loop(self, live_recording: bool, interval_seconds: int) -> None:
+        label = "Twitch live" if live_recording else "source"
+        while not self._stop_event.is_set():
+            store: Store | None = None
+            try:
+                store = Store(self.config.db_path)
+                store.initialize()
+                sources = self._new_source_registry()
+                while not self._stop_event.is_set():
+                    started_at = time.monotonic()
+                    try:
+                        self._poll_origins(
+                            live_recording=live_recording,
+                            store=store,
+                            sources=sources,
+                        )
+                    except Exception:
+                        self.logger.exception("%s poll cycle failed", label)
+                    elapsed = time.monotonic() - started_at
+                    self._stop_event.wait(max(0.0, interval_seconds - elapsed))
+            except Exception:
+                self.logger.exception("%s poll worker crashed; reconnecting", label)
+                self._stop_event.wait(min(10, interval_seconds))
+            finally:
+                if store is not None:
+                    store.close()
+
+    def _poll_origins(
+        self,
+        *,
+        live_recording: bool | None,
+        store: Store | None = None,
+        sources: SourceRegistry | None = None,
+    ) -> None:
+        active_store = store or self.store
+        active_sources = sources or self.sources
+        source_filter_pattern, source_filter = self._compiled_source_filter(active_store)
+        for origin in self._all_origins(active_store):
+            if not origin.enabled:
+                self.logger.debug("origin disabled id=%s", origin.id)
+                continue
+            is_live_origin = self._is_live_recording_origin(origin)
+            if live_recording is not None and is_live_origin != live_recording:
+                continue
+            if origin.provider == "twitch" and origin.kind == "vods":
+                mode = "live" if is_live_origin else "vod"
+                if active_store.reconcile_origin_poll_mode(origin.id, mode):
+                    self.logger.info(
+                        "reset Twitch poll state after recording mode change "
+                        "origin=%s mode=%s",
+                        origin.id,
+                        mode,
+                    )
+            if not active_store.origin_poll_due(origin.id):
+                continue
+            self._poll_origin(
                 origin,
-                self.store.get_origin_checkpoint(origin.id),
+                source_filter_pattern,
+                source_filter,
+                store=active_store,
+                sources=active_sources,
+            )
+
+    def _poll_origin(
+        self,
+        origin: Origin,
+        source_filter_pattern: str | None,
+        source_filter,
+        *,
+        store: Store | None = None,
+        sources: SourceRegistry | None = None,
+    ) -> None:
+        active_store = store or self.store
+        active_sources = sources or self.sources
+        try:
+            result = active_sources.get(origin.provider, origin.kind).discover(
+                origin,
+                active_store.get_origin_checkpoint(origin.id),
             )
         except SourceError as exc:
-            retry_seconds = exc.retry_after or self.config.app.retry_seconds
-            self.store.record_origin_poll_failure(
+            if not self._origin_poll_configuration_is_current(
+                active_store,
+                origin,
+            ):
+                self.logger.info(
+                    "discarded stale origin poll failure after configuration change "
+                    "origin=%s provider=%s",
+                    origin.id,
+                    origin.provider,
+                )
+                return
+            retry_seconds = exc.retry_after or (
+                self.config.twitch.live_retry_seconds
+                if self._is_live_recording_origin(origin)
+                else self.config.app.retry_seconds
+            )
+            active_store.record_origin_poll_failure(
                 origin.id,
                 error_code=exc.code,
                 error=self._safe_error(exc),
@@ -173,7 +277,18 @@ class BackupService:
             self.logger.warning("origin poll failed id=%s provider=%s code=%s: %s", origin.id, origin.provider, exc.code, exc)
             return
         except HTTPError as exc:
-            self.store.record_origin_poll_failure(
+            if not self._origin_poll_configuration_is_current(
+                active_store,
+                origin,
+            ):
+                self.logger.info(
+                    "discarded stale origin poll failure after configuration change "
+                    "origin=%s provider=%s",
+                    origin.id,
+                    origin.provider,
+                )
+                return
+            active_store.record_origin_poll_failure(
                 origin.id,
                 error_code=f"http_{exc.code}",
                 error=f"HTTP {exc.code}",
@@ -182,7 +297,18 @@ class BackupService:
             self.logger.warning("origin HTTP failure id=%s status=%s", origin.id, exc.code)
             return
         except Exception as exc:
-            self.store.record_origin_poll_failure(
+            if not self._origin_poll_configuration_is_current(
+                active_store,
+                origin,
+            ):
+                self.logger.info(
+                    "discarded stale origin poll failure after configuration change "
+                    "origin=%s provider=%s",
+                    origin.id,
+                    origin.provider,
+                )
+                return
+            active_store.record_origin_poll_failure(
                 origin.id,
                 error_code="unexpected_error",
                 error=self._safe_error(exc),
@@ -191,7 +317,19 @@ class BackupService:
             self.logger.exception("origin poll failed id=%s provider=%s", origin.id, origin.provider)
             return
 
-        origin_seeded = self.store.origin_has_items(origin.id)
+        if not self._origin_poll_configuration_is_current(active_store, origin):
+            self.logger.info(
+                "discarded stale origin poll result after configuration change "
+                "origin=%s provider=%s",
+                origin.id,
+                origin.provider,
+            )
+            return
+
+        origin_seeded = active_store.origin_has_items(
+            origin.id,
+            content_kind=self._origin_seed_content_kind(origin),
+        )
         new_count = 0
         ignored_seed_count = 0
         filtered_count = 0
@@ -199,7 +337,7 @@ class BackupService:
         for candidate in result.items:
             if not self._candidate_matches_filter(origin, candidate, source_filter):
                 filtered_count += 1
-                self.store.upsert_discovered(
+                active_store.upsert_discovered(
                     origin.id,
                     candidate,
                     disposition="ignored",
@@ -212,20 +350,37 @@ class BackupService:
             disposition = "eligible"
             decision_code = None
             decision_reason = None
-            if not origin_seeded and origin.bootstrap == "latest" and matching_index > 0:
+            stream_id = str(candidate.metadata.get("stream_id") or "")
+            if (
+                candidate.provider == "twitch"
+                and candidate.content_kind == "vod"
+                and stream_id
+                and active_store.has_ready_twitch_live_recording(stream_id)
+            ):
+                disposition = "ignored"
+                decision_code = "live_recording_exists"
+                decision_reason = "matching Twitch live stream was already archived"
+            elif not origin_seeded and origin.bootstrap == "latest" and matching_index > 0:
                 disposition = "ignored"
                 decision_code = "initial_seed"
                 decision_reason = "initial feed seed ignored; kept latest entry only"
             elif origin.bootstrap == "all":
                 decision_code = "bootstrap_all"
                 decision_reason = "origin bootstrap explicitly permits backfill"
-            _, created = self.store.upsert_discovered(
+            job_payload = None
+            if candidate.metadata.get("recording_mode") == "live":
+                job_payload = {
+                    "download_lane": "live",
+                    "recording_mode": "live",
+                }
+            _, created = active_store.upsert_discovered(
                 origin.id,
                 candidate,
                 disposition=disposition,
                 decision_code=decision_code,
                 decision_reason=decision_reason,
                 max_failures=self.config.app.max_attempts,
+                job_payload=job_payload,
             )
             if created:
                 if disposition == "eligible":
@@ -234,7 +389,7 @@ class BackupService:
                     ignored_seed_count += 1
             matching_index += 1
 
-        self.store.record_origin_poll_success(
+        active_store.record_origin_poll_success(
             origin.id,
             cursor=result.cursor,
             etag=result.etag,
@@ -259,10 +414,15 @@ class BackupService:
             self.telegram,
             owner=owner,
             limit=self.config.app.max_items_per_poll,
+            job_types=("download", "telegram_delivery"),
+            download_lane="standard",
         )
 
-    def _worker_loop(self, index: int) -> None:
-        owner = f"worker:{socket.gethostname()}:{os.getpid()}:{index}:{uuid.uuid4().hex[:8]}"
+    def _worker_loop(self, index: int, download_lane: str = "standard") -> None:
+        owner = (
+            f"worker:{download_lane}:{socket.gethostname()}:{os.getpid()}:"
+            f"{index}:{uuid.uuid4().hex[:8]}"
+        )
         while not self._stop_event.is_set():
             store: Store | None = None
             try:
@@ -271,11 +431,28 @@ class BackupService:
                 downloader = Downloader(self.config, self.logger)
                 telegram = TelegramUploader(self.config.telegram)
                 while not self._stop_event.is_set():
-                    processed = self._process_available(store, downloader, telegram, owner=owner, limit=1)
+                    job_types = (
+                        ("download", "telegram_delivery")
+                        if download_lane == "standard"
+                        else ("download",)
+                    )
+                    processed = self._process_available(
+                        store,
+                        downloader,
+                        telegram,
+                        owner=owner,
+                        limit=1,
+                        job_types=job_types,
+                        download_lane=download_lane,
+                    )
                     if processed == 0:
                         self._stop_event.wait(self.config.app.worker_poll_interval_seconds)
             except Exception:
-                self.logger.exception("worker loop crashed index=%s; reconnecting", index)
+                self.logger.exception(
+                    "worker loop crashed lane=%s index=%s; reconnecting",
+                    download_lane,
+                    index,
+                )
                 self._stop_event.wait(min(10, self.config.app.worker_poll_interval_seconds))
             finally:
                 if store is not None:
@@ -315,13 +492,16 @@ class BackupService:
         *,
         owner: str,
         limit: int,
+        job_types: tuple[str, ...] = ("download", "telegram_delivery"),
+        download_lane: str | None = None,
     ) -> int:
         processed = 0
         for _ in range(limit):
             job = store.claim_next_job(
-                ("download", "telegram_delivery"),
+                job_types,
                 owner=owner,
                 lease_seconds=self.config.app.job_lease_seconds,
+                download_lane=download_lane,
             )
             if job is None:
                 break
@@ -332,10 +512,23 @@ class BackupService:
                 self.config.app.job_lease_seconds,
                 self.logger,
             )
-            heartbeat.start()
+            heartbeat_ready = heartbeat.start()
             try:
+                if not heartbeat_ready:
+                    store.defer_job(
+                        job,
+                        reason_code="lease_heartbeat_unavailable",
+                        error="job deferred because its lease heartbeat could not start",
+                        retry_seconds=5,
+                    )
+                    continue
                 if job.job_type == "download":
-                    self._process_download_job(store, downloader, job)
+                    self._process_download_job(
+                        store,
+                        downloader,
+                        job,
+                        lease_lost_event=heartbeat.lost_event,
+                    )
                 elif job.job_type == "telegram_delivery":
                     self._process_delivery_job(store, downloader, telegram, job)
                 else:
@@ -352,11 +545,66 @@ class BackupService:
                 heartbeat.stop()
         return processed
 
-    def _process_download_job(self, store: Store, downloader: Downloader, job: ClaimedJob) -> None:
+    def _process_download_job(
+        self,
+        store: Store,
+        downloader: Downloader,
+        job: ClaimedJob,
+        *,
+        lease_lost_event: threading.Event,
+    ) -> None:
         media = store.get_media(job.media_id)
         if media is None:
             store.block_job(job, reason_code="media_missing", error="media item no longer exists")
             return
+        try:
+            metadata = json.loads(str(media["metadata_json"] or "{}"))
+            if not isinstance(metadata, dict):
+                raise ValueError("media metadata must be an object")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            store.block_job(
+                job,
+                reason_code="invalid_media_metadata",
+                error=self._safe_error(exc),
+            )
+            return
+        live_recording = (
+            str(media["provider"]) == "twitch"
+            and metadata.get("recording_mode") == "live"
+        )
+        stream_id = str(metadata.get("stream_id") or "")
+        twitch_vod = (
+            str(media["provider"]) == "twitch"
+            and str(media["content_kind"]) == "vod"
+            and bool(stream_id)
+        )
+        if live_recording and not self._has_enabled_live_origin(store, job.media_id):
+            if self._finalize_live_segments(store, downloader, job, media):
+                return
+            store.cancel_job(
+                job,
+                reason_code="live_origin_disabled",
+                error="live recording origin is disabled, deleted, or switched to VOD mode",
+            )
+            return
+        linked_live_state = None
+        if twitch_vod:
+            linked_live_state = store.twitch_live_recording_state(stream_id)
+            if linked_live_state == "ready":
+                store.cancel_job(
+                    job,
+                    reason_code="live_recording_exists",
+                    error="matching Twitch live stream was already archived",
+                )
+                return
+            if linked_live_state == "pending":
+                store.defer_job(
+                    job,
+                    reason_code="live_recording_pending",
+                    error="matching Twitch live recording is still in progress",
+                    retry_seconds=self.config.twitch.live_retry_seconds,
+                )
+                return
 
         source_filter_pattern, source_filter = self._compiled_source_filter(store)
         origin_rows = store.media_origins(job.media_id)
@@ -375,27 +623,30 @@ class BackupService:
         force_redownload = False
         if artifact is not None:
             artifact_path = Path(str(artifact["path"]))
-            if artifact["state"] == "ready" and artifact_path.exists():
+            reusable_artifact = artifact["state"] in {"ready", "staged"} or (
+                twitch_vod
+                and linked_live_state is None
+                and artifact["state"] == "suppressed"
+            )
+            if reusable_artifact and artifact_path.exists():
                 store.complete_download(
                     job,
                     path=artifact_path,
                     size_bytes=artifact_path.stat().st_size,
                     delivery_targets=self._delivery_targets(),
                     delivery_max_failures=self.config.app.max_attempts,
+                    live_retry_seconds=self.config.twitch.live_retry_seconds,
                 )
                 return
             force_redownload = True
 
-        if not self._download_delay_elapsed(str(media["first_seen_at"])):
+        if not live_recording and not self._download_delay_elapsed(str(media["first_seen_at"])):
             store.defer_job(job, reason_code="download_delay", error="waiting for download delay", retry_seconds=60)
             return
 
         url = str(media["canonical_url"])
         if str(media["provider"]) == "rss":
             try:
-                metadata = json.loads(str(media["metadata_json"] or "{}"))
-                if not isinstance(metadata, dict):
-                    raise ValueError("RSS media metadata must be an object")
                 validate_public_media_url(
                     url,
                     allowed_hosts=tuple(str(item) for item in metadata.get("allowed_media_hosts", [])),
@@ -416,18 +667,53 @@ class BackupService:
                 store.block_job(job, reason_code="invalid_media_metadata", error=self._safe_error(exc))
                 return
         try:
-            probe = downloader.probe(url, provider=str(media["provider"]))
+            probe = downloader.probe(
+                url,
+                provider=str(media["provider"]),
+                live=live_recording,
+            )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as exc:
             store.fail_job(
                 job,
                 reason_code="probe_failed",
                 error=self._safe_error(exc),
-                retry_seconds=self.config.app.retry_seconds,
+                retry_seconds=(
+                    self.config.twitch.live_retry_seconds
+                    if live_recording
+                    else self.config.app.retry_seconds
+                ),
             )
             return
         if probe.title:
             store.update_media_title(job.media_id, probe.title)
-        if probe.live_status in WAIT_LIVE_STATUSES:
+        expected_stream_id = stream_id
+        if (
+            live_recording
+            and probe.external_id is not None
+            and probe.external_id != expected_stream_id
+        ):
+            if self._finalize_live_segments(store, downloader, job, media):
+                return
+            store.cancel_job(
+                job,
+                reason_code="stream_replaced",
+                error=(
+                    f"expected Twitch stream {expected_stream_id}, "
+                    f"but channel is now streaming {probe.external_id}"
+                ),
+            )
+            return
+        if live_recording and probe.live_status != "is_live":
+            if self._finalize_live_segments(store, downloader, job, media):
+                return
+            store.fail_job(
+                job,
+                reason_code="live_window_missed",
+                error=f"live_status={probe.live_status or 'unknown'}; stream is no longer recordable",
+                retry_seconds=self.config.twitch.live_retry_seconds,
+            )
+            return
+        if not live_recording and probe.live_status in WAIT_LIVE_STATUSES:
             store.defer_job(
                 job,
                 reason_code="not_ready",
@@ -441,14 +727,156 @@ class BackupService:
                 str(media["external_id"]),
                 url,
                 provider=str(media["provider"]),
-                ignore_archive=force_redownload or job.reason_code == "artifact_missing",
+                ignore_archive=force_redownload
+                or job.reason_code in {
+                    "artifact_missing",
+                    "live_interrupted",
+                    "service_stopping",
+                },
+                live=live_recording,
+                cancel_events=(self._stop_event, lease_lost_event),
             )
+        except DownloadCancelled as exc:
+            self._record_live_segment(
+                store,
+                job.media_id,
+                exc.partial_result,
+                reason="service_stopping",
+            )
+            if lease_lost_event.is_set():
+                raise RuntimeError("job lease lost during live recording") from None
+            store.defer_job(
+                job,
+                reason_code="service_stopping",
+                error=(
+                    "live recording stopped with the service; retry starts from "
+                    "the channel's current live position"
+                ),
+                retry_seconds=0,
+            )
+            return
+        except LiveDownloadError as exc:
+            self._record_live_segment(
+                store,
+                job.media_id,
+                exc.partial_result,
+                reason="download_interrupted",
+            )
+            recovery_probe = self._probe_twitch_live(downloader, url)
+            if (
+                recovery_probe is not None
+                and recovery_probe.live_status == "is_live"
+                and recovery_probe.external_id not in {None, expected_stream_id}
+            ):
+                if self._finalize_live_segments(store, downloader, job, media):
+                    return
+                store.cancel_job(
+                    job,
+                    reason_code="stream_replaced",
+                    error=(
+                        f"expected Twitch stream {expected_stream_id}, "
+                        f"but channel is now streaming {recovery_probe.external_id}"
+                    ),
+                )
+                return
+            if (
+                exc.retryable
+                and (
+                    recovery_probe is None
+                    or (
+                        recovery_probe.live_status == "is_live"
+                        and recovery_probe.external_id in {None, expected_stream_id}
+                    )
+                )
+            ):
+                store.defer_job(
+                    job,
+                    reason_code="live_interrupted",
+                    error=(
+                        f"{self._safe_error(exc.cause)}; "
+                        + (
+                            "the same Twitch stream is still live, so recording "
+                            "will reconnect"
+                            if recovery_probe is not None
+                            else (
+                                "Twitch status could not be confirmed, so "
+                                "recording will recheck without consuming its "
+                                "failure budget"
+                            )
+                        )
+                    ),
+                    retry_seconds=self.config.twitch.live_retry_seconds,
+                )
+                return
+            if (
+                recovery_probe is not None
+                and recovery_probe.live_status != "is_live"
+                and self._finalize_live_segments(store, downloader, job, media)
+            ):
+                return
+            store.fail_job(
+                job,
+                reason_code="download_failed",
+                error=self._safe_error(exc.cause),
+                retry_seconds=self.config.twitch.live_retry_seconds,
+            )
+            return
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, RuntimeError) as exc:
             store.fail_job(
                 job,
                 reason_code="download_failed",
                 error=self._safe_error(exc),
-                retry_seconds=self.config.app.retry_seconds,
+                retry_seconds=(
+                    self.config.twitch.live_retry_seconds
+                    if live_recording
+                    else self.config.app.retry_seconds
+                ),
+            )
+            return
+        if live_recording:
+            self._record_live_segment(
+                store,
+                job.media_id,
+                result,
+                reason="stream_finished",
+            )
+            completion_probe = self._probe_twitch_live(downloader, url)
+            if (
+                completion_probe is None
+                or (
+                    completion_probe.live_status == "is_live"
+                    and completion_probe.external_id in {None, expected_stream_id}
+                )
+            ):
+                store.defer_job(
+                    job,
+                    reason_code="live_interrupted",
+                    error=(
+                        "live downloader exited cleanly but the same Twitch "
+                        "stream is still online; recording will reconnect"
+                        if completion_probe is not None
+                        else (
+                            "live downloader exited cleanly but Twitch status "
+                            "could not be confirmed; recording will recheck"
+                        )
+                    ),
+                    retry_seconds=self.config.twitch.live_retry_seconds,
+                )
+                return
+            if self._finalize_live_segments(store, downloader, job, media):
+                return
+            store.fail_job(
+                job,
+                reason_code="live_segment_missing",
+                error="live download finished without a usable recording segment",
+                retry_seconds=self.config.twitch.live_retry_seconds,
+            )
+            return
+        if twitch_vod and store.has_ready_twitch_live_recording(stream_id):
+            store.cancel_job(
+                job,
+                reason_code="live_recording_exists",
+                error="matching Twitch live stream finished while its VOD was downloading",
             )
             return
         store.complete_download(
@@ -457,6 +885,7 @@ class BackupService:
             size_bytes=result.file_size,
             delivery_targets=self._delivery_targets(),
             delivery_max_failures=self.config.app.max_attempts,
+            live_retry_seconds=self.config.twitch.live_retry_seconds,
         )
 
     def _delivery_targets(self) -> tuple[str, ...]:
@@ -490,6 +919,17 @@ class BackupService:
             store.block_job(job, reason_code="media_missing", error="media item no longer exists")
             return
         if artifact is None or artifact["state"] != "ready" or not Path(str(artifact["path"])).exists():
+            try:
+                metadata = json.loads(str(media["metadata_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            if isinstance(metadata, dict) and metadata.get("recording_mode") == "live":
+                store.block_job(
+                    job,
+                    reason_code="live_artifact_missing",
+                    error="live recording artifact is missing and cannot be recreated after the stream",
+                )
+                return
             store.requeue_download(
                 job.media_id,
                 max_failures=self.config.app.max_attempts,
@@ -594,8 +1034,152 @@ class BackupService:
         except RuntimeError:
             self.logger.warning("could not fail job id=%s because its lease was lost", job.id)
 
-    def _all_origins(self) -> list[Origin]:
-        return self.store.list_origins()
+    def _new_source_registry(self) -> SourceRegistry:
+        return SourceRegistry(
+            self.config.twitch,
+            youtube_fetcher=lambda url: fetch_feed(url),
+            rss_fetcher=lambda url: fetch_feed(url),
+        )
+
+    def _all_origins(self, store: Store | None = None) -> list[Origin]:
+        return (store or self.store).list_origins()
+
+    def _is_live_recording_origin(self, origin: Origin) -> bool:
+        try:
+            return twitch_recording_mode(origin, self.config.twitch) == "live"
+        except SourceError as exc:
+            self.logger.warning("invalid Twitch recording mode origin=%s: %s", origin.id, exc)
+            return False
+
+    def _origin_seed_content_kind(self, origin: Origin) -> str | None:
+        if origin.provider != "twitch":
+            return None
+        if origin.kind == "vods":
+            return (
+                "live_stream"
+                if self._is_live_recording_origin(origin)
+                else "vod"
+            )
+        return {
+            "highlights": "highlight",
+            "uploads": "upload",
+        }.get(origin.kind)
+
+    def _origin_poll_configuration_is_current(
+        self,
+        store: Store,
+        polled_origin: Origin,
+    ) -> bool:
+        if polled_origin.provider != "twitch" or polled_origin.kind != "vods":
+            return True
+        current = next(
+            (
+                origin
+                for origin in store.list_origins()
+                if origin.id == polled_origin.id
+            ),
+            None,
+        )
+        if current is None or not current.enabled:
+            return False
+        try:
+            return twitch_recording_mode(
+                current,
+                self.config.twitch,
+            ) == twitch_recording_mode(
+                polled_origin,
+                self.config.twitch,
+            )
+        except SourceError:
+            return False
+
+    def _has_enabled_live_origin(self, store: Store, media_id: int) -> bool:
+        media_origin_ids = {
+            str(row["id"])
+            for row in store.media_origins(media_id)
+            if row["disposition"] == "eligible"
+        }
+        return any(
+            origin.id in media_origin_ids
+            and origin.enabled
+            and self._is_live_recording_origin(origin)
+            for origin in store.list_origins()
+        )
+
+    def _probe_twitch_live(
+        self,
+        downloader: Downloader,
+        url: str,
+    ) -> ProbeResult | None:
+        try:
+            return downloader.probe(url, provider="twitch", live=True)
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+            json.JSONDecodeError,
+            RuntimeError,
+        ):
+            return None
+
+    def _record_live_segment(
+        self,
+        store: Store,
+        media_id: int,
+        result: DownloadResult | None,
+        *,
+        reason: str,
+    ) -> None:
+        if result is None or not result.file_path.is_file() or result.file_size <= 0:
+            return
+        metadata: dict[str, object] = {"reason": reason}
+        if result.attempt_order is not None:
+            metadata["attempt_order"] = result.attempt_order
+        store.record_live_segment(
+            media_id,
+            path=result.file_path,
+            size_bytes=result.file_size,
+            metadata=metadata,
+        )
+
+    def _finalize_live_segments(
+        self,
+        store: Store,
+        downloader: Downloader,
+        job: ClaimedJob,
+        media,
+    ) -> bool:
+        paths = store.live_segment_paths(job.media_id)
+        if not paths:
+            return False
+        try:
+            result = downloader.merge_live_segments(
+                str(media["external_id"]),
+                paths,
+                provider=str(media["provider"]),
+            )
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+            RuntimeError,
+        ) as exc:
+            store.fail_job(
+                job,
+                reason_code="live_segment_merge_failed",
+                error=self._safe_error(exc),
+                retry_seconds=self.config.twitch.live_retry_seconds,
+            )
+            return True
+        store.complete_download(
+            job,
+            path=result.file_path,
+            size_bytes=result.file_size,
+            delivery_targets=self._delivery_targets(),
+            delivery_max_failures=self.config.app.max_attempts,
+            live_retry_seconds=self.config.twitch.live_retry_seconds,
+        )
+        return True
 
     def _compiled_source_filter(self, store: Store | None = None):
         pattern = self._source_filter_pattern(store)
@@ -665,25 +1249,77 @@ class _LeaseHeartbeat:
         self.lease_seconds = lease_seconds
         self.logger = logger
         self._stop = threading.Event()
+        self.lost_event = threading.Event()
+        self.ready_event = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"lease-heartbeat-{job.id}", daemon=True)
 
-    def start(self) -> None:
+    def start(self) -> bool:
         self._thread.start()
+        startup_timeout = max(1.0, min(5.0, self.lease_seconds * 0.2))
+        if not self.ready_event.wait(timeout=startup_timeout):
+            self.logger.warning("lease heartbeat did not become ready job id=%s", self.job.id)
+            self._stop.set()
+            self._thread.join(timeout=2)
+            return False
+        return not self.lost_event.is_set()
 
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=2)
 
     def _run(self) -> None:
-        interval = max(5, self.lease_seconds // 3)
-        store = Store(self.db_path)
-        store.initialize()
+        interval = max(5, min(30, self.lease_seconds // 3))
+        last_renewed = time.monotonic()
+        next_wait = 0
+        conn: sqlite3.Connection | None = None
         try:
-            while not self._stop.wait(interval):
-                if not store.renew_lease(self.job, self.lease_seconds):
-                    self.logger.warning("lease heartbeat lost job id=%s", self.job.id)
-                    return
-        except sqlite3.Error as exc:
-            self.logger.warning("lease heartbeat failed job id=%s: %s", self.job.id, exc)
+            conn = sqlite3.connect(self.db_path, timeout=1)
+            conn.execute("PRAGMA busy_timeout=1000")
+            while not self._stop.wait(next_wait):
+                try:
+                    cursor = conn.execute(
+                        """
+                        UPDATE jobs SET lease_until=?, updated_at=?
+                        WHERE id=? AND state='running' AND lease_token=?
+                        """,
+                        (
+                            future_iso(self.lease_seconds),
+                            now_iso(),
+                            self.job.id,
+                            self.job.lease_token,
+                        ),
+                    )
+                    conn.commit()
+                    if cursor.rowcount != 1:
+                        self.logger.warning("lease heartbeat lost job id=%s", self.job.id)
+                        self.lost_event.set()
+                        return
+                    last_renewed = time.monotonic()
+                    self.ready_event.set()
+                    next_wait = interval
+                except sqlite3.Error as exc:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    elapsed = time.monotonic() - last_renewed
+                    self.logger.warning(
+                        "lease heartbeat retrying job id=%s elapsed=%.1fs: %s",
+                        self.job.id,
+                        elapsed,
+                        exc,
+                    )
+                    if elapsed >= max(5, self.lease_seconds * 0.8):
+                        self.logger.warning("lease heartbeat gave up job id=%s", self.job.id)
+                        self.lost_event.set()
+                        return
+                    next_wait = 1
+        except Exception as exc:
+            self.logger.warning(
+                "lease heartbeat crashed job id=%s: %s",
+                self.job.id,
+                exc,
+            )
+            self.lost_event.set()
         finally:
-            store.close()
+            self.ready_event.set()
+            if conn is not None:
+                conn.close()

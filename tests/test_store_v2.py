@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -99,6 +100,93 @@ class StoreV2Test(unittest.TestCase):
             self.assertFalse(store.delete_control_origin("config-yt"))
             self.assertTrue(store.delete_control_origin(twitch.id))
             self.assertIsNotNone(store.conn.execute("SELECT 1 FROM origins WHERE id='config-yt'").fetchone())
+
+    def test_control_twitch_recording_mode_preserves_options_and_invalidates_poll_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            twitch = Origin(
+                "db:twitch:vods:example",
+                "twitch",
+                "vods",
+                "Example",
+                "example",
+                options={
+                    "created_from": "telegram_panel",
+                    "language": "ja",
+                    "recording_mode": "vod",
+                },
+            )
+            store.upsert_control_origin(twitch, created_by="123")
+            store.record_origin_poll_success(
+                twitch.id,
+                cursor='{"external_id":"old-vod"}',
+            )
+            store.get_panel_snapshot(None, force=True)
+
+            self.assertTrue(
+                store.set_control_twitch_recording_mode(twitch.id, "live")
+            )
+
+            row = store.conn.execute(
+                "SELECT options_json FROM origins WHERE id=?",
+                (twitch.id,),
+            ).fetchone()
+            options = json.loads(str(row["options_json"]))
+            self.assertEqual(
+                options,
+                {
+                    "created_from": "telegram_panel",
+                    "language": "ja",
+                    "recording_mode": "live",
+                },
+            )
+            self.assertIsNone(store.get_origin_checkpoint(twitch.id))
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT dirty FROM panel_snapshots WHERE cache_key='global'"
+                ).fetchone()["dirty"],
+                1,
+            )
+            snapshot = store.get_panel_snapshot(None)
+            twitch_snapshot = next(
+                origin
+                for origin in snapshot["origins"]
+                if origin["id"] == twitch.id
+            )
+            self.assertEqual(twitch_snapshot["recording_mode"], "live")
+
+            config_twitch = Origin(
+                "config-twitch",
+                "twitch",
+                "vods",
+                "Config Twitch",
+                "config",
+            )
+            highlight = Origin(
+                "db:twitch:highlights:example",
+                "twitch",
+                "highlights",
+                "Highlights",
+                "example",
+            )
+            store.upsert_origin(config_twitch)
+            store.upsert_control_origin(highlight, created_by="123")
+            self.assertFalse(
+                store.set_control_twitch_recording_mode(
+                    config_twitch.id,
+                    "live",
+                )
+            )
+            self.assertFalse(
+                store.set_control_twitch_recording_mode(
+                    highlight.id,
+                    "live",
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "recording_mode"):
+                store.set_control_twitch_recording_mode(twitch.id, "archive")
+            store.close()
 
     def test_provider_namespace_and_many_origin_relationships(self):
         with tempfile.TemporaryDirectory() as tmp:

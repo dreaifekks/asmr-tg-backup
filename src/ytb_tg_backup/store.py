@@ -463,6 +463,54 @@ class Store:
         self.conn.commit()
         return cursor.rowcount == 1
 
+    def set_control_twitch_recording_mode(
+        self,
+        origin_id: str,
+        recording_mode: str,
+    ) -> bool:
+        mode = recording_mode.lower().strip()
+        if mode not in {"vod", "live"}:
+            raise ValueError("recording_mode must be 'vod' or 'live'")
+        row = self.conn.execute(
+            """
+            SELECT options_json
+            FROM origins
+            WHERE id=? AND managed_by='control'
+              AND provider='twitch' AND kind='vods'
+            """,
+            (origin_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            options = json.loads(str(row["options_json"] or "{}"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("origin options_json is invalid") from exc
+        if not isinstance(options, dict):
+            raise ValueError("origin options_json must be an object")
+        options["recording_mode"] = mode
+        now = now_iso()
+        self.conn.execute(
+            """
+            UPDATE origins SET options_json=?, updated_at=?
+            WHERE id=? AND managed_by='control'
+              AND provider='twitch' AND kind='vods'
+            """,
+            (
+                json.dumps(options, ensure_ascii=False, sort_keys=True),
+                now,
+                origin_id,
+            ),
+        )
+        # Make the new mode eligible for polling as soon as its worker wakes.
+        # The service's mode reconciliation also updates its durable marker.
+        self.conn.execute(
+            "DELETE FROM origin_poll_state WHERE origin_id=?",
+            (origin_id,),
+        )
+        self.conn.commit()
+        return True
+
     def delete_control_origin(self, origin_id: str) -> bool:
         cursor = self.conn.execute(
             "DELETE FROM origins WHERE id=? AND managed_by='control'",
@@ -510,6 +558,7 @@ class Store:
                 if (
                     age <= max_age_seconds
                     and isinstance(payload, dict)
+                    and payload.get("version") == 2
                     and payload.get("source_filter_pattern") == source_filter_pattern
                 ):
                     return payload
@@ -534,11 +583,14 @@ class Store:
                     "last_success_at": str(row["last_success_at"]) if row["last_success_at"] else None,
                     "last_error_code": str(row["last_error_code"]) if row["last_error_code"] else None,
                     "next_poll_at": str(row["next_poll_at"]) if row["next_poll_at"] else None,
+                    "recording_mode": _origin_recording_mode_override(
+                        row["options_json"]
+                    ),
                 }
                 for row in self.list_origin_statuses()
             ]
             payload: dict[str, object] = {
-                "version": 1,
+                "version": 2,
                 "generated_at": generated_at,
                 "source_filter_pattern": source_filter_pattern,
                 "origins": origins,
@@ -583,8 +635,28 @@ class Store:
         self.conn.commit()
         return cursor.rowcount > 0
 
-    def origin_has_items(self, origin_id: str) -> bool:
-        row = self.conn.execute("SELECT 1 FROM origin_items WHERE origin_id = ? LIMIT 1", (origin_id,)).fetchone()
+    def origin_has_items(
+        self,
+        origin_id: str,
+        *,
+        content_kind: str | None = None,
+    ) -> bool:
+        if content_kind is None:
+            row = self.conn.execute(
+                "SELECT 1 FROM origin_items WHERE origin_id = ? LIMIT 1",
+                (origin_id,),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                """
+                SELECT 1
+                FROM origin_items oi
+                JOIN media_items mi ON mi.id=oi.media_id
+                WHERE oi.origin_id=? AND mi.content_kind=?
+                LIMIT 1
+                """,
+                (origin_id, content_kind),
+            ).fetchone()
         return row is not None
 
     def upsert_discovered(
@@ -596,6 +668,7 @@ class Store:
         decision_code: str | None = None,
         decision_reason: str | None = None,
         max_failures: int = 5,
+        job_payload: dict[str, object] | None = None,
     ) -> tuple[int, bool]:
         now = now_iso()
         existing = self.conn.execute(
@@ -672,14 +745,37 @@ class Store:
             (origin_id, media_id),
         ).fetchone()
         if effective is not None and effective["disposition"] == "eligible":
-            job_id = self._ensure_job(media_id, "download", "", max_failures=max_failures)
+            job_id = self._ensure_job(
+                media_id,
+                "download",
+                "",
+                max_failures=max_failures,
+                payload=job_payload,
+            )
+            retriable_reasons = ["source_filter"]
+            candidate_stream_id = str(candidate.metadata.get("stream_id") or "")
+            if (
+                candidate.provider == "twitch"
+                and candidate.content_kind == "vod"
+                and candidate_stream_id
+                and not self.has_ready_twitch_live_recording(candidate_stream_id)
+            ):
+                retriable_reasons.append("live_recording_exists")
+            if (
+                job_payload
+                and job_payload.get("download_lane") == "live"
+                and job_payload.get("recording_mode") == "live"
+            ):
+                retriable_reasons.append("live_origin_disabled")
+            placeholders = ",".join("?" for _ in retriable_reasons)
             self.conn.execute(
-                """
+                f"""
                 UPDATE jobs SET state='queued', failure_count=0, available_at=?,
                   reason_code=NULL, last_error=NULL, finished_at=NULL, updated_at=?
-                WHERE id=? AND state='cancelled' AND reason_code='source_filter'
+                WHERE id=? AND state='cancelled'
+                  AND reason_code IN ({placeholders})
                 """,
-                (now, now, job_id),
+                (now, now, job_id, *retriable_reasons),
             )
         self.conn.commit()
         return media_id, created
@@ -742,6 +838,29 @@ class Store:
     def origin_poll_due(self, origin_id: str) -> bool:
         row = self.conn.execute("SELECT next_poll_at FROM origin_poll_state WHERE origin_id = ?", (origin_id,)).fetchone()
         return row is None or row["next_poll_at"] is None or str(row["next_poll_at"]) <= now_iso()
+
+    def reconcile_origin_poll_mode(self, origin_id: str, recording_mode: str) -> bool:
+        if recording_mode not in {"vod", "live"}:
+            raise ValueError("recording_mode must be 'vod' or 'live'")
+        key = f"_origin_poll_mode:{origin_id}"
+        row = self.conn.execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
+        previous_mode = str(row["value"]) if row is not None else None
+        reset_poll_state = (
+            previous_mode is not None and previous_mode != recording_mode
+        ) or (
+            previous_mode is None and recording_mode == "live"
+        )
+        self.conn.execute(
+            """
+            INSERT INTO bot_state(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, recording_mode),
+        )
+        if reset_poll_state:
+            self.conn.execute("DELETE FROM origin_poll_state WHERE origin_id=?", (origin_id,))
+        self.conn.commit()
+        return reset_poll_state
 
     def get_origin_checkpoint(self, origin_id: str) -> str | None:
         row = self.conn.execute(
@@ -812,12 +931,26 @@ class Store:
         *,
         owner: str,
         lease_seconds: int,
+        download_lane: str | None = None,
     ) -> ClaimedJob | None:
         if not job_types:
             return None
+        if download_lane not in {None, "standard", "live"}:
+            raise ValueError("download_lane must be 'standard', 'live', or None")
         self.recover_stale_jobs(commit=True)
         now = now_iso()
         placeholders = ",".join("?" for _ in job_types)
+        lane_clause = ""
+        if download_lane == "live":
+            lane_clause = (
+                "AND job_type='download' "
+                "AND COALESCE(json_extract(payload_json, '$.download_lane'), 'standard')='live'"
+            )
+        elif download_lane == "standard":
+            lane_clause = (
+                "AND (job_type!='download' "
+                "OR COALESCE(json_extract(payload_json, '$.download_lane'), 'standard')!='live')"
+            )
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             row = self.conn.execute(
@@ -827,6 +960,7 @@ class Store:
                   AND state IN ('queued', 'retry')
                   AND failure_count < max_failures
                   AND available_at <= ?
+                  {lane_clause}
                 ORDER BY CASE job_type WHEN 'telegram_delivery' THEN 0 ELSE 1 END,
                          available_at ASC, id ASC
                 LIMIT 1
@@ -971,19 +1105,46 @@ class Store:
         size_bytes: int,
         delivery_targets: tuple[str, ...] = (),
         delivery_max_failures: int | None = None,
+        live_retry_seconds: int = 15,
     ) -> int:
         now = now_iso()
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             self._assert_lease(job)
+            media = self.conn.execute(
+                "SELECT provider, content_kind, metadata_json FROM media_items WHERE id=?",
+                (job.media_id,),
+            ).fetchone()
+            metadata: dict[str, object] = {}
+            if media is not None:
+                decoded = json.loads(str(media["metadata_json"] or "{}"))
+                if isinstance(decoded, dict):
+                    metadata = decoded
+            twitch_vod_stream_id = ""
+            if (
+                media is not None
+                and str(media["provider"]) == "twitch"
+                and str(media["content_kind"]) == "vod"
+            ):
+                twitch_vod_stream_id = str(metadata.get("stream_id") or "")
+            linked_live_state = (
+                self.twitch_live_recording_state(twitch_vod_stream_id)
+                if twitch_vod_stream_id
+                else None
+            )
+            artifact_state = {
+                "ready": "suppressed",
+                "pending": "staged",
+            }.get(linked_live_state, "ready")
             self.conn.execute(
                 """
                 INSERT INTO artifacts(media_id, role, part_no, path, size_bytes, state, created_at, updated_at)
-                VALUES (?, 'master', 0, ?, ?, 'ready', ?, ?)
+                VALUES (?, 'master', 0, ?, ?, ?, ?, ?)
                 ON CONFLICT(media_id, role, part_no) DO UPDATE SET
-                  path=excluded.path, size_bytes=excluded.size_bytes, state='ready', updated_at=excluded.updated_at
+                  path=excluded.path, size_bytes=excluded.size_bytes,
+                  state=excluded.state, updated_at=excluded.updated_at
                 """,
-                (job.media_id, str(path), size_bytes, now, now),
+                (job.media_id, str(path), size_bytes, artifact_state, now, now),
             )
             artifact_id = int(
                 self.conn.execute(
@@ -991,8 +1152,133 @@ class Store:
                     (job.media_id,),
                 ).fetchone()[0]
             )
+            if linked_live_state in {"ready", "pending"}:
+                state = "cancelled" if linked_live_state == "ready" else "retry"
+                reason_code = (
+                    "live_recording_exists"
+                    if linked_live_state == "ready"
+                    else "live_recording_pending"
+                )
+                error = (
+                    "matching Twitch live stream was already archived"
+                    if linked_live_state == "ready"
+                    else "matching Twitch live recording is still in progress"
+                )
+                available_at = (
+                    now
+                    if linked_live_state == "ready"
+                    else future_iso(max(1, live_retry_seconds))
+                )
+                cursor = self.conn.execute(
+                    """
+                    UPDATE jobs SET state=?, reason_code=?, last_error=?,
+                      available_at=?, lease_owner=NULL, lease_token=NULL,
+                      lease_until=NULL, finished_at=?, updated_at=?
+                    WHERE id=? AND state='running' AND lease_token=?
+                    """,
+                    (
+                        state,
+                        reason_code,
+                        error,
+                        available_at,
+                        now if state == "cancelled" else None,
+                        now,
+                        job.id,
+                        job.lease_token,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("job lease is no longer owned by this worker")
+                self.conn.commit()
+                return artifact_id
+            suppress_current_delivery = False
+            if (
+                media is not None
+                and str(media["provider"]) == "twitch"
+                and str(media["content_kind"]) == "live_stream"
+            ):
+                stream_id = str(metadata.get("stream_id") or "")
+                if stream_id:
+                    matching_vod_media = """
+                        SELECT id FROM media_items
+                        WHERE provider='twitch'
+                          AND content_kind='vod'
+                          AND json_extract(metadata_json, '$.stream_id')=?
+                    """
+                    vod_delivery_started = bool(
+                        self.conn.execute(
+                            f"""
+                            SELECT
+                              EXISTS(
+                                SELECT 1 FROM deliveries
+                                WHERE media_id IN ({matching_vod_media})
+                              )
+                              OR EXISTS(
+                                SELECT 1 FROM jobs
+                                WHERE job_type='telegram_delivery'
+                                  AND media_id IN ({matching_vod_media})
+                                  AND state IN ('running', 'succeeded', 'uncertain')
+                              )
+                            """,
+                            (stream_id, stream_id),
+                        ).fetchone()[0]
+                    )
+                    if vod_delivery_started:
+                        suppress_current_delivery = True
+                        self.conn.execute(
+                            """
+                            UPDATE artifacts SET state='suppressed', updated_at=?
+                            WHERE id=?
+                            """,
+                            (now, artifact_id),
+                        )
+                    else:
+                        self.conn.execute(
+                            f"""
+                            UPDATE jobs SET
+                              state='cancelled',
+                              reason_code='live_recording_exists',
+                              last_error='matching Twitch live stream was already archived',
+                              lease_owner=NULL,
+                              lease_token=NULL,
+                              lease_until=NULL,
+                              finished_at=?,
+                              updated_at=?
+                            WHERE job_type='download'
+                              AND media_id IN ({matching_vod_media})
+                              AND state IN ('queued', 'retry', 'blocked', 'succeeded')
+                            """,
+                            (now, now, stream_id),
+                        )
+                        self.conn.execute(
+                            f"""
+                            UPDATE jobs SET
+                              state='cancelled',
+                              reason_code='live_recording_exists',
+                              last_error='matching Twitch live stream was already archived',
+                              lease_owner=NULL,
+                              lease_token=NULL,
+                              lease_until=NULL,
+                              finished_at=?,
+                              updated_at=?
+                            WHERE job_type='telegram_delivery'
+                              AND media_id IN ({matching_vod_media})
+                              AND state IN ('queued', 'retry', 'blocked')
+                            """,
+                            (now, now, stream_id),
+                        )
+                        self.conn.execute(
+                            f"""
+                            UPDATE artifacts SET state='suppressed', updated_at=?
+                            WHERE role='master'
+                              AND media_id IN ({matching_vod_media})
+                            """,
+                            (now, stream_id),
+                        )
             max_failures = delivery_max_failures or job.max_attempts
-            for destination_key in dict.fromkeys(delivery_targets):
+            for destination_key in (
+                () if suppress_current_delivery else dict.fromkeys(delivery_targets)
+            ):
                 self._ensure_job(
                     job.media_id,
                     "telegram_delivery",
@@ -1036,6 +1322,84 @@ class Store:
                 (media_id, role, part_no),
             ).fetchone()[0]
         )
+
+    def record_live_segment(
+        self,
+        media_id: int,
+        *,
+        path: Path,
+        size_bytes: int,
+        metadata: dict[str, object] | None = None,
+    ) -> int:
+        now = now_iso()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.conn.execute(
+                """
+                SELECT part_no FROM artifacts
+                WHERE media_id=? AND role='live_segment' AND path=?
+                """,
+                (media_id, str(path)),
+            ).fetchone()
+            if existing is not None:
+                self.conn.commit()
+                return int(existing["part_no"])
+            part_no = int(
+                self.conn.execute(
+                    """
+                    SELECT COALESCE(MAX(part_no), -1) + 1
+                    FROM artifacts
+                    WHERE media_id=? AND role='live_segment'
+                    """,
+                    (media_id,),
+                ).fetchone()[0]
+            )
+            self.conn.execute(
+                """
+                INSERT INTO artifacts(
+                  media_id, role, part_no, path, size_bytes, state,
+                  metadata_json, created_at, updated_at
+                ) VALUES (?, 'live_segment', ?, ?, ?, 'ready', ?, ?, ?)
+                """,
+                (
+                    media_id,
+                    part_no,
+                    str(path),
+                    size_bytes,
+                    json.dumps(metadata or {}, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            self.conn.commit()
+            return part_no
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def live_segment_paths(self, media_id: int) -> list[Path]:
+        return [
+            Path(str(row["path"]))
+            for row in self.conn.execute(
+                """
+                SELECT path FROM artifacts
+                WHERE media_id=? AND role='live_segment' AND state='ready'
+                ORDER BY
+                  CASE
+                    WHEN json_type(metadata_json, '$.attempt_order')='integer'
+                    THEN 1 ELSE 0
+                  END,
+                  CASE
+                    WHEN json_type(metadata_json, '$.attempt_order')='integer'
+                    THEN CAST(json_extract(metadata_json, '$.attempt_order') AS INTEGER)
+                    ELSE part_no
+                  END,
+                  part_no
+                """,
+                (media_id,),
+            ).fetchall()
+            if Path(str(row["path"])).is_file()
+        ]
 
     def complete_delivery(
         self,
@@ -1109,6 +1473,45 @@ class Store:
             "SELECT * FROM artifacts WHERE media_id=? AND role=? AND part_no=?",
             (media_id, role, part_no),
         ).fetchone()
+
+    def has_ready_twitch_live_recording(self, stream_id: str) -> bool:
+        if not stream_id:
+            return False
+        rows = self.conn.execute(
+            """
+            SELECT a.path
+            FROM media_items mi
+            JOIN artifacts a ON a.media_id=mi.id
+            WHERE mi.provider='twitch'
+              AND mi.content_kind='live_stream'
+              AND json_extract(mi.metadata_json, '$.stream_id')=?
+              AND a.role='master'
+              AND a.part_no=0
+              AND a.state='ready'
+            """,
+            (stream_id,),
+        ).fetchall()
+        return any(Path(str(row["path"])).is_file() for row in rows)
+
+    def twitch_live_recording_state(self, stream_id: str) -> str | None:
+        if not stream_id:
+            return None
+        if self.has_ready_twitch_live_recording(stream_id):
+            return "ready"
+        row = self.conn.execute(
+            """
+            SELECT 1
+            FROM media_items mi
+            JOIN jobs j ON j.media_id=mi.id AND j.job_type='download'
+            WHERE mi.provider='twitch'
+              AND mi.content_kind='live_stream'
+              AND json_extract(mi.metadata_json, '$.stream_id')=?
+              AND j.state IN ('queued', 'retry', 'running')
+            LIMIT 1
+            """,
+            (stream_id,),
+        ).fetchone()
+        return "pending" if row is not None else None
 
     def recover_stale_jobs(self, *, commit: bool = True) -> None:
         now = now_iso()
@@ -1435,6 +1838,26 @@ class Store:
             (key, value),
         )
         self.conn.commit()
+
+    def list_bot_states(self, key_prefix: str) -> list[tuple[str, str]]:
+        rows = self.conn.execute(
+            """
+            SELECT key, value
+            FROM bot_state
+            WHERE substr(key, 1, ?) = ?
+            ORDER BY key
+            """,
+            (len(key_prefix), key_prefix),
+        ).fetchall()
+        return [(str(row["key"]), str(row["value"])) for row in rows]
+
+    def delete_bot_state(self, key: str) -> bool:
+        cursor = self.conn.execute(
+            "DELETE FROM bot_state WHERE key=?",
+            (key,),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1862,3 +2285,14 @@ def future_iso(seconds: int) -> str:
 
 def row_dict(row: sqlite3.Row) -> dict[str, object]:
     return dict(row)
+
+
+def _origin_recording_mode_override(options_json: object) -> str | None:
+    try:
+        options = json.loads(str(options_json or "{}"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(options, dict):
+        return None
+    mode = str(options.get("recording_mode") or "").lower().strip()
+    return mode if mode in {"vod", "live"} else None

@@ -20,7 +20,7 @@ external_id = "UC_CHANNEL_ID"
 bootstrap = "latest"
 enabled = false
 
-# Public Twitch VOD placeholder. Supply the credentials only through the
+# Twitch VOD/live placeholder. Supply the credentials only through the
 # environment variables named in [twitch].
 [[origins]]
 id = "twitch-placeholder"
@@ -30,6 +30,9 @@ name = "Twitch ASMR placeholder"
 external_id = "twitch_login_or_numeric_broadcaster_id"
 bootstrap = "latest"
 enabled = false
+# Only twitch/vods supports this per-origin override. Panel-managed Twitch
+# channels store the same choice in SQLite.
+# recording_mode = "live"
 
 [download]
 yt_dlp = "/home/your-user/dev/ytb-tg-backup/.venv/bin/yt-dlp"
@@ -76,11 +79,21 @@ access_token_env = "TWITCH_ACCESS_TOKEN"
 client_secret_env = "TWITCH_CLIENT_SECRET"
 request_timeout_seconds = 30
 max_pages_per_poll = 3
+# Fallback for Twitch vods origins without their own recording_mode. The panel
+# persists its live/vod selection per bot-managed channel in SQLite.
+recording_mode = "vod"
+live_poll_interval_seconds = 30
+live_retry_seconds = 15
+live_worker_count = 1
+# 0 disables the wall-clock timeout for long-running live recordings.
+live_download_timeout_seconds = 0
 
 [control]
 enabled = false
 # Telegram getUpdates long-poll window; accepted range is 1-30 seconds.
 poll_interval_seconds = 10
+# Close the inline panel after one idle hour. 0 keeps it active indefinitely.
+panel_idle_timeout_seconds = 3600
 delete_webhook_on_startup = true
 default_routes = ["live"]
 # /panel is a single edited inline-keyboard message; its state survives restarts.

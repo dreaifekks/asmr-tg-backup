@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
 import re
+import secrets
 import shlex
 from typing import Any
 from urllib.error import HTTPError
@@ -24,6 +26,7 @@ from .youtube import resolve_channel_id
 PANEL_STATE_PREFIX = "control_panel_v1"
 PANEL_PAGE_SIZE = 6
 PANEL_SNAPSHOT_MAX_AGE_SECONDS = 30
+PANEL_REVISION_SEPARATOR = "~"
 TWITCH_KINDS = {"vods", "highlights", "uploads"}
 TWITCH_LOGIN_PATTERN = re.compile(r"[a-zA-Z0-9_]{1,25}")
 
@@ -71,6 +74,7 @@ class ControlBot:
                 self._handle_update(update)
             finally:
                 self.store.set_bot_offset(update_id)
+        self.expire_idle_panels()
 
     def register_commands(self) -> None:
         if not self.config.control.enabled or not self.config.telegram.bot_token:
@@ -167,6 +171,13 @@ class ControlBot:
             if self.store.set_control_origin_enabled(rest[0], enabled):
                 return f"{'enabled' if enabled else 'disabled'}: {rest[0]}"
             return f"not found or config-managed: {rest[0]}"
+        if action in {"mode", "recording_mode"}:
+            if len(rest) != 2 or rest[1].lower() not in {"vod", "live"}:
+                return "usage: /origin mode <origin_id> <vod|live>"
+            mode = rest[1].lower()
+            if self.store.set_control_twitch_recording_mode(rest[0], mode):
+                return f"recording mode={mode}: {rest[0]}"
+            return f"not found, config-managed, or not twitch/vods: {rest[0]}"
         if action in {"del", "delete", "rm", "remove"}:
             if len(rest) != 1:
                 return "usage: /origin del <origin_id>"
@@ -175,7 +186,13 @@ class ControlBot:
             return f"not found or config-managed: {rest[0]}"
         return self._origin_usage()
 
-    def _origin_add(self, args: list[str], message: dict[str, Any]) -> str:
+    def _origin_add(
+        self,
+        args: list[str],
+        message: dict[str, Any],
+        *,
+        recording_mode: str | None = None,
+    ) -> str:
         if len(args) < 2:
             return self._origin_usage()
         provider = args[0].lower()
@@ -200,6 +217,16 @@ class ControlBot:
         else:
             return "panel currently supports youtube and twitch origins"
 
+        effective_recording_mode: str | None = None
+        if provider == "twitch" and kind == "vods":
+            effective_recording_mode = (
+                recording_mode or self.config.twitch.recording_mode
+            ).lower().strip()
+            if effective_recording_mode not in {"vod", "live"}:
+                raise ValueError("recording_mode must be 'vod' or 'live'")
+        elif recording_mode is not None:
+            raise ValueError("recording_mode is only supported for twitch/vods")
+
         name = " ".join(remaining[1:]).strip() or _default_name(source_ref)
         existing = next(
             (
@@ -213,11 +240,25 @@ class ControlBot:
             None,
         )
         if existing is not None:
+            if recording_mode is not None and effective_recording_mode is not None:
+                if not self.store.set_control_twitch_recording_mode(
+                    str(existing["id"]),
+                    effective_recording_mode,
+                ):
+                    raise ValueError("existing Twitch origin is no longer editable")
             self.store.set_control_origin_enabled(str(existing["id"]), True)
-            return f"already exists; enabled: {existing['id']}"
+            mode_suffix = (
+                f" mode={effective_recording_mode}"
+                if recording_mode is not None and effective_recording_mode is not None
+                else ""
+            )
+            return f"already exists; enabled: {existing['id']}{mode_suffix}"
 
         credentials_ready = self._twitch_credentials_ready()
         enabled = provider != "twitch" or credentials_ready
+        options: dict[str, Any] = {"created_from": "telegram_panel"}
+        if effective_recording_mode is not None:
+            options["recording_mode"] = effective_recording_mode
         origin = Origin(
             id=_dynamic_origin_id(provider, kind, external_id),
             provider=provider,
@@ -226,7 +267,7 @@ class ControlBot:
             external_id=external_id,
             enabled=enabled,
             bootstrap="latest",
-            options={"created_from": "telegram_panel"},
+            options=options,
         )
         created_by = str((message.get("from") or {}).get("id") or "")
         created = self.store.upsert_control_origin(
@@ -238,13 +279,37 @@ class ControlBot:
         suffix = ""
         if provider == "twitch" and not credentials_ready:
             suffix = "; disabled until Twitch credentials are configured and it is enabled"
-        return f"{action}: {origin.id} -> {provider}/{kind}:{external_id}{suffix}"
+        mode_suffix = (
+            f" mode={effective_recording_mode}"
+            if effective_recording_mode is not None
+            else ""
+        )
+        return (
+            f"{action}: {origin.id} -> {provider}/{kind}:{external_id}"
+            f"{mode_suffix}{suffix}"
+        )
 
     def _twitch_credentials_ready(self) -> bool:
         return bool(
             self.config.twitch.client_id
             and (self.config.twitch.access_token or self.config.twitch.client_secret)
         )
+
+    def _effective_twitch_recording_mode(self, row: Any) -> str | None:
+        if str(row["provider"]) != "twitch" or str(row["kind"]) != "vods":
+            return None
+        override: object = None
+        try:
+            override = row["recording_mode"]
+        except (IndexError, KeyError, TypeError):
+            try:
+                options = json.loads(str(row["options_json"] or "{}"))
+            except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+                options = {}
+            if isinstance(options, dict):
+                override = options.get("recording_mode")
+        mode = str(override or self.config.twitch.recording_mode).lower().strip()
+        return mode if mode in {"vod", "live"} else self.config.twitch.recording_mode
 
     def _origin_list(self) -> str:
         rows = self.store.list_origin_statuses()
@@ -253,9 +318,12 @@ class ControlBot:
             state = "on" if row["enabled"] else "off"
             owner = "bot" if row["managed_by"] == "control" else "config"
             error = f" error={row['last_error_code']}" if row["last_error_code"] else ""
+            mode = self._effective_twitch_recording_mode(row)
+            mode_text = f" mode={mode}" if mode else ""
             lines.append(
                 f"- {row['id']} [{owner}:{state}] {row['provider']}/{row['kind']} "
-                f"{row['name']} -> {row['external_id']} items={row['item_count']}{error}"
+                f"{row['name']} -> {row['external_id']}{mode_text} "
+                f"items={row['item_count']}{error}"
             )
         if len(lines) == 2:
             lines.append("(none)")
@@ -270,6 +338,7 @@ class ControlBot:
                 "/origin add twitch [vods|highlights|uploads] <login|user_id> [name]",
                 "/origin list",
                 "/origin enable|disable <origin_id>",
+                "/origin mode <origin_id> <vod|live>",
                 "/origin del <origin_id>",
             ]
         )
@@ -286,16 +355,53 @@ class ControlBot:
                 {"callback_query_id": callback_id, "text": "unauthorized", "show_alert": True},
             )
             return
+        raw_data = str(callback.get("data") or "")
+        state = self._load_panel_state(message)
+        callback_message_id = callback_message.get("message_id")
+        current_message_id = state.get("message_id")
+        if (
+            callback_message_id is None
+            or current_message_id is None
+            or str(callback_message_id) != str(current_message_id)
+        ):
+            self._answer_inactive_panel_callback(
+                callback_id,
+                "这个面板不是你当前的会话，请发送 /panel 重新打开。",
+            )
+            return
+        if not bool(state.get("active", True)):
+            self._answer_inactive_panel_callback(
+                callback_id,
+                "控制面板已关闭，请发送 /panel 重新打开。",
+            )
+            return
+        if self._panel_state_is_expired(state):
+            self._answer_inactive_panel_callback(
+                callback_id,
+                "控制面板已过期，请发送 /panel 重新打开。",
+            )
+            self._close_panel_state(
+                self._panel_state_key(message),
+                state,
+            )
+            return
+        data, separator, revision = raw_data.rpartition(PANEL_REVISION_SEPARATOR)
+        if (
+            not separator
+            or not revision
+            or revision != str(state.get("panel_revision") or "")
+        ):
+            self._answer_inactive_panel_callback(
+                callback_id,
+                "控制面板已经刷新，请使用消息上当前显示的按钮。",
+            )
+            return
         try:
             self._api("answerCallbackQuery", {"callback_query_id": callback_id})
         except Exception as exc:
             # A delayed callback acknowledgement may expire, but the authorized
             # panel action should still be applied and rendered.
             self.logger.info("could not acknowledge panel callback id=%s: %s", callback_id, exc)
-        data = str(callback.get("data") or "")
-        state = self._load_panel_state(message)
-        if callback_message.get("message_id") is not None:
-            state["message_id"] = int(callback_message["message_id"])
         try:
             self._apply_panel_action(data, state, message)
         except Exception as exc:
@@ -315,7 +421,7 @@ class ControlBot:
         action = parts[1] if len(parts) > 1 else "home"
         state.pop("flash", None)
         if action == "home":
-            state.update({"view": "home", "awaiting": None})
+            state.update({"view": "home", "awaiting": None, "twitch_mode": None})
             return
         if action == "refresh":
             self._panel_snapshot(force=True)
@@ -344,7 +450,24 @@ class ControlBot:
             state.update({"view": "input", "awaiting": "add_youtube"})
             return
         if action == "addtw":
-            state.update({"view": "input", "awaiting": "add_twitch"})
+            state.update(
+                {
+                    "view": "twitch_mode",
+                    "awaiting": None,
+                    "twitch_mode": None,
+                }
+            )
+            return
+        if action == "addtwmode":
+            if len(parts) != 3 or parts[2] not in {"vod", "live"}:
+                raise ValueError("invalid Twitch recording mode")
+            state.update(
+                {
+                    "view": "input",
+                    "awaiting": "add_twitch",
+                    "twitch_mode": parts[2],
+                }
+            )
             return
         if action == "filterset":
             state.update({"view": "input", "awaiting": "set_filter"})
@@ -358,7 +481,36 @@ class ControlBot:
             state.update({"view": "filter", "awaiting": None, "flash": "过滤器已恢复默认"})
             return
         if action == "cancel":
-            state.update({"view": "home", "awaiting": None, "flash": "已取消输入"})
+            state.update(
+                {
+                    "view": "home",
+                    "awaiting": None,
+                    "twitch_mode": None,
+                    "flash": "已取消输入",
+                }
+            )
+            return
+        if action == "twmode":
+            if len(parts) != 4 or parts[3] not in {"vod", "live"}:
+                raise ValueError("invalid Twitch mode action")
+            row = self._resolve_control_origin(parts[2])
+            mode = parts[3]
+            if not self.store.set_control_twitch_recording_mode(
+                str(row["id"]),
+                mode,
+            ):
+                raise ValueError("origin is no longer editable as twitch/vods")
+            self._panel_snapshot(force=True)
+            state.update(
+                {
+                    "view": "origins",
+                    "awaiting": None,
+                    "flash": (
+                        f"{row['name']} 已切换为"
+                        f"{'直播中录制' if mode == 'live' else '直播结束后下载'}"
+                    ),
+                }
+            )
             return
         if action in {"toggle", "delask", "delete"}:
             if len(parts) != 3:
@@ -404,11 +556,26 @@ class ControlBot:
         if not self._authorized(message):
             return
         state = self._load_panel_state(message)
+        if not bool(state.get("active", True)):
+            return
+        if self._panel_state_is_expired(state):
+            self._close_panel_state(
+                self._panel_state_key(message),
+                state,
+            )
+            return
         awaiting = state.get("awaiting")
         if not awaiting:
             return
         if text.lower() in {"cancel", "取消"}:
-            state.update({"view": "home", "awaiting": None, "flash": "已取消输入"})
+            state.update(
+                {
+                    "view": "home",
+                    "awaiting": None,
+                    "twitch_mode": None,
+                    "flash": "已取消输入",
+                }
+            )
             self._render_panel_message(message, state)
             return
         try:
@@ -418,8 +585,22 @@ class ControlBot:
                 state.update({"view": "origins", "awaiting": None, "flash": reply})
             elif awaiting == "add_twitch":
                 args = shlex.split(text)
-                reply = self._origin_add(["twitch", *args], message)
-                state.update({"view": "origins", "awaiting": None, "flash": reply})
+                mode = str(state.get("twitch_mode") or "")
+                if mode not in {"vod", "live"}:
+                    raise ValueError("请先选择 Twitch 录制模式")
+                reply = self._origin_add(
+                    ["twitch", *args],
+                    message,
+                    recording_mode=mode,
+                )
+                state.update(
+                    {
+                        "view": "origins",
+                        "awaiting": None,
+                        "twitch_mode": None,
+                        "flash": reply,
+                    }
+                )
             elif awaiting == "set_filter":
                 reply = self._source_filter([text])
                 if reply.startswith("error:"):
@@ -433,19 +614,37 @@ class ControlBot:
 
     def _cancel_panel_input(self, message: dict[str, Any]) -> bool:
         state = self._load_panel_state(message)
+        if not bool(state.get("active", True)):
+            return True
+        if self._panel_state_is_expired(state):
+            self._close_panel_state(
+                self._panel_state_key(message),
+                state,
+            )
+            return True
         if not state.get("awaiting"):
             return False
-        state.update({"view": "home", "awaiting": None, "flash": "已取消输入"})
+        state.update(
+            {
+                "view": "home",
+                "awaiting": None,
+                "twitch_mode": None,
+                "flash": "已取消输入",
+            }
+        )
         self._render_panel_message(message, state)
         return True
 
     def _open_panel(self, message: dict[str, Any]) -> None:
         state = self._load_panel_state(message)
-        state.update({"view": "home", "awaiting": None})
+        state.update({"view": "home", "awaiting": None, "twitch_mode": None})
         self._render_panel_message(message, state)
 
     def _render_panel_message(self, message: dict[str, Any], state: dict[str, Any]) -> None:
         text, reply_markup = self._render_panel(state)
+        revision = secrets.token_hex(4)
+        _add_panel_revision(reply_markup, revision)
+        state["panel_revision"] = revision
         message_id = state.get("message_id")
         if message_id is not None:
             try:
@@ -491,9 +690,10 @@ class ControlBot:
                     "也可以发送 UC channel ID。"
                 ),
                 "add_twitch": (
-                    "添加 Twitch VOD 来源\n\n"
+                    "添加 Twitch 来源\n\n"
                     "请发送：主播登录名 [显示名称]\n"
-                    "将只归档公开 VOD 的音频。"
+                    "本频道模式："
+                    f"{'直播中录制' if state.get('twitch_mode') == 'live' else '直播结束后下载'}。"
                 ),
                 "set_filter": (
                     "设置全局来源过滤器\n\n"
@@ -508,6 +708,8 @@ class ControlBot:
         view = str(state.get("view") or "home")
         if view == "origins":
             text, keyboard = self._render_origins_panel(state)
+        elif view == "twitch_mode":
+            text, keyboard = self._render_twitch_mode_panel()
         elif view == "stats":
             text, keyboard = self._render_stats_panel()
         elif view == "filter":
@@ -527,6 +729,11 @@ class ControlBot:
         summary = snapshot["summary"]
         providers = snapshot["providers"]
         provider_text = ", ".join(f"{key}={value}" for key, value in providers.items()) or "none"
+        panel_expiry = (
+            f"{self._panel_timeout_text()}无操作后自动关闭"
+            if self.config.control.panel_idle_timeout_seconds > 0
+            else "不会自动关闭"
+        )
         text = "\n".join(
             [
                 "🎧 Media Backup 控制面板",
@@ -536,6 +743,7 @@ class ControlBot:
                 f"已上传：{summary['uploaded']}",
                 f"失败：{summary['failed']}  阻断：{summary['blocked']}",
                 f"过滤器：{format_source_filter(snapshot.get('source_filter_pattern'))}",
+                f"面板：{panel_expiry}",
                 f"快照：{_format_snapshot_time(str(snapshot['generated_at']))}",
             ]
         )
@@ -543,6 +751,25 @@ class ControlBot:
             [_button("📚 来源", "p:origins:0"), _button("📊 状态", "p:stats")],
             [_button("➕ YouTube", "p:addyt"), _button("➕ Twitch", "p:addtw")],
             [_button("🔎 过滤器", "p:filter"), _button("🔄 刷新", "p:refresh")],
+        ]
+
+    def _render_twitch_mode_panel(
+        self,
+    ) -> tuple[str, list[list[dict[str, str]]]]:
+        text = "\n".join(
+            [
+                "➕ 添加 Twitch 来源",
+                "",
+                "请选择这个频道的备份方式：",
+                "",
+                "🔴 直播中录制：检测开播后立即运行 yt-dlp。",
+                "📼 结束后下载：等待 Twitch 发布 VOD 后再下载。",
+            ]
+        )
+        return text, [
+            [_button("🔴 直播中录制", "p:addtwmode:live")],
+            [_button("📼 结束后下载", "p:addtwmode:vod")],
+            [_button("🏠 返回", "p:home")],
         ]
 
     def _render_origins_panel(
@@ -560,20 +787,34 @@ class ControlBot:
             icon = "✅" if row["enabled"] else "⏸"
             owner = "bot" if row["managed_by"] == "control" else "config"
             error = f" · ⚠️{row['last_error_code']}" if row["last_error_code"] else ""
+            mode = self._effective_twitch_recording_mode(row)
+            mode_text = (
+                f" · {'🔴 LIVE' if mode == 'live' else '📼 VOD'}"
+                if mode
+                else ""
+            )
             lines.append(
                 f"{index}. {icon} {row['name']}\n"
-                f"   {row['provider']}/{row['kind']} · {owner} · items={row['item_count']}{error}"
+                f"   {row['provider']}/{row['kind']} · {owner}{mode_text} "
+                f"· items={row['item_count']}{error}"
             )
             if row["managed_by"] == "control":
                 token = _origin_token(str(row["id"]))
                 toggle = "停用" if row["enabled"] else "启用"
                 label = _compact_button_label(str(row["name"]))
-                keyboard.append(
-                    [
-                        _button(f"{toggle} {label}", f"p:toggle:{token}"),
-                        _button("删除", f"p:delask:{token}"),
-                    ]
-                )
+                buttons = [
+                    _button(f"{toggle} {label}", f"p:toggle:{token}"),
+                ]
+                if mode:
+                    target_mode = "vod" if mode == "live" else "live"
+                    buttons.append(
+                        _button(
+                            "切换为 VOD" if target_mode == "vod" else "切换为 LIVE",
+                            f"p:twmode:{token}:{target_mode}",
+                        )
+                    )
+                buttons.append(_button("删除", f"p:delask:{token}"))
+                keyboard.append(buttons)
         if not selected:
             lines.append("(暂无来源)")
         navigation: list[dict[str, str]] = []
@@ -671,10 +912,161 @@ class ControlBot:
         return state if isinstance(state, dict) else {"view": "home", "awaiting": None}
 
     def _save_panel_state(self, message: dict[str, Any], state: dict[str, Any]) -> None:
+        now = _utcnow()
+        timeout_seconds = self.config.control.panel_idle_timeout_seconds
+        state.update(
+            {
+                "active": True,
+                "chat_id": (message.get("chat") or {}).get("id"),
+                "message_thread_id": message.get("message_thread_id"),
+                "user_id": (message.get("from") or {}).get("id"),
+                "last_activity_at": now.isoformat(),
+            }
+        )
+        state.pop("closed_at", None)
+        if timeout_seconds > 0:
+            state["expires_at"] = (
+                now + timedelta(seconds=timeout_seconds)
+            ).isoformat()
+        else:
+            state.pop("expires_at", None)
         self.store.set_bot_state(
             self._panel_state_key(message),
             json.dumps(state, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
         )
+
+    def expire_idle_panels(self, *, now: datetime | None = None) -> int:
+        if self.config.control.panel_idle_timeout_seconds <= 0:
+            return 0
+        checked_at = now or _utcnow()
+        closed = 0
+        for key, raw in self.store.list_bot_states(f"{PANEL_STATE_PREFIX}:"):
+            try:
+                state = json.loads(raw)
+            except json.JSONDecodeError:
+                self.store.delete_bot_state(key)
+                continue
+            if not isinstance(state, dict):
+                self.store.delete_bot_state(key)
+                continue
+            if not bool(state.get("active", True)):
+                continue
+            if not self._panel_state_is_expired(state, now=checked_at):
+                continue
+            self._close_panel_state(key, state, now=checked_at)
+            closed += 1
+        return closed
+
+    def _panel_state_is_expired(
+        self,
+        state: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        timeout_seconds = self.config.control.panel_idle_timeout_seconds
+        if timeout_seconds <= 0:
+            return False
+        raw_last_activity = state.get("last_activity_at")
+        if not raw_last_activity:
+            return bool(state.get("message_id"))
+        try:
+            last_activity = datetime.fromisoformat(str(raw_last_activity))
+        except ValueError:
+            return True
+        if last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+        deadline = last_activity.astimezone(timezone.utc) + timedelta(
+            seconds=timeout_seconds
+        )
+        return deadline <= (now or _utcnow()).astimezone(timezone.utc)
+
+    def _close_panel_state(
+        self,
+        key: str,
+        state: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        closed_at = now or _utcnow()
+        state.update(
+            {
+                "active": False,
+                "view": "closed",
+                "awaiting": None,
+                "twitch_mode": None,
+                "closed_at": closed_at.isoformat(),
+            }
+        )
+        state.pop("flash", None)
+        state.pop("target_token", None)
+        self.store.set_bot_state(
+            key,
+            json.dumps(state, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        )
+
+        message_id = state.get("message_id")
+        chat_id = state.get("chat_id")
+        if chat_id is None:
+            chat_id = self._panel_state_chat_id(key)
+        if message_id is None or chat_id is None:
+            return
+        try:
+            self._api(
+                "editMessageText",
+                {
+                    "chat_id": chat_id,
+                    "message_id": int(message_id),
+                    "text": (
+                        "🔒 控制面板已自动关闭\n\n"
+                        f"超过 {self._panel_timeout_text()}没有操作，按钮已失效。\n"
+                        "发送 /panel 可以重新打开。"
+                    ),
+                    "reply_markup": _inline_keyboard([]),
+                },
+            )
+        except Exception as exc:
+            self.logger.info(
+                "could not edit expired panel message key=%s: %s",
+                key,
+                exc,
+            )
+
+    def _answer_inactive_panel_callback(
+        self,
+        callback_id: str,
+        text: str,
+    ) -> None:
+        try:
+            self._api(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_id,
+                    "text": text,
+                    "show_alert": True,
+                },
+            )
+        except Exception as exc:
+            self.logger.info(
+                "could not reject inactive panel callback id=%s: %s",
+                callback_id,
+                exc,
+            )
+
+    def _panel_timeout_text(self) -> str:
+        seconds = self.config.control.panel_idle_timeout_seconds
+        if seconds % 3600 == 0:
+            return f"{seconds // 3600} 小时"
+        if seconds % 60 == 0:
+            return f"{seconds // 60} 分钟"
+        return f"{seconds} 秒"
+
+    @staticmethod
+    def _panel_state_chat_id(key: str) -> str | None:
+        prefix = f"{PANEL_STATE_PREFIX}:"
+        if not key.startswith(prefix):
+            return None
+        parts = key[len(prefix) :].split(":", 2)
+        return parts[0] if len(parts) == 3 and parts[0] else None
 
     @staticmethod
     def _panel_state_key(message: dict[str, Any]) -> str:
@@ -860,6 +1252,7 @@ class ControlBot:
                 "/origin add twitch [vods|highlights|uploads] login [name]",
                 "/origin list",
                 "/origin enable|disable <origin_id>",
+                "/origin mode <origin_id> <vod|live>",
                 "/origin del <origin_id>",
                 "",
                 "YouTube compatibility:",
@@ -934,6 +1327,10 @@ def _format_snapshot_time(value: str) -> str:
         return value
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _validate_id(value: str) -> str:
     if not value or any(char.isspace() for char in value) or len(value) > 100:
         raise ValueError("subscription id must be 1-100 non-whitespace characters")
@@ -981,3 +1378,17 @@ def _button(text: str, callback_data: str) -> dict[str, str]:
 
 def _inline_keyboard(rows: list[list[dict[str, str]]]) -> dict[str, Any]:
     return {"inline_keyboard": rows}
+
+
+def _add_panel_revision(reply_markup: dict[str, Any], revision: str) -> None:
+    for row in reply_markup.get("inline_keyboard", []):
+        for button in row:
+            callback_data = button.get("callback_data")
+            if callback_data is None:
+                continue
+            revised = (
+                f"{callback_data}{PANEL_REVISION_SEPARATOR}{revision}"
+            )
+            if len(revised.encode("utf-8")) > 64:
+                raise ValueError("Telegram callback_data exceeds 64 bytes")
+            button["callback_data"] = revised

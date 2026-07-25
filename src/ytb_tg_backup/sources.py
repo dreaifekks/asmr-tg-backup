@@ -111,6 +111,9 @@ class TwitchHelixSource:
     def discover(self, origin: Origin, checkpoint: str | None = None) -> DiscoveryResult:
         self._validate_config()
         user_id = self._resolve_user_id(origin.external_id)
+        if origin.kind == "vods" and twitch_recording_mode(origin, self.config) == "live":
+            return self._discover_live(origin, user_id, checkpoint)
+
         video_type = {
             "vods": "archive",
             "highlights": "highlight",
@@ -190,6 +193,60 @@ class TwitchHelixSource:
             )
         next_checkpoint = newest_checkpoint or previous
         return DiscoveryResult(items=items, cursor=_encode_twitch_checkpoint(next_checkpoint))
+
+    def _discover_live(
+        self,
+        origin: Origin,
+        user_id: str,
+        checkpoint: str | None,
+    ) -> DiscoveryResult:
+        payload = self._api_json("streams", {"user_id": user_id, "first": "1"})
+        streams = _payload_list(payload, "data")
+        if not streams:
+            return DiscoveryResult(items=[], cursor=checkpoint)
+        raw = streams[0]
+        if not isinstance(raw, dict):
+            raise SourceError("Twitch API returned an invalid stream item", code="invalid_response")
+
+        stream_id = str(raw.get("id") or "")
+        user_login = str(raw.get("user_login") or "").lower()
+        started_at = str(raw.get("started_at") or "") or None
+        if not stream_id.isdigit() or not re.fullmatch(r"[a-z0-9_]{1,25}", user_login):
+            raise SourceError("Twitch API returned an incomplete stream item", code="invalid_response")
+
+        next_checkpoint = {
+            "external_id": stream_id,
+            "published_at": started_at or "",
+        }
+
+        candidate = MediaCandidate(
+            provider="twitch",
+            content_kind="live_stream",
+            external_id=stream_id,
+            title=str(raw.get("title") or f"{origin.name} live"),
+            url=f"https://www.twitch.tv/{user_login}",
+            published_at=started_at,
+            updated_at=None,
+            live_status="is_live",
+            metadata={
+                "recording_mode": "live",
+                "broadcaster_id": user_id,
+                "stream_id": stream_id,
+                "user_login": user_login,
+                "user_name": raw.get("user_name"),
+                "game_id": raw.get("game_id"),
+                "game_name": raw.get("game_name"),
+                "language": raw.get("language"),
+                "tags": raw.get("tags"),
+                "thumbnail_url": raw.get("thumbnail_url"),
+                "started_at": started_at,
+                "is_mature": raw.get("is_mature"),
+            },
+        )
+        return DiscoveryResult(
+            items=[candidate],
+            cursor=_encode_twitch_checkpoint(next_checkpoint),
+        )
 
     def _resolve_user_id(self, value: str) -> str:
         candidate = value.strip()
@@ -305,6 +362,18 @@ class SourceRegistry:
         except KeyError:
             label = provider if kind is None else f"{provider}/{kind}"
             raise SourceError(f"unsupported source adapter: {label}", code="invalid_origin") from None
+
+
+def twitch_recording_mode(origin: Origin, config: TwitchConfig) -> str:
+    if origin.provider != "twitch" or origin.kind != "vods":
+        return "vod"
+    mode = str(origin.options.get("recording_mode", config.recording_mode)).lower().strip()
+    if mode not in {"vod", "live"}:
+        raise SourceError(
+            f"unsupported Twitch recording_mode: {mode}",
+            code="invalid_origin",
+        )
+    return mode
 
 
 def _rss_external_id(url: str) -> str:

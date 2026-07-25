@@ -9,7 +9,7 @@ WorkingDirectory=%h/dev/ytb-tg-backup
 ExecStart=%h/dev/ytb-tg-backup/.venv/bin/python -m ytb_tg_backup run --config %h/.config/ytb-tg-backup/config.toml
 Restart=always
 RestartSec=10
-KillMode=control-group
+KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=30s
 Environment=PYTHONUNBUFFERED=1

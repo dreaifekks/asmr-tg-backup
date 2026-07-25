@@ -41,6 +41,7 @@ enabled = true
         )
         self.assertEqual(config.telegram.media_type, "audio")
         self.assertFalse(config.control.enabled)
+        self.assertEqual(config.control.panel_idle_timeout_seconds, 3600)
         self.assertTrue(config.control.delete_webhook_on_startup)
 
     def test_twitch_credentials_load_from_default_environment_variables(self):
