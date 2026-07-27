@@ -108,9 +108,18 @@ class Downloader:
             self.config.download.yt_dlp,
             "--no-warnings",
             "--skip-download",
-            "--dump-single-json",
-            "--no-playlist",
         ]
+        if provider == "youtube":
+            # Upcoming/live YouTube pages can expose useful metadata before
+            # formats are available. Keep that metadata so the service can
+            # defer without consuming the job's failure budget.
+            cmd.append("--ignore-no-formats-error")
+        cmd.extend(
+            [
+                "--dump-single-json",
+                "--no-playlist",
+            ]
+        )
         cmd.extend(self._extra_args(provider))
         cmd.append(url)
         try:

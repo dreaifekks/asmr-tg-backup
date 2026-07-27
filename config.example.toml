@@ -131,8 +131,8 @@ poll_interval_seconds = 10
 panel_idle_timeout_seconds = 3600
 delete_webhook_on_startup = true
 default_routes = ["live"]
-# /panel uses one edited Telegram message. Pending panel input and its message
-# ID are persisted in bot_state and scoped to user + chat + message thread.
+# Every /panel command sends a fresh panel below the command; navigation edits
+# that current message. Its state is persisted and scoped to user + chat + thread.
 # Every non-empty allowlist below must match. Empty dimensions are ignored; if
 # all three are empty, every control command is denied.
 allowed_user_ids = []

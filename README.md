@@ -276,8 +276,9 @@ of the lease.
 
 ## Telegram control panel
 
-Use `/panel` (or `/start`) for the normal workflow. The bot creates one panel
-message with an inline keyboard and edits that same message while navigating:
+Use `/panel` (or `/start`) for the normal workflow. Every explicit command
+creates a fresh panel message below that command. The bot then edits that new
+message in place while navigating:
 
 - view provider-neutral origins and their polling errors;
 - add YouTube uploads;
@@ -289,15 +290,17 @@ message with an inline keyboard and edits that same message while navigating:
 
 Adding a source or entering a filter requires one user text message. For Twitch,
 the mode is selected with an inline button before entering the login/name. The
-bot stores the pending action and then returns to the existing panel message;
-it does not create a new bot response for every navigation action. Panel state
-is scoped by user, chat, and message thread and survives service restarts.
+bot stores the pending action and then returns to the current panel message;
+it does not create a new bot response for every navigation action. Opening a
+new panel disables the previous panel's buttons. Panel state is scoped by user,
+chat, and message thread and survives service restarts.
 
 By default, the panel automatically closes after one hour without a valid
 button press or accepted text input. Closing edits the same Telegram message,
 removes its inline keyboard, and rejects delayed callbacks from that expired
 message. Every redraw also invalidates buttons from the previous keyboard
-revision. Send `/panel` to reopen it. This only closes the control UI;
+revision. Send `/panel` to open a fresh panel below the new command. This only
+closes the control UI;
 discovery, live recording, downloading, and Telegram delivery continue in the
 background. The idle deadline survives service restarts and is checked within
 one control long-poll window. Set `panel_idle_timeout_seconds = 0` to disable

@@ -636,9 +636,45 @@ class ControlBot:
         return True
 
     def _open_panel(self, message: dict[str, Any]) -> None:
-        state = self._load_panel_state(message)
-        state.update({"view": "home", "awaiting": None, "twitch_mode": None})
+        previous_state = self._load_panel_state(message)
+        state = {"view": "home", "awaiting": None, "twitch_mode": None}
         self._render_panel_message(message, state)
+        self._retire_replaced_panel_message(message, previous_state, state)
+
+    def _retire_replaced_panel_message(
+        self,
+        message: dict[str, Any],
+        previous_state: dict[str, Any],
+        current_state: dict[str, Any],
+    ) -> None:
+        previous_message_id = previous_state.get("message_id")
+        current_message_id = current_state.get("message_id")
+        if (
+            previous_message_id is None
+            or current_message_id is None
+            or str(previous_message_id) == str(current_message_id)
+        ):
+            return
+        chat_id = previous_state.get("chat_id")
+        if chat_id is None:
+            chat_id = (message.get("chat") or {}).get("id")
+        if chat_id is None:
+            return
+        try:
+            self._api(
+                "editMessageReplyMarkup",
+                {
+                    "chat_id": chat_id,
+                    "message_id": int(previous_message_id),
+                    "reply_markup": _inline_keyboard([]),
+                },
+            )
+        except Exception as exc:
+            self.logger.info(
+                "could not remove buttons from replaced panel message_id=%s: %s",
+                previous_message_id,
+                exc,
+            )
 
     def _render_panel_message(self, message: dict[str, Any], state: dict[str, Any]) -> None:
         text, reply_markup = self._render_panel(state)
@@ -1245,7 +1281,7 @@ class ControlBot:
                 "Media audio backup bot",
                 "",
                 "Recommended:",
-                "/panel - open the single-message control panel",
+                "/panel - open a fresh control panel below this command",
                 "",
                 "Provider-neutral origins:",
                 "/origin add youtube @handle [name]",

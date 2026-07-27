@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.2 - 2026-07-27
+
+- Make each explicit `/panel` or `/start` command send a fresh Telegram panel
+  below the command while retiring the previous panel's buttons.
+- Preserve YouTube upcoming/live metadata when formats are not ready so
+  scheduled streams wait without exhausting the download failure budget.
+
 ## 0.2.1 - 2026-07-25
 
 - Add configurable Twitch `vod` versus `live` recording. Live mode polls Helix

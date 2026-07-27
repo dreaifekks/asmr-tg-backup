@@ -374,7 +374,6 @@ allowed_chat_ids = ["-100"]
                         }
                     }
                 )
-                bot._handle_update({"message": command_message})
 
             self.assertEqual(store.list_origin_statuses(), [])
             self.assertEqual(sum(method == "sendMessage" for method, _ in calls), 1)
@@ -393,6 +392,138 @@ allowed_chat_ids = ["-100"]
                     for payload in edits
                 )
             )
+
+    def test_each_panel_command_sends_a_fresh_panel_and_retires_the_previous_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "test-token"
+
+[control]
+enabled = true
+allowed_user_ids = ["123"]
+allowed_chat_ids = ["-100"]
+allowed_message_thread_ids = ["42"]
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            calls: list[tuple[str, dict]] = []
+            next_message_id = iter((500, 501))
+
+            def fake_api(method: str, payload: dict) -> dict:
+                calls.append((method, payload))
+                if method == "sendMessage":
+                    return {
+                        "ok": True,
+                        "result": {"message_id": next(next_message_id)},
+                    }
+                return {"ok": True, "result": True}
+
+            first_command = {
+                "message_id": 10,
+                "from": {"id": 123},
+                "chat": {"id": -100},
+                "message_thread_id": 42,
+                "text": "/panel",
+            }
+            latest_command = {
+                **first_command,
+                "message_id": 11,
+            }
+
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                bot._handle_update({"message": first_command})
+                first_callback = _current_panel_callback(calls, "p:stats")
+                first_revision = first_callback.rpartition("~")[2]
+                bot._handle_update({"message": latest_command})
+
+            sends = [payload for method, payload in calls if method == "sendMessage"]
+            self.assertEqual(len(sends), 2)
+            self.assertEqual(sends[1]["chat_id"], -100)
+            self.assertEqual(sends[1]["message_thread_id"], 42)
+            self.assertIn("Media Backup 控制面板", sends[1]["text"])
+            second_callback = _current_panel_callback(calls, "p:stats")
+            self.assertNotEqual(
+                second_callback.rpartition("~")[2],
+                first_revision,
+            )
+
+            retired = [
+                payload
+                for method, payload in calls
+                if method == "editMessageReplyMarkup"
+            ]
+            self.assertEqual(
+                retired,
+                [
+                    {
+                        "chat_id": -100,
+                        "message_id": 500,
+                        "reply_markup": {"inline_keyboard": []},
+                    }
+                ],
+            )
+            state = json.loads(
+                str(store.get_bot_state(bot._panel_state_key(latest_command)))
+            )
+            self.assertEqual(state["message_id"], 501)
+            self.assertEqual(state["message_thread_id"], 42)
+            self.assertEqual(
+                state["panel_revision"],
+                second_callback.rpartition("~")[2],
+            )
+
+            calls.clear()
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-replaced",
+                            "from": {"id": 123},
+                            "message": {
+                                "message_id": 500,
+                                "chat": {"id": -100},
+                                "message_thread_id": 42,
+                            },
+                            "data": first_callback,
+                        }
+                    }
+                )
+
+            self.assertEqual([method for method, _ in calls], ["answerCallbackQuery"])
+            self.assertIn("不是你当前的会话", calls[0][1]["text"])
+
+            calls.clear()
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-current",
+                            "from": {"id": 123},
+                            "message": {
+                                "message_id": 501,
+                                "chat": {"id": -100},
+                                "message_thread_id": 42,
+                            },
+                            "data": second_callback,
+                        }
+                    }
+                )
+
+            current_edit = next(
+                payload
+                for method, payload in calls
+                if method == "editMessageText"
+            )
+            self.assertEqual(current_edit["message_id"], 501)
 
     def test_panel_closes_after_one_idle_hour_and_reopens_on_command(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -417,11 +548,15 @@ allowed_chat_ids = ["-100"]
             store.initialize()
             bot = ControlBot(config, store, logging.getLogger("test"))
             calls: list[tuple[str, dict]] = []
+            next_message_id = iter((500, 501))
 
             def fake_api(method: str, payload: dict) -> dict:
                 calls.append((method, payload))
                 if method == "sendMessage":
-                    return {"ok": True, "result": {"message_id": 500}}
+                    return {
+                        "ok": True,
+                        "result": {"message_id": next(next_message_id)},
+                    }
                 return {"ok": True, "result": True}
 
             command_message = {
@@ -543,11 +678,20 @@ allowed_chat_ids = ["-100"]
 
             reopened = json.loads(str(store.get_bot_state(state_key)))
             self.assertTrue(reopened["active"])
+            self.assertEqual(reopened["message_id"], 501)
             self.assertEqual(reopened["last_activity_at"], reopened_at.isoformat())
             self.assertTrue(
                 any(
-                    method == "editMessageText"
+                    method == "sendMessage"
                     and "Media Backup 控制面板" in payload["text"]
+                    for method, payload in calls
+                )
+            )
+            self.assertTrue(
+                any(
+                    method == "editMessageReplyMarkup"
+                    and payload["message_id"] == 500
+                    and payload["reply_markup"] == {"inline_keyboard": []}
                     for method, payload in calls
                 )
             )
@@ -560,13 +704,151 @@ allowed_chat_ids = ["-100"]
                         "callback_query": {
                             "id": "cb-old-message",
                             "from": {"id": 123},
-                            "message": {"message_id": 499, "chat": {"id": -100}},
+                            "message": {"message_id": 500, "chat": {"id": -100}},
                             "data": current_stats_callback,
                         }
                     }
                 )
             self.assertEqual([method for method, _ in calls], ["answerCallbackQuery"])
             self.assertIn("不是你当前的会话", calls[0][1]["text"])
+
+    def test_panel_replacement_succeeds_when_old_keyboard_cleanup_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "test-token"
+
+[control]
+enabled = true
+allowed_user_ids = ["123"]
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            calls: list[tuple[str, dict]] = []
+            next_message_id = iter((500, 501))
+
+            def fake_api(method: str, payload: dict) -> dict:
+                calls.append((method, payload))
+                if method == "sendMessage":
+                    return {
+                        "ok": True,
+                        "result": {"message_id": next(next_message_id)},
+                    }
+                if method == "editMessageReplyMarkup":
+                    raise RuntimeError("message cannot be edited")
+                return {"ok": True, "result": True}
+
+            command_message = {
+                "message_id": 10,
+                "from": {"id": 123},
+                "chat": {"id": -100},
+                "text": "/panel",
+            }
+
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                bot._handle_update({"message": command_message})
+                bot._handle_update(
+                    {
+                        "message": {
+                            **command_message,
+                            "message_id": 11,
+                        }
+                    }
+                )
+
+            self.assertEqual(
+                sum(method == "sendMessage" for method, _ in calls),
+                2,
+            )
+            state = json.loads(
+                str(store.get_bot_state(bot._panel_state_key(command_message)))
+            )
+            self.assertEqual(state["message_id"], 501)
+
+            calls.clear()
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-replaced",
+                            "from": {"id": 123},
+                            "message": {
+                                "message_id": 500,
+                                "chat": {"id": -100},
+                            },
+                            "data": "p:stats~stale",
+                        }
+                    }
+                )
+            self.assertEqual([method for method, _ in calls], ["answerCallbackQuery"])
+            self.assertIn("不是你当前的会话", calls[0][1]["text"])
+
+    def test_failed_fresh_panel_send_preserves_the_previous_panel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "test-token"
+
+[control]
+enabled = true
+allowed_user_ids = ["123"]
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            calls: list[tuple[str, dict]] = []
+            fail_next_send = False
+
+            def fake_api(method: str, payload: dict) -> dict:
+                calls.append((method, payload))
+                if method == "sendMessage":
+                    if fail_next_send:
+                        raise RuntimeError("Telegram unavailable")
+                    return {"ok": True, "result": {"message_id": 500}}
+                return {"ok": True, "result": True}
+
+            command_message = {
+                "message_id": 10,
+                "from": {"id": 123},
+                "chat": {"id": -100},
+                "text": "/panel",
+            }
+            state_key = bot._panel_state_key(command_message)
+
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                bot._handle_update({"message": command_message})
+            previous_state = str(store.get_bot_state(state_key))
+
+            fail_next_send = True
+            calls.clear()
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                with self.assertRaisesRegex(RuntimeError, "Telegram unavailable"):
+                    bot._handle_update(
+                        {
+                            "message": {
+                                **command_message,
+                                "message_id": 11,
+                            }
+                        }
+                    )
+
+            self.assertEqual(str(store.get_bot_state(state_key)), previous_state)
+            self.assertEqual([method for method, _ in calls], ["sendMessage"])
 
     def test_panel_remains_closed_when_expiry_message_edit_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

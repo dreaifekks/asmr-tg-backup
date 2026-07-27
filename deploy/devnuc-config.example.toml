@@ -96,7 +96,8 @@ poll_interval_seconds = 10
 panel_idle_timeout_seconds = 3600
 delete_webhook_on_startup = true
 default_routes = ["live"]
-# /panel is a single edited inline-keyboard message; its state survives restarts.
+# Each /panel sends a fresh message; navigation edits that current message.
+# The panel state survives service restarts.
 # Authorization requires every configured dimension to match. Empty dimensions
 # are ignored, and an entirely empty set denies every command.
 allowed_user_ids = []

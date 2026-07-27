@@ -1,8 +1,9 @@
-import unittest
+import json
 import logging
 from pathlib import Path
 import subprocess
 import tempfile
+import unittest
 from unittest import mock
 
 from ytb_tg_backup.config import load_config
@@ -10,6 +11,59 @@ from ytb_tg_backup.downloader import Downloader, _bitrate_candidates, _looks_lik
 
 
 class DownloaderHelpersTest(unittest.TestCase):
+    def test_youtube_probe_keeps_upcoming_metadata_without_formats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{tmp_path}"')
+            downloader = Downloader(load_config(config_path), logging.getLogger("test"))
+            payload = json.dumps(
+                {
+                    "id": "upcoming123",
+                    "title": "Scheduled ASMR",
+                    "live_status": "is_upcoming",
+                    "formats": [],
+                }
+            )
+
+            with mock.patch(
+                "ytb_tg_backup.downloader.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 0, payload, ""),
+            ) as run:
+                result = downloader.probe("https://www.youtube.com/watch?v=upcoming123")
+
+            command = run.call_args.args[0]
+            self.assertIn("--ignore-no-formats-error", command)
+            self.assertEqual(result.live_status, "is_upcoming")
+            self.assertEqual(result.title, "Scheduled ASMR")
+            self.assertEqual(result.external_id, "upcoming123")
+
+    def test_twitch_probe_does_not_ignore_missing_formats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{tmp_path}"')
+            downloader = Downloader(load_config(config_path), logging.getLogger("test"))
+            payload = json.dumps(
+                {
+                    "id": "stream123",
+                    "title": "Live stream",
+                    "live_status": "is_live",
+                }
+            )
+
+            with mock.patch(
+                "ytb_tg_backup.downloader.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 0, payload, ""),
+            ) as run:
+                downloader.probe(
+                    "https://www.twitch.tv/example",
+                    provider="twitch",
+                    live=True,
+                )
+
+            self.assertNotIn("--ignore-no-formats-error", run.call_args.args[0])
+
     def test_target_bitrate_for_long_audio(self):
         bitrate = _target_audio_bitrate_kbps(max_bytes=52_428_800, duration_seconds=10_000)
         self.assertLessEqual(bitrate, 40)
