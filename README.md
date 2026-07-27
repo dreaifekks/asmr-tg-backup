@@ -9,6 +9,10 @@ Helix API.
 YouTube members-only discovery and authentication are outside the main worker's
 public-origin path.
 
+> Handing this repository to a coding agent? Start with
+> [`AGENTS.md`](AGENTS.md) for a safe quick configuration, validation commands,
+> and the boundaries around live provider and Telegram operations.
+
 ## Providers and origins
 
 A provider is the implementation that knows how to discover remote media. An

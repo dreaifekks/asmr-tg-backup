@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a root `AGENTS.md` quick-configuration entrypoint and link it from the
+  README for coding-agent handoff.
 - Rename the public project, CLI, deployment templates, documentation, and
   request identity from `ytb-tg-backup` to the provider-neutral
   `asmr-tg-backup`, while retaining the Python import namespace for compatibility.
