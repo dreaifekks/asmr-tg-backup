@@ -279,7 +279,7 @@ class TwitchHelixSource:
             headers={
                 "Authorization": f"Bearer {self._access_token}",
                 "Client-Id": self.config.client_id,
-                "User-Agent": "ytb-tg-backup/0.1",
+                "User-Agent": "asmr-tg-backup/0.1",
             },
         )
         try:
@@ -313,7 +313,7 @@ class TwitchHelixSource:
                     "grant_type": "client_credentials",
                 }
             ).encode("ascii"),
-            headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "ytb-tg-backup/0.1"},
+            headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "asmr-tg-backup/0.1"},
             method="POST",
         )
         try:

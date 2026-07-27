@@ -11,7 +11,7 @@ from .store import Store
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="ytb-tg-backup")
+    parser = argparse.ArgumentParser(prog="asmr-tg-backup")
     parser.add_argument("--config", default="config.toml", help="Path to TOML config")
     subparsers = parser.add_subparsers(dest="command", required=True)
 

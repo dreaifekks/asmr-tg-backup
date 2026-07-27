@@ -46,7 +46,7 @@ class BackupService:
     def __init__(self, config: Config):
         os.umask(0o077)
         self.config = config
-        self.logger = logging.getLogger("ytb_tg_backup")
+        self.logger = logging.getLogger("asmr_tg_backup")
         self.store = Store(config.db_path)
         self.downloader = Downloader(config, self.logger)
         self.telegram = TelegramUploader(config.telegram)

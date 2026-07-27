@@ -154,7 +154,7 @@ def load_config(path: str | Path) -> Config:
         raw = tomllib.load(fh)
 
     app_raw = raw.get("app", {})
-    data_dir = Path(app_raw.get("data_dir", "~/.local/share/ytb-tg-backup")).expanduser()
+    data_dir = Path(app_raw.get("data_dir", "~/.local/share/asmr-tg-backup")).expanduser()
     app = AppConfig(
         data_dir=data_dir,
         poll_interval_seconds=int(app_raw.get("poll_interval_seconds", 1800)),

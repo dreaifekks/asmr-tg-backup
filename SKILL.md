@@ -1,14 +1,15 @@
 ---
-name: ytb-tg-backup
-description: Use when working on ytb-tg-backup, a Python CLI and leased background worker that discovers public YouTube, RSS, and Twitch media through provider-backed origins, archives it with yt-dlp, stores provider-neutral state in SQLite, and optionally delivers artifacts to Telegram.
+name: asmr-tg-backup
+description: Use when working on asmr-tg-backup, an ASMR-focused Python CLI and leased background worker that discovers public YouTube, RSS, and Twitch media through provider-backed origins, archives it with yt-dlp, stores provider-neutral state in SQLite, and optionally delivers artifacts to Telegram.
 ---
 
-# ytb-tg-backup
+# asmr-tg-backup
 
 ## Project Shape
 
-- Python 3.11+ package under `src/ytb_tg_backup`; console entrypoint is
-  `ytb-tg-backup = ytb_tg_backup.cli:main`.
+- Python 3.11+ package under the compatibility namespace
+  `src/ytb_tg_backup`; console entrypoint is
+  `asmr-tg-backup = ytb_tg_backup.cli:main`.
 - Runtime Python dependencies are intentionally empty. Host tools perform media
   and Telegram work: `yt-dlp`, `curl`, and preferably `ffmpeg`/`ffprobe`.
 - Main config is `config.toml`, copied from `config.example.toml`. Never commit a
@@ -26,11 +27,11 @@ python3 -m venv .venv
 pip install -e .
 cp config.example.toml config.toml
 chmod 600 config.toml
-ytb-tg-backup init --config config.toml
-ytb-tg-backup status --config config.toml
+asmr-tg-backup init --config config.toml
+asmr-tg-backup status --config config.toml
 ```
 
-Use `ytb-tg-backup poll --config config.toml --once --no-process` for discovery
+Use `asmr-tg-backup poll --config config.toml --once --no-process` for discovery
 without running jobs. Use `poll --once` or `process` only when the user expects
 real probing, downloading, transcoding, or Telegram work.
 
@@ -174,8 +175,8 @@ origin discovery -> download job -> master artifact -> telegram_delivery job -> 
   and migration backup files at `0600`. The shipped unit uses `UMask=0077`.
 - For systemd Twitch credentials, use a mode-`0600` `EnvironmentFile` outside
   the repository and add it through the installed user-unit configuration.
-- The unit expects the repo at `~/dev/ytb-tg-backup` and config at
-  `~/.config/ytb-tg-backup/config.toml`.
+- The unit expects the repo at `~/dev/asmr-tg-backup` and config at
+  `~/.config/asmr-tg-backup/config.toml`.
 - The local Telegram Bot API service is under `deploy/telegram-bot-api`; set
   `telegram.api_base = "http://127.0.0.1:18081"` when using it.
 - Do not commit `.venv/`, `__pycache__/`, `*.egg-info/`, real configs,

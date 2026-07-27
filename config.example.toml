@@ -1,5 +1,5 @@
 [app]
-data_dir = "~/.local/share/ytb-tg-backup"
+data_dir = "~/.local/share/asmr-tg-backup"
 poll_interval_seconds = 1800
 download_delay_seconds = 300
 max_items_per_poll = 3

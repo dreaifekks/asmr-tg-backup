@@ -27,7 +27,7 @@ class FeedEntry:
 
 
 def fetch_feed(url: str, timeout: int = 30) -> bytes:
-    request = Request(_quote_url_for_request(url), headers={"User-Agent": "ytb-tg-backup/0.1"})
+    request = Request(_quote_url_for_request(url), headers={"User-Agent": "asmr-tg-backup/0.1"})
     with urlopen(request, timeout=timeout) as response:
         payload = response.read(MAX_FEED_BYTES + 1)
     if len(payload) > MAX_FEED_BYTES:

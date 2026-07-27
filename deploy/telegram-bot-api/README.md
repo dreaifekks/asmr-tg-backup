@@ -40,7 +40,7 @@ Point Bot API clients at:
 http://127.0.0.1:18081
 ```
 
-For `ytb-tg-backup`, set:
+For `asmr-tg-backup`, set:
 
 ```toml
 [telegram]

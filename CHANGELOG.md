@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Rename the public project, CLI, deployment templates, documentation, and
+  request identity from `ytb-tg-backup` to the provider-neutral
+  `asmr-tg-backup`, while retaining the Python import namespace for compatibility.
+
 ## 0.2.2 - 2026-07-27
 
 - Make each explicit `/panel` or `/start` command send a fresh Telegram panel

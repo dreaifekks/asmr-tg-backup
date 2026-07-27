@@ -1,9 +1,10 @@
-# ytb-tg-backup
+# asmr-tg-backup
 
-Background service for discovering public media from provider-backed origins,
-archiving it with `yt-dlp`, and optionally delivering the archived files to
-Telegram. The built-in providers are YouTube official channel feeds, generic
-RSS feeds, and Twitch VOD/live discovery through the Helix API.
+ASMR-focused background service for discovering public media from
+provider-backed origins, archiving it with `yt-dlp`, and optionally delivering
+the archived files to Telegram. The built-in providers are YouTube official
+channel feeds, generic RSS feeds, and Twitch VOD/live discovery through the
+Helix API.
 
 YouTube members-only discovery and authentication are outside the main worker's
 public-origin path.
@@ -101,7 +102,7 @@ export TWITCH_CLIENT_SECRET='<client-secret>'
 ```
 
 For systemd, put the assignments in the mode-`0600` file
-`~/.config/ytb-tg-backup/env`. The shipped user unit loads this optional file.
+`~/.config/asmr-tg-backup/env`. The shipped user unit loads this optional file.
 Do not commit it.
 
 ## Twitch VOD versus live recording
@@ -187,8 +188,8 @@ python3 -m venv .venv
 pip install -e .
 cp config.example.toml config.toml
 chmod 600 config.toml
-ytb-tg-backup init --config config.toml
-ytb-tg-backup poll --config config.toml --once
+asmr-tg-backup init --config config.toml
+asmr-tg-backup poll --config config.toml --once
 ```
 
 Required host tools:
@@ -239,7 +240,7 @@ remote message may already exist.
 
 `uncertain` is deliberately not retried automatically. Inspect the destination
 and logs before changing or requeueing that job, otherwise a duplicate Telegram
-message may be sent. It is visible in `ytb-tg-backup status` and the job table.
+message may be sent. It is visible in `asmr-tg-backup status` and the job table.
 
 Live, upcoming, and post-live media in VOD mode are deferred without consuming
 the failure budget until a VOD is ready. Twitch live-recording jobs proceed
@@ -395,16 +396,16 @@ file at `0600`. The shipped systemd unit also uses `UMask=0077` and several
 hardening options.
 
 ```bash
-mkdir -p ~/.config/systemd/user ~/.config/ytb-tg-backup
-chmod 700 ~/.config/ytb-tg-backup
-cp deploy/ytb-tg-backup.service ~/.config/systemd/user/
+mkdir -p ~/.config/systemd/user ~/.config/asmr-tg-backup
+chmod 700 ~/.config/asmr-tg-backup
+cp deploy/asmr-tg-backup.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now ytb-tg-backup.service
-journalctl --user -u ytb-tg-backup.service -f
+systemctl --user enable --now asmr-tg-backup.service
+journalctl --user -u asmr-tg-backup.service -f
 ```
 
-The unit expects the repo at `~/dev/ytb-tg-backup` and config at
-`~/.config/ytb-tg-backup/config.toml`. SIGTERM stops new claims and gives worker
+The unit expects the repo at `~/dev/asmr-tg-backup` and config at
+`~/.config/asmr-tg-backup/config.toml`. SIGTERM stops new claims and gives worker
 threads up to 25 seconds to drain. `KillMode=mixed` lets the main process first
 interrupt live ffmpeg children cleanly; systemd then bounds the whole control
 group with `TimeoutStopSec=30s`.

@@ -99,7 +99,7 @@ def _canonical_channel_url(value: str) -> tuple[str, str | None]:
 
 
 def _resolve_channel_id_from_html(url: str) -> str | None:
-    request = Request(_quote_url(url), headers={"User-Agent": "ytb-tg-backup/0.1"})
+    request = Request(_quote_url(url), headers={"User-Agent": "asmr-tg-backup/0.1"})
     try:
         with urlopen(request, timeout=30) as response:
             html = response.read().decode("utf-8", errors="replace")

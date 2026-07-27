@@ -1,5 +1,5 @@
 [app]
-data_dir = "/home/your-user/.local/share/ytb-tg-backup"
+data_dir = "/home/your-user/.local/share/asmr-tg-backup"
 poll_interval_seconds = 1800
 download_delay_seconds = 300
 max_items_per_poll = 3
@@ -35,7 +35,7 @@ enabled = false
 # recording_mode = "live"
 
 [download]
-yt_dlp = "/home/your-user/dev/ytb-tg-backup/.venv/bin/yt-dlp"
+yt_dlp = "/home/your-user/dev/asmr-tg-backup/.venv/bin/yt-dlp"
 ffmpeg = "/usr/bin/ffmpeg"
 format = "bestaudio/best"
 merge_output_format = ""

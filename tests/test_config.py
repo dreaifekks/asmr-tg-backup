@@ -32,6 +32,10 @@ enabled = true
             ["https://www.youtube.com/feeds/videos.xml?channel_id=UC123"],
         )
         self.assertEqual(config.app.poll_interval_seconds, 1800)
+        self.assertEqual(
+            config.app.data_dir,
+            Path.home() / ".local/share/asmr-tg-backup",
+        )
         self.assertEqual(config.download.format, "bestaudio/best")
         self.assertTrue(config.download.extract_audio)
         self.assertTrue(config.download.provider_profiles["twitch"].extract_audio)

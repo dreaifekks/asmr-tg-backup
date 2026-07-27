@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ytb-tg-backup"
+name = "asmr-tg-backup"
 version = "0.2.2"
 description = "Discover public media from provider-backed origins, archive it with yt-dlp, and optionally deliver it to Telegram."
 license = {file = "LICENSE"}
@@ -14,7 +14,7 @@ classifiers = [
 ]
 
 [project.scripts]
-ytb-tg-backup = "ytb_tg_backup.cli:main"
+asmr-tg-backup = "ytb_tg_backup.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

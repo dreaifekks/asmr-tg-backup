@@ -5,15 +5,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/dev/ytb-tg-backup
-ExecStart=%h/dev/ytb-tg-backup/.venv/bin/python -m ytb_tg_backup run --config %h/.config/ytb-tg-backup/config.toml
+WorkingDirectory=%h/dev/asmr-tg-backup
+ExecStart=%h/dev/asmr-tg-backup/.venv/bin/python -m ytb_tg_backup run --config %h/.config/asmr-tg-backup/config.toml
 Restart=always
 RestartSec=10
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=30s
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=-%h/.config/ytb-tg-backup/env
+EnvironmentFile=-%h/.config/asmr-tg-backup/env
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
