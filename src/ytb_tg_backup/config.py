@@ -112,6 +112,7 @@ class ControlConfig:
     enabled: bool = False
     poll_interval_seconds: int = 10
     panel_idle_timeout_seconds: int = 3600
+    allow_disk_delete: bool = False
     delete_webhook_on_startup: bool = True
     default_routes: list[str] = field(default_factory=lambda: ["live"])
     allowed_user_ids: list[str] = field(default_factory=list)
@@ -268,6 +269,10 @@ def load_config(path: str | Path) -> Config:
             0,
             int(control_raw.get("panel_idle_timeout_seconds", 3600)),
         ),
+        allow_disk_delete=_strict_bool(
+            control_raw.get("allow_disk_delete", False),
+            label="control.allow_disk_delete",
+        ),
         delete_webhook_on_startup=bool(control_raw.get("delete_webhook_on_startup", True)),
         default_routes=[str(route).strip("/") for route in control_raw.get("default_routes", ["live"])],
         allowed_user_ids=[str(item) for item in control_raw.get("allowed_user_ids", [])],
@@ -388,6 +393,12 @@ def _twitch_recording_mode(value: object, *, label: str) -> str:
     if mode not in {"vod", "live"}:
         raise ValueError(f"{label} must be 'vod' or 'live'")
     return mode
+
+
+def _strict_bool(value: object, *, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} must be true or false")
+    return value
 
 
 def _load_download_profiles(raw_profiles: dict[str, Any]) -> dict[str, DownloadProfile]:

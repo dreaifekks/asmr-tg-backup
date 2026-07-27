@@ -298,6 +298,8 @@ message in place while navigating:
 - add a Twitch channel after choosing `直播中录制` or `直播结束后下载`;
 - see each Twitch channel's current `LIVE`/`VOD` mode and switch it in place;
 - enable, disable, or confirm deletion of bot-managed origins;
+- browse tracked local ASMR resources, search by title/source/provider/external
+  ID, inspect their managed files, and optionally purge local copies;
 - view media/job statistics; and
 - inspect, set, disable, or reset the global source filter.
 
@@ -357,6 +359,53 @@ visible with their effective mode but remain read-only in the panel; change
 their TOML entry instead. Deleting a bot-managed origin retains its historical
 media, artifacts, and delivery records.
 
+### Local resource library
+
+`💾 本地资源` opens a paginated library built from SQLite artifacts. A completed
+resource is anchored by its `master`; an interrupted live recording that has
+only `live_segment` files is also listed and clearly marked as unmerged. Each
+resource shows its provider, source, archive date, tracked size, local file
+health, and Telegram delivery state. Search matches the title, source name,
+provider, content kind, or external ID. The detail view also lists the number
+and roles of all tracked files for that media item, including live segments,
+Telegram upload derivatives, and registered thumbnails.
+
+The panel deliberately manages only exact paths recorded in `artifacts`. It
+does not recursively scan `downloads/`, infer ownership from filenames, or
+delete untracked `.info.json`, source thumbnails, partial downloads, or other
+orphan files. This prevents a short or overlapping media ID from deleting a
+different resource. The detail page reports missing or unsafe tracked paths
+instead of treating them as healthy local files.
+
+Local deletion is read-only by default. To enable the destructive action:
+
+```toml
+[control]
+allow_disk_delete = true
+```
+
+This option is loaded from TOML when the service starts. Restart the service
+after changing it; refreshing the Telegram panel does not reload the config.
+
+Deletion requires the normal authorized, current, unexpired panel plus a
+resource-specific confirmation page. It removes every exact tracked regular
+file for that media item only when the path resolves below
+`[app].data_dir/downloads`; symlinks, directories, paths outside that root, and
+files shared by another media item are rejected. A resource with a running
+download or delivery is also rejected. Queued/retry/blocked work is cancelled
+so intentional cleanup does not trigger an automatic redownload. Each exact
+path is reserved in SQLite before unlinking; artifact writers cannot register
+the same path during deletion. Successful removals retain a path tombstone so a
+writer that was waiting on the deletion transaction cannot later register a
+missing file; an interrupted purge becomes retryable after service recovery.
+
+The media item, source relationship, job audit, artifact tombstones, yt-dlp
+archive, and Telegram delivery records remain in SQLite. Existing Telegram
+messages are never deleted. Twitch live recordings are explicitly marked in
+the confirmation page because they usually cannot be recreated after local
+deletion. A partial filesystem failure stays visible as `purge_failed` and can
+be retried from the same resource.
+
 Authorization is an AND across every configured dimension. An empty dimension
 is ignored, but each non-empty allowlist must match the incoming message. If all
 three allowlists are empty, all commands are denied. For example, configuring a
@@ -370,6 +419,8 @@ enabled = true
 poll_interval_seconds = 10
 # Close /panel after one idle hour; use 0 to keep it active indefinitely.
 panel_idle_timeout_seconds = 3600
+# Browsing local resources is always available; permanent file deletion is not.
+allow_disk_delete = false
 delete_webhook_on_startup = true
 default_routes = ["live"]
 allowed_user_ids = ["123456789"]

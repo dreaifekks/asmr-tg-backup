@@ -8,6 +8,7 @@ from unittest import mock
 
 from ytb_tg_backup.config import load_config
 from ytb_tg_backup.control import ControlBot, _origin_token
+from ytb_tg_backup.models import MediaCandidate, Origin
 from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
 from ytb_tg_backup.store import Store
 
@@ -392,6 +393,402 @@ allowed_chat_ids = ["-100"]
                     for payload in edits
                 )
             )
+
+    def test_panel_browses_searches_and_deletes_tracked_disk_resource(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "test-token"
+
+[control]
+enabled = true
+allow_disk_delete = true
+allowed_user_ids = ["123"]
+allowed_chat_ids = ["-100"]
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin(
+                    "youtube-asmr",
+                    "youtube",
+                    "uploads",
+                    "Quiet ASMR",
+                    "UC-quiet",
+                )
+            )
+            media_id, _ = store.upsert_discovered(
+                "youtube-asmr",
+                MediaCandidate(
+                    provider="youtube",
+                    content_kind="video",
+                    external_id="whisper-1",
+                    title="Soft Whisper ASMR",
+                    url="https://www.youtube.com/watch?v=whisper-1",
+                    published_at="2026-07-26T12:00:00+00:00",
+                ),
+            )
+            resource_dir = config.download_dir / "youtube" / "Quiet ASMR"
+            resource_dir.mkdir(parents=True)
+            resource_path = resource_dir / "Soft Whisper ASMR_whisper-1.m4a"
+            resource_path.write_bytes(b"audio")
+            download = store.claim_next_job(
+                ("download",),
+                owner="download",
+                lease_seconds=60,
+            )
+            artifact_id = store.complete_download(
+                download,
+                path=resource_path,
+                size_bytes=5,
+            )
+            self.assertEqual(download.media_id, media_id)
+
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            calls: list[tuple[str, dict]] = []
+
+            def fake_api(method: str, payload: dict) -> dict:
+                calls.append((method, payload))
+                if method == "sendMessage":
+                    return {"ok": True, "result": {"message_id": 500}}
+                return {"ok": True, "result": True}
+
+            command_message = {
+                "message_id": 10,
+                "from": {"id": 123},
+                "chat": {"id": -100},
+                "text": "/panel",
+            }
+            panel_message = {"message_id": 500, "chat": {"id": -100}}
+
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                bot._handle_update({"message": command_message})
+                resources_callback = _current_panel_callback(
+                    calls,
+                    "p:resources:0",
+                )
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-resources",
+                            "from": {"id": 123},
+                            "message": panel_message,
+                            "data": resources_callback,
+                        }
+                    }
+                )
+                library_panel = next(
+                    payload
+                    for method, payload in reversed(calls)
+                    if method == "editMessageText"
+                )
+                self.assertIn("本地资源", library_panel["text"])
+                self.assertIn("Soft Whisper ASMR", library_panel["text"])
+
+                search_callback = _current_panel_callback(calls, "p:ressearch")
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-search",
+                            "from": {"id": 123},
+                            "message": panel_message,
+                            "data": search_callback,
+                        }
+                    }
+                )
+                bot._handle_update(
+                    {
+                        "message": {
+                            "message_id": 11,
+                            "from": {"id": 123},
+                            "chat": {"id": -100},
+                            "text": "quiet whisper-1",
+                        }
+                    }
+                )
+                searched_panel = next(
+                    payload
+                    for method, payload in reversed(calls)
+                    if method == "editMessageText"
+                )
+                self.assertIn("搜索：quiet whisper-1", searched_panel["text"])
+                self.assertIn("Soft Whisper ASMR", searched_panel["text"])
+
+                detail_callback = _current_panel_callback(
+                    calls,
+                    f"p:resource:{artifact_id}",
+                )
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-detail",
+                            "from": {"id": 123},
+                            "message": panel_message,
+                            "data": detail_callback,
+                        }
+                    }
+                )
+                detail_panel = next(
+                    payload
+                    for method, payload in reversed(calls)
+                    if method == "editMessageText"
+                )
+                self.assertIn("本地资源详情", detail_panel["text"])
+                self.assertIn(
+                    "youtube/Quiet ASMR/Soft Whisper ASMR_whisper-1.m4a",
+                    detail_panel["text"],
+                )
+
+                ask_callback = _current_panel_callback(
+                    calls,
+                    f"p:resdelask:{artifact_id}",
+                )
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-delete-ask",
+                            "from": {"id": 123},
+                            "message": panel_message,
+                            "data": ask_callback,
+                        }
+                    }
+                )
+                confirm_panel = next(
+                    payload
+                    for method, payload in reversed(calls)
+                    if method == "editMessageText"
+                )
+                self.assertIn("永久删除本地备份", confirm_panel["text"])
+                self.assertIn("不会自动重新下载", confirm_panel["text"])
+
+                delete_callback = _current_panel_callback(
+                    calls,
+                    f"p:resdelete:{artifact_id}",
+                )
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-delete",
+                            "from": {"id": 123},
+                            "message": panel_message,
+                            "data": delete_callback,
+                        }
+                    }
+                )
+
+            self.assertFalse(resource_path.exists())
+            self.assertEqual(store.get_artifact(media_id)["state"], "purged")
+            final_panel = next(
+                payload
+                for method, payload in reversed(calls)
+                if method == "editMessageText"
+            )
+            self.assertIn("已删除 Soft Whisper ASMR", final_panel["text"])
+            self.assertIn("没有匹配的受管本地资源", final_panel["text"])
+            self.assertEqual(
+                sum(method == "sendMessage" for method, _ in calls),
+                1,
+            )
+
+    def test_panel_disk_delete_actions_are_rejected_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "test-token"
+
+[control]
+enabled = true
+allowed_user_ids = ["123"]
+allowed_chat_ids = ["-100"]
+""".strip()
+            )
+            config = load_config(config_path)
+            self.assertFalse(config.control.allow_disk_delete)
+            store = Store(config.db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin(
+                    "youtube-asmr",
+                    "youtube",
+                    "uploads",
+                    "Quiet ASMR",
+                    "UC-quiet",
+                )
+            )
+            media_id, _ = store.upsert_discovered(
+                "youtube-asmr",
+                MediaCandidate(
+                    provider="youtube",
+                    content_kind="video",
+                    external_id="readonly-1",
+                    title="Read-only ASMR",
+                    url="https://www.youtube.com/watch?v=readonly-1",
+                    published_at=None,
+                ),
+            )
+            resource_path = config.download_dir / "youtube" / "readonly-1.m4a"
+            resource_path.parent.mkdir(parents=True)
+            resource_path.write_bytes(b"audio")
+            download = store.claim_next_job(
+                ("download",),
+                owner="download",
+                lease_seconds=60,
+            )
+            artifact_id = store.complete_download(
+                download,
+                path=resource_path,
+                size_bytes=5,
+            )
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            message = {"from": {"id": 123}, "chat": {"id": -100}}
+
+            for action in ("resdelask", "resdelete"):
+                with self.subTest(action=action), self.assertRaisesRegex(
+                    ValueError,
+                    "本地删除未启用",
+                ):
+                    bot._apply_panel_action(
+                        f"p:{action}:{artifact_id}",
+                        {
+                            "view": "resource_detail",
+                            "target_artifact_id": artifact_id,
+                            "target_resource_revision": "forged",
+                        },
+                        message,
+                    )
+
+            self.assertTrue(resource_path.exists())
+            self.assertEqual(store.get_artifact(media_id)["state"], "ready")
+
+    def test_panel_stale_resource_confirmation_cannot_delete_new_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "test-token"
+
+[control]
+enabled = true
+allow_disk_delete = true
+allowed_user_ids = ["123"]
+allowed_chat_ids = ["-100"]
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin(
+                    "youtube-asmr",
+                    "youtube",
+                    "uploads",
+                    "Quiet ASMR",
+                    "UC-quiet",
+                )
+            )
+            media_id, _ = store.upsert_discovered(
+                "youtube-asmr",
+                MediaCandidate(
+                    provider="youtube",
+                    content_kind="video",
+                    external_id="stale-confirmation-1",
+                    title="Stale Confirmation ASMR",
+                    url=(
+                        "https://www.youtube.com/watch?"
+                        "v=stale-confirmation-1"
+                    ),
+                    published_at=None,
+                ),
+            )
+            resource_path = (
+                config.download_dir / "youtube" / "stale-confirmation-1.m4a"
+            )
+            resource_path.parent.mkdir(parents=True)
+            resource_path.write_bytes(b"audio")
+            download = store.claim_next_job(
+                ("download",),
+                owner="download",
+                lease_seconds=60,
+            )
+            artifact_id = store.complete_download(
+                download,
+                path=resource_path,
+                size_bytes=5,
+            )
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            message = {"from": {"id": 123}, "chat": {"id": -100}}
+            state = {
+                "view": "resource_detail",
+                "target_artifact_id": artifact_id,
+            }
+            bot._apply_panel_action(
+                f"p:resdelask:{artifact_id}",
+                state,
+                message,
+            )
+            confirmed_revision = state["target_resource_revision"]
+
+            thumbnail_path = (
+                config.download_dir / "youtube" / "stale-confirmation-1.jpg"
+            )
+            thumbnail_path.write_bytes(b"thumbnail")
+            store.record_artifact(
+                media_id,
+                role="thumbnail",
+                path=thumbnail_path,
+                size_bytes=9,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "changed after confirmation",
+            ):
+                bot._apply_panel_action(
+                    f"p:resdelete:{artifact_id}",
+                    state,
+                    message,
+                )
+
+            self.assertEqual(
+                state["target_resource_revision"],
+                confirmed_revision,
+            )
+            self.assertTrue(resource_path.exists())
+            self.assertTrue(thumbnail_path.exists())
+            self.assertEqual(
+                {
+                    str(row["state"])
+                    for row in store.conn.execute(
+                        "SELECT state FROM artifacts WHERE media_id=?",
+                        (media_id,),
+                    )
+                },
+                {"ready"},
+            )
+            text, keyboard = bot._render_resource_delete_confirm_panel(state)
+            self.assertIn("资源在确认期间发生了变化", text)
+            callbacks = {
+                button["callback_data"]
+                for row in keyboard
+                for button in row
+            }
+            self.assertNotIn(f"p:resdelete:{artifact_id}", callbacks)
 
     def test_each_panel_command_sends_a_fresh_panel_and_retires_the_previous_one(self):
         with tempfile.TemporaryDirectory() as tmp:

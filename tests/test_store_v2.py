@@ -3,8 +3,11 @@ from pathlib import Path
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
+import ytb_tg_backup.store as store_module
 from ytb_tg_backup.models import MediaCandidate, Origin
 from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
 from ytb_tg_backup.store import LEGACY_SCHEMA, Store, now_iso
@@ -423,6 +426,1338 @@ class StoreV2Test(unittest.TestCase):
             row = store.conn.execute("SELECT state, reason_code FROM jobs WHERE id=?", (delivery.id,)).fetchone()
             self.assertEqual(tuple(row), ("retry", "worker_recovered"))
             self.assertIsNotNone(store.claim_next_job(("telegram_delivery",), owner="other", lease_seconds=60))
+
+    def test_disk_resource_library_search_detail_and_purge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            youtube_dir = root / "youtube" / "channel"
+            twitch_dir = root / "twitch" / "streamer"
+            youtube_dir.mkdir(parents=True)
+            twitch_dir.mkdir(parents=True)
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "Quiet ASMR", "UC-1")
+            )
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "Live ASMR", "42")
+            )
+            youtube_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "first"),
+            )
+            twitch_id, _ = store.upsert_discovered(
+                "tw",
+                candidate("twitch", "second", kind="vod"),
+            )
+
+            youtube_path = youtube_dir / "first.m4a"
+            youtube_path.write_bytes(b"one")
+            youtube_job = store.claim_next_job(
+                ("download",),
+                owner="youtube",
+                lease_seconds=60,
+            )
+            self.assertEqual(youtube_job.media_id, youtube_id)
+            youtube_artifact_id = store.complete_download(
+                youtube_job,
+                path=youtube_path,
+                size_bytes=3,
+                delivery_targets=("telegram:@archive",),
+            )
+            thumbnail_path = youtube_dir / "first.jpg"
+            thumbnail_path.write_bytes(b"thumb")
+            store.record_artifact(
+                youtube_id,
+                role="thumbnail",
+                path=thumbnail_path,
+                size_bytes=5,
+            )
+            delivery = store.claim_next_job(
+                ("telegram_delivery",),
+                owner="delivery",
+                lease_seconds=60,
+            )
+            store.complete_delivery(
+                delivery,
+                artifact_id=youtube_artifact_id,
+                destination_key="telegram:@archive",
+                remote_id="100",
+            )
+            store.ensure_delivery_job(youtube_id, "telegram:@other")
+
+            twitch_path = twitch_dir / "second.m4a"
+            twitch_path.write_bytes(b"two-two")
+            twitch_job = store.claim_next_job(
+                ("download",),
+                owner="twitch",
+                lease_seconds=60,
+            )
+            self.assertEqual(twitch_job.media_id, twitch_id)
+            twitch_artifact_id = store.complete_download(
+                twitch_job,
+                path=twitch_path,
+                size_bytes=7,
+            )
+            store.conn.execute(
+                "UPDATE artifacts SET state='suppressed' WHERE id=?",
+                (twitch_artifact_id,),
+            )
+            store.conn.commit()
+
+            first_page = store.list_disk_resources(root, limit=1)
+            self.assertEqual(first_page["total"], 2)
+            self.assertEqual(len(first_page["items"]), 1)
+            self.assertEqual(
+                first_page["items"][0]["artifact_id"],
+                twitch_artifact_id,
+            )
+            search = store.list_disk_resources(
+                root,
+                query="quiet first",
+            )
+            self.assertEqual(search["total"], 1)
+            self.assertEqual(
+                search["items"][0]["artifact_id"],
+                youtube_artifact_id,
+            )
+
+            detail = store.get_disk_resource(youtube_artifact_id, root)
+            self.assertEqual(detail["existing_file_count"], 2)
+            self.assertEqual(detail["actual_bytes"], 8)
+            self.assertTrue(detail["delivered"])
+            self.assertEqual(detail["relative_path"], "youtube/channel/first.m4a")
+
+            untracked = youtube_dir / "first.info.json"
+            untracked.write_text("{}")
+            result = store.purge_disk_resource(
+                youtube_artifact_id,
+                root,
+                expected_revision=str(detail["resource_revision"]),
+            )
+
+            self.assertTrue(result["completed"])
+            self.assertEqual(result["deleted_files"], 2)
+            self.assertEqual(result["freed_bytes"], 8)
+            self.assertFalse(youtube_path.exists())
+            self.assertFalse(thumbnail_path.exists())
+            self.assertTrue(untracked.exists())
+            self.assertEqual(
+                {
+                    str(row["state"])
+                    for row in store.conn.execute(
+                        "SELECT state FROM artifacts WHERE media_id=?",
+                        (youtube_id,),
+                    )
+                },
+                {"purged"},
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT COUNT(*) FROM media_items WHERE id=?",
+                    (youtube_id,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT COUNT(*) FROM deliveries WHERE media_id=?",
+                    (youtube_id,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    """
+                    SELECT state FROM jobs
+                    WHERE media_id=? AND target_key='telegram:@other'
+                    """,
+                    (youtube_id,),
+                ).fetchone()["state"],
+                "cancelled",
+            )
+            remaining = store.list_disk_resources(root)
+            self.assertEqual(remaining["total"], 1)
+            self.assertEqual(
+                remaining["items"][0]["artifact_id"],
+                twitch_artifact_id,
+            )
+
+    def test_disk_resource_purge_rejects_running_and_unsafe_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "busy"),
+            )
+            path = root / "busy.m4a"
+            path.write_bytes(b"audio")
+            download = store.claim_next_job(
+                ("download",),
+                owner="download",
+                lease_seconds=60,
+            )
+            artifact_id = store.complete_download(
+                download,
+                path=path,
+                size_bytes=5,
+            )
+            store.ensure_delivery_job(media_id, "telegram:@archive")
+            delivery = store.claim_next_job(
+                ("telegram_delivery",),
+                owner="delivery",
+                lease_seconds=60,
+            )
+            detail = store.get_disk_resource(artifact_id, root)
+
+            with self.assertRaisesRegex(ValueError, "currently"):
+                store.purge_disk_resource(
+                    artifact_id,
+                    root,
+                    expected_revision=str(detail["resource_revision"]),
+                )
+            self.assertTrue(path.exists())
+            self.assertEqual(
+                store.get_artifact(media_id)["state"],
+                "ready",
+            )
+
+            store.cancel_job(
+                delivery,
+                reason_code="test",
+                error="test cleanup",
+            )
+            changed_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=1)
+            ).isoformat()
+            store.conn.execute(
+                "UPDATE artifacts SET updated_at=? WHERE id=?",
+                (changed_at, artifact_id),
+            )
+            store.conn.commit()
+            with self.assertRaisesRegex(ValueError, "changed after confirmation"):
+                store.purge_disk_resource(
+                    artifact_id,
+                    root,
+                    expected_revision=str(detail["resource_revision"]),
+                )
+            self.assertTrue(path.exists())
+
+            outside = Path(tmp) / "outside.m4a"
+            outside.write_bytes(b"outside")
+            changed_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=2)
+            ).isoformat()
+            store.conn.execute(
+                "UPDATE artifacts SET path=?, updated_at=? WHERE id=?",
+                (str(outside), changed_at, artifact_id),
+            )
+            store.conn.commit()
+            unsafe_detail = store.get_disk_resource(artifact_id, root)
+            with self.assertRaisesRegex(ValueError, "unsafe tracked path"):
+                store.purge_disk_resource(
+                    artifact_id,
+                    root,
+                    expected_revision=str(unsafe_detail["resource_revision"]),
+                )
+            self.assertTrue(outside.exists())
+
+    def test_disk_resource_purge_failure_can_be_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "retry-purge"),
+            )
+            path = root / "retry-purge.m4a"
+            path.write_bytes(b"audio")
+            download = store.claim_next_job(
+                ("download",),
+                owner="download",
+                lease_seconds=60,
+            )
+            artifact_id = store.complete_download(
+                download,
+                path=path,
+                size_bytes=5,
+            )
+            detail = store.get_disk_resource(artifact_id, root)
+
+            with mock.patch.object(
+                store_module,
+                "_unlink_tracked_file",
+                side_effect=PermissionError("read-only filesystem"),
+            ):
+                failed = store.purge_disk_resource(
+                    artifact_id,
+                    root,
+                    expected_revision=str(detail["resource_revision"]),
+                )
+
+            self.assertFalse(failed["completed"])
+            self.assertEqual(failed["failed_files"], 1)
+            self.assertTrue(path.exists())
+            self.assertEqual(
+                store.get_artifact(media_id)["state"],
+                "purge_failed",
+            )
+            retried = store.purge_disk_resource(
+                artifact_id,
+                root,
+                expected_revision=str(failed["resource_revision"]),
+            )
+            self.assertTrue(retried["completed"])
+            self.assertFalse(path.exists())
+            self.assertEqual(
+                store.get_artifact(media_id)["state"],
+                "purged",
+            )
+
+    def test_disk_resource_confirmation_covers_new_related_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "revision"),
+            )
+            master_path = root / "revision.m4a"
+            master_path.write_bytes(b"master")
+            download = store.claim_next_job(
+                ("download",),
+                owner="download",
+                lease_seconds=60,
+            )
+            artifact_id = store.complete_download(
+                download,
+                path=master_path,
+                size_bytes=6,
+            )
+            confirmed = store.get_disk_resource(artifact_id, root)
+
+            thumbnail = root / "revision.jpg"
+            thumbnail.write_bytes(b"thumbnail")
+            store.record_artifact(
+                media_id,
+                role="thumbnail",
+                path=thumbnail,
+                size_bytes=9,
+            )
+
+            with self.assertRaisesRegex(ValueError, "changed after confirmation"):
+                store.purge_disk_resource(
+                    artifact_id,
+                    root,
+                    expected_revision=str(confirmed["resource_revision"]),
+                )
+
+            self.assertTrue(master_path.exists())
+            self.assertTrue(thumbnail.exists())
+            self.assertEqual(
+                {
+                    str(row["state"])
+                    for row in store.conn.execute(
+                        "SELECT state FROM artifacts WHERE media_id=?",
+                        (media_id,),
+                    )
+                },
+                {"ready"},
+            )
+
+            refreshed = store.get_disk_resource(artifact_id, root)
+            replacement = root / "replacement.m4a"
+            replacement.write_bytes(b"replacement master")
+            replacement.replace(master_path)
+            with self.assertRaisesRegex(ValueError, "changed after confirmation"):
+                store.purge_disk_resource(
+                    artifact_id,
+                    root,
+                    expected_revision=str(refreshed["resource_revision"]),
+                )
+            self.assertEqual(master_path.read_bytes(), b"replacement master")
+            self.assertTrue(thumbnail.exists())
+
+    def test_disk_resource_purge_rejects_path_shared_by_another_media(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            first_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "shared-first"),
+            )
+            second_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "shared-second"),
+            )
+            shared = root / "shared.m4a"
+            shared.write_bytes(b"shared")
+            first_job = store.claim_next_job(
+                ("download",),
+                owner="first",
+                lease_seconds=60,
+            )
+            first_artifact = store.complete_download(
+                first_job,
+                path=shared,
+                size_bytes=6,
+            )
+            second_job = store.claim_next_job(
+                ("download",),
+                owner="second",
+                lease_seconds=60,
+            )
+            second_artifact = store.complete_download(
+                second_job,
+                path=shared,
+                size_bytes=6,
+            )
+            detail = store.get_disk_resource(first_artifact, root)
+
+            with self.assertRaisesRegex(ValueError, "another media item"):
+                store.purge_disk_resource(
+                    first_artifact,
+                    root,
+                    expected_revision=str(detail["resource_revision"]),
+                )
+
+            self.assertTrue(shared.exists())
+            self.assertEqual(store.get_artifact(first_id)["state"], "ready")
+            self.assertEqual(store.get_artifact(second_id)["state"], "ready")
+
+            alias = root / "shared-alias.m4a"
+            alias.symlink_to(shared)
+            store.conn.execute(
+                "UPDATE artifacts SET path=?, updated_at=? WHERE id=?",
+                (str(alias), now_iso(), second_artifact),
+            )
+            store.conn.commit()
+            with self.assertRaisesRegex(ValueError, "another media item"):
+                store.purge_disk_resource(
+                    first_artifact,
+                    root,
+                    expected_revision=str(detail["resource_revision"]),
+                )
+            self.assertTrue(shared.exists())
+            self.assertTrue(alias.is_symlink())
+
+    def test_disk_resource_reservation_blocks_late_shared_path_registration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            first_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "reserved-first"),
+            )
+            shared = root / "reserved-shared.m4a"
+            shared.write_bytes(b"shared")
+            first_job = store.claim_next_job(
+                ("download",),
+                owner="first",
+                lease_seconds=60,
+            )
+            first_artifact = store.complete_download(
+                first_job,
+                path=shared,
+                size_bytes=6,
+            )
+            second_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "reserved-second"),
+            )
+            confirmed = store.get_disk_resource(first_artifact, root)
+            second_store = Store(db_path)
+            second_store.initialize()
+            original_purge = Store._purge_reserved_files
+            late_registration_attempted = False
+
+            def inject_late_registration(
+                active_store: Store,
+                **kwargs,
+            ):
+                nonlocal late_registration_attempted
+                late_registration_attempted = True
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "reserved for deletion",
+                ):
+                    second_store.record_artifact(
+                        second_id,
+                        role="master",
+                        path=shared,
+                        size_bytes=6,
+                    )
+                return original_purge(active_store, **kwargs)
+
+            with mock.patch.object(
+                Store,
+                "_purge_reserved_files",
+                new=inject_late_registration,
+            ):
+                result = store.purge_disk_resource(
+                    first_artifact,
+                    root,
+                    expected_revision=str(
+                        confirmed["resource_revision"]
+                    ),
+                )
+
+            self.assertTrue(late_registration_attempted)
+            self.assertTrue(result["completed"])
+            self.assertFalse(shared.exists())
+            self.assertEqual(store.get_artifact(first_id)["state"], "purged")
+            self.assertIsNone(second_store.get_artifact(second_id))
+            tombstone = store.conn.execute(
+                """
+                SELECT state, owner_pid, owner_start_id, finished_at
+                FROM purge_path_reservations
+                WHERE storage_key=?
+                """,
+                (str(shared.resolve()),),
+            ).fetchone()
+            self.assertIsNotNone(tombstone)
+            self.assertEqual(
+                tuple(tombstone)[:3],
+                ("purged", 0, ""),
+            )
+            self.assertIsNotNone(tombstone["finished_at"])
+
+    def test_disk_resource_purge_blocks_concurrent_writer_until_tombstoned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            origin = Origin(
+                "yt",
+                "youtube",
+                "uploads",
+                "YT",
+                "UC-1",
+            )
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(origin)
+            first_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "concurrent-purge-first"),
+            )
+            shared = root / "concurrent-purge.m4a"
+            shared.write_bytes(b"shared")
+            first_job = store.claim_next_job(
+                ("download",),
+                owner="first",
+                lease_seconds=60,
+            )
+            first_artifact = store.complete_download(
+                first_job,
+                path=shared,
+                size_bytes=6,
+            )
+            second_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "concurrent-purge-second"),
+            )
+            confirmed = store.get_disk_resource(first_artifact, root)
+            store.close()
+
+            phase_two_paused = threading.Event()
+            allow_purge = threading.Event()
+            writer_ready = threading.Event()
+            writer_started = threading.Event()
+            writer_finished = threading.Event()
+            purge_results: list[dict[str, object]] = []
+            purge_errors: list[BaseException] = []
+            writer_errors: list[BaseException] = []
+            original_unlink = store_module._unlink_tracked_file
+
+            def pause_before_unlink(
+                path: Path,
+                download_root: Path,
+                expected: dict[str, object],
+            ) -> int:
+                phase_two_paused.set()
+                if not allow_purge.wait(timeout=5):
+                    raise TimeoutError("test did not release purge")
+                return original_unlink(path, download_root, expected)
+
+            def purge_worker() -> None:
+                worker_store = Store(db_path)
+                worker_store.initialize()
+                try:
+                    purge_results.append(
+                        worker_store.purge_disk_resource(
+                            first_artifact,
+                            root,
+                            expected_revision=str(
+                                confirmed["resource_revision"]
+                            ),
+                        )
+                    )
+                except BaseException as exc:
+                    purge_errors.append(exc)
+                finally:
+                    worker_store.close()
+
+            def writer_worker() -> None:
+                writer_store = Store(db_path)
+                writer_store.initialize()
+                writer_ready.set()
+                try:
+                    if not phase_two_paused.wait(timeout=5):
+                        raise TimeoutError(
+                            "purge did not reach phase two"
+                        )
+                    writer_started.set()
+                    writer_store.record_artifact(
+                        second_id,
+                        role="master",
+                        path=shared,
+                        size_bytes=6,
+                    )
+                except BaseException as exc:
+                    writer_errors.append(exc)
+                finally:
+                    writer_finished.set()
+                    writer_store.close()
+
+            writer_thread = threading.Thread(
+                target=writer_worker,
+                name="late-artifact-writer",
+            )
+            purge_thread = threading.Thread(
+                target=purge_worker,
+                name="disk-resource-purge",
+            )
+            writer_thread.start()
+            self.assertTrue(writer_ready.wait(timeout=5))
+            with mock.patch.object(
+                store_module,
+                "_unlink_tracked_file",
+                side_effect=pause_before_unlink,
+            ):
+                purge_thread.start()
+                phase_two_seen = phase_two_paused.wait(timeout=5)
+                writer_seen = (
+                    writer_started.wait(timeout=5)
+                    if phase_two_seen
+                    else False
+                )
+                writer_was_blocked = (
+                    writer_seen
+                    and not writer_finished.wait(timeout=0.2)
+                )
+                allow_purge.set()
+                purge_thread.join(timeout=5)
+                writer_thread.join(timeout=5)
+
+            self.assertTrue(phase_two_seen)
+            self.assertTrue(writer_seen)
+            self.assertTrue(writer_was_blocked)
+            self.assertFalse(purge_thread.is_alive())
+            self.assertFalse(writer_thread.is_alive())
+            self.assertEqual(purge_errors, [])
+            self.assertEqual(len(purge_results), 1)
+            self.assertTrue(purge_results[0]["completed"])
+            self.assertEqual(len(writer_errors), 1)
+            self.assertIsInstance(writer_errors[0], RuntimeError)
+            self.assertIn(
+                "reserved for deletion",
+                str(writer_errors[0]),
+            )
+            self.assertFalse(shared.exists())
+
+            verify_store = Store(db_path)
+            verify_store.initialize()
+            self.assertEqual(
+                verify_store.get_artifact(first_id)["state"],
+                "purged",
+            )
+            self.assertIsNone(verify_store.get_artifact(second_id))
+            tombstone = verify_store.conn.execute(
+                """
+                SELECT state, owner_pid, owner_start_id, finished_at
+                FROM purge_path_reservations
+                WHERE storage_key=?
+                """,
+                (str(shared.resolve()),),
+            ).fetchone()
+            self.assertIsNotNone(tombstone)
+            self.assertEqual(
+                tuple(tombstone)[:3],
+                ("purged", 0, ""),
+            )
+            self.assertIsNotNone(tombstone["finished_at"])
+
+    def test_disk_resource_purge_rejects_parent_symlink_swap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            managed_dir = root / "managed"
+            managed_dir.mkdir(parents=True)
+            outside_dir = Path(tmp) / "outside"
+            outside_dir.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "parent-swap"),
+            )
+            tracked = managed_dir / "parent-swap.m4a"
+            tracked.write_bytes(b"tracked")
+            outside = outside_dir / tracked.name
+            outside.write_bytes(b"outside")
+            download = store.claim_next_job(
+                ("download",),
+                owner="download",
+                lease_seconds=60,
+            )
+            artifact_id = store.complete_download(
+                download,
+                path=tracked,
+                size_bytes=7,
+            )
+            confirmed = store.get_disk_resource(artifact_id, root)
+            renamed_dir = root / "managed-before-swap"
+            original_unlink = store_module._unlink_tracked_file
+            swapped = False
+
+            def swap_parent_then_unlink(
+                path: Path,
+                download_root: Path,
+                expected: dict[str, object],
+            ) -> int:
+                nonlocal swapped
+                swapped = True
+                managed_dir.rename(renamed_dir)
+                managed_dir.symlink_to(
+                    outside_dir,
+                    target_is_directory=True,
+                )
+                return original_unlink(path, download_root, expected)
+
+            with mock.patch.object(
+                store_module,
+                "_unlink_tracked_file",
+                side_effect=swap_parent_then_unlink,
+            ):
+                result = store.purge_disk_resource(
+                    artifact_id,
+                    root,
+                    expected_revision=str(
+                        confirmed["resource_revision"]
+                    ),
+                )
+
+            self.assertTrue(swapped)
+            self.assertFalse(result["completed"])
+            self.assertEqual(result["deleted_files"], 0)
+            self.assertEqual(result["failed_files"], 1)
+            self.assertEqual(outside.read_bytes(), b"outside")
+            self.assertEqual(
+                (renamed_dir / tracked.name).read_bytes(),
+                b"tracked",
+            )
+            self.assertEqual(
+                store.get_artifact(media_id)["state"],
+                "purge_failed",
+            )
+
+    def test_live_segment_only_resource_is_listed_detailed_and_purged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "Live ASMR", "42")
+            )
+            media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "live-segments-only",
+                    kind="live_stream",
+                ),
+            )
+            first_segment = root / "live-segment-1.ts"
+            second_segment = root / "live-segment-2.ts"
+            first_segment.write_bytes(b"one")
+            second_segment.write_bytes(b"four")
+            store.record_live_segment(
+                media_id,
+                path=first_segment,
+                size_bytes=3,
+            )
+            store.record_live_segment(
+                media_id,
+                path=second_segment,
+                size_bytes=4,
+            )
+            self.assertIsNone(store.get_artifact(media_id, "master"))
+            segment_rows = store.conn.execute(
+                """
+                SELECT id, part_no
+                FROM artifacts
+                WHERE media_id=? AND role='live_segment'
+                ORDER BY part_no
+                """,
+                (media_id,),
+            ).fetchall()
+            anchor_id = int(segment_rows[0]["id"])
+
+            library = store.list_disk_resources(root)
+            self.assertEqual(library["total"], 1)
+            self.assertEqual(library["recorded_bytes"], 7)
+            self.assertEqual(
+                library["items"][0]["artifact_id"],
+                anchor_id,
+            )
+            self.assertEqual(
+                library["items"][0]["anchor_role"],
+                "live_segment",
+            )
+            self.assertTrue(library["items"][0]["irreplaceable_live"])
+
+            detail = store.get_disk_resource(anchor_id, root)
+            self.assertIsNotNone(detail)
+            self.assertEqual(detail["existing_file_count"], 2)
+            self.assertEqual(detail["actual_bytes"], 7)
+            self.assertEqual(
+                [str(item["role"]) for item in detail["files"]],
+                ["live_segment", "live_segment"],
+            )
+
+            result = store.purge_disk_resource(
+                anchor_id,
+                root,
+                expected_revision=str(detail["resource_revision"]),
+            )
+
+            self.assertTrue(result["completed"])
+            self.assertEqual(result["deleted_files"], 2)
+            self.assertEqual(result["freed_bytes"], 7)
+            self.assertFalse(first_segment.exists())
+            self.assertFalse(second_segment.exists())
+            self.assertEqual(
+                {
+                    str(row["state"])
+                    for row in store.conn.execute(
+                        "SELECT state FROM artifacts WHERE media_id=?",
+                        (media_id,),
+                    )
+                },
+                {"purged"},
+            )
+            self.assertIsNone(store.get_disk_resource(anchor_id, root))
+            self.assertEqual(store.list_disk_resources(root)["total"], 0)
+
+    def test_purged_download_job_stays_cancelled_after_rediscovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            origin = Origin(
+                "yt",
+                "youtube",
+                "uploads",
+                "YT",
+                "UC-1",
+            )
+            discovered = candidate("youtube", "purged-rediscovery")
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(origin)
+            media_id, _ = store.upsert_discovered("yt", discovered)
+            path = root / "purged-rediscovery.m4a"
+            path.write_bytes(b"audio")
+            download = store.claim_next_job(
+                ("download",),
+                owner="download",
+                lease_seconds=60,
+            )
+            artifact_id = store.complete_download(
+                download,
+                path=path,
+                size_bytes=5,
+            )
+            store.requeue_download(
+                media_id,
+                reason="test pending redownload",
+            )
+            detail = store.get_disk_resource(artifact_id, root)
+            result = store.purge_disk_resource(
+                artifact_id,
+                root,
+                expected_revision=str(detail["resource_revision"]),
+            )
+            self.assertTrue(result["completed"])
+            cancelled = store.conn.execute(
+                """
+                SELECT state, reason_code
+                FROM jobs
+                WHERE media_id=? AND job_type='download' AND target_key=''
+                """,
+                (media_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(cancelled),
+                ("cancelled", "resource_purged"),
+            )
+            store.close()
+
+            reopened = Store(db_path)
+            reopened.initialize()
+            reopened.upsert_origin(origin)
+            rediscovered_id, created = reopened.upsert_discovered(
+                "yt",
+                discovered,
+            )
+
+            self.assertEqual(rediscovered_id, media_id)
+            self.assertFalse(created)
+            still_cancelled = reopened.conn.execute(
+                """
+                SELECT state, reason_code
+                FROM jobs
+                WHERE media_id=? AND job_type='download' AND target_key=''
+                """,
+                (media_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(still_cancelled),
+                ("cancelled", "resource_purged"),
+            )
+            self.assertIsNone(
+                reopened.claim_next_job(
+                    ("download",),
+                    owner="after-restart",
+                    lease_seconds=60,
+                )
+            )
+            self.assertEqual(
+                reopened.get_artifact(media_id)["state"],
+                "purged",
+            )
+            self.assertEqual(
+                reopened.list_disk_resources(root)["total"],
+                0,
+            )
+
+    def test_initialize_recovers_dead_owner_disk_purge_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "dead-purge-owner"),
+            )
+            path = root / "dead-purge-owner.m4a"
+            path.write_bytes(b"audio")
+            download = store.claim_next_job(
+                ("download",),
+                owner="download",
+                lease_seconds=60,
+            )
+            artifact_id = store.complete_download(
+                download,
+                path=path,
+                size_bytes=5,
+            )
+            operation_id = "dead-purge-operation"
+            requested_at = now_iso()
+            metadata = {
+                "local_purge": {
+                    "operation_id": operation_id,
+                    "requested_at": requested_at,
+                    "previous_state": "ready",
+                    "source": "telegram_panel",
+                }
+            }
+            store.conn.execute(
+                """
+                UPDATE artifacts
+                SET state='purging', metadata_json=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    json.dumps(metadata, sort_keys=True),
+                    requested_at,
+                    artifact_id,
+                ),
+            )
+            store.conn.execute(
+                """
+                INSERT INTO purge_path_reservations(
+                  storage_key, media_id, operation_id, owner_pid,
+                  owner_start_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(path.resolve()),
+                    media_id,
+                    operation_id,
+                    0,
+                    "dead",
+                    requested_at,
+                ),
+            )
+            store.conn.commit()
+            store.close()
+
+            reopened = Store(db_path)
+            reopened.initialize()
+
+            artifact = reopened.get_artifact(media_id)
+            self.assertEqual(artifact["state"], "purge_failed")
+            recovered_metadata = json.loads(
+                str(artifact["metadata_json"])
+            )["local_purge"]
+            self.assertEqual(recovered_metadata["result"], "interrupted")
+            self.assertIn(
+                "service stopped",
+                recovered_metadata["error"],
+            )
+            self.assertEqual(
+                reopened.conn.execute(
+                    "SELECT COUNT(*) FROM purge_path_reservations"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertTrue(path.exists())
+            detail = reopened.get_disk_resource(artifact_id, root)
+            self.assertIsNotNone(detail)
+
+            retried = reopened.purge_disk_resource(
+                artifact_id,
+                root,
+                expected_revision=str(detail["resource_revision"]),
+            )
+            self.assertTrue(retried["completed"])
+            self.assertFalse(path.exists())
+
+    def test_initialize_recovers_crash_after_unlink_with_reusable_tombstone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            resources: dict[str, dict[str, object]] = {}
+            for scenario in ("missing", "restored"):
+                media_id, _ = store.upsert_discovered(
+                    "yt",
+                    candidate(
+                        "youtube",
+                        f"crash-after-unlink-{scenario}",
+                    ),
+                )
+                path = root / f"crash-after-unlink-{scenario}.m4a"
+                path.write_bytes(b"audio")
+                download = store.claim_next_job(
+                    ("download",),
+                    owner=f"download-{scenario}",
+                    lease_seconds=60,
+                )
+                artifact_id = store.complete_download(
+                    download,
+                    path=path,
+                    size_bytes=5,
+                )
+                operation_id = f"dead-after-unlink-{scenario}"
+                requested_at = now_iso()
+                metadata = {
+                    "local_purge": {
+                        "operation_id": operation_id,
+                        "requested_at": requested_at,
+                        "previous_state": "ready",
+                        "source": "telegram_panel",
+                    }
+                }
+                storage_key = str(path.resolve())
+                store.conn.execute(
+                    """
+                    UPDATE artifacts
+                    SET state='purging', metadata_json=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        json.dumps(metadata, sort_keys=True),
+                        requested_at,
+                        artifact_id,
+                    ),
+                )
+                store.conn.execute(
+                    """
+                    INSERT INTO purge_path_reservations(
+                      storage_key, media_id, operation_id, owner_pid,
+                      owner_start_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        storage_key,
+                        media_id,
+                        operation_id,
+                        0,
+                        "dead",
+                        requested_at,
+                    ),
+                )
+                resources[scenario] = {
+                    "artifact_id": artifact_id,
+                    "media_id": media_id,
+                    "operation_id": operation_id,
+                    "path": path,
+                    "storage_key": storage_key,
+                }
+            store.conn.commit()
+            for resource in resources.values():
+                resource["path"].unlink()
+            store.close()
+
+            reopened = Store(db_path)
+            reopened.initialize()
+
+            for scenario, resource in resources.items():
+                with self.subTest(
+                    scenario=scenario,
+                    phase="recovery",
+                ):
+                    artifact = reopened.get_artifact(
+                        int(resource["media_id"])
+                    )
+                    self.assertEqual(artifact["state"], "purge_failed")
+                    tombstone = reopened.conn.execute(
+                        """
+                        SELECT operation_id, state, owner_pid,
+                          owner_start_id, finished_at
+                        FROM purge_path_reservations
+                        WHERE storage_key=?
+                        """,
+                        (str(resource["storage_key"]),),
+                    ).fetchone()
+                    self.assertIsNotNone(tombstone)
+                    self.assertEqual(
+                        tuple(tombstone)[:4],
+                        (
+                            resource["operation_id"],
+                            "purged",
+                            0,
+                            "",
+                        ),
+                    )
+                    self.assertIsNotNone(tombstone["finished_at"])
+                    self.assertFalse(resource["path"].exists())
+
+            missing = resources["missing"]
+            missing_detail = reopened.get_disk_resource(
+                int(missing["artifact_id"]),
+                root,
+            )
+            self.assertIsNotNone(missing_detail)
+            missing_retry = reopened.purge_disk_resource(
+                int(missing["artifact_id"]),
+                root,
+                expected_revision=str(
+                    missing_detail["resource_revision"]
+                ),
+            )
+            self.assertTrue(missing_retry["completed"])
+            self.assertEqual(missing_retry["deleted_files"], 0)
+            self.assertEqual(missing_retry["missing_files"], 1)
+
+            restored = resources["restored"]
+            restored_bytes = b"restored after recovery"
+            restored["path"].write_bytes(restored_bytes)
+            restored_detail = reopened.get_disk_resource(
+                int(restored["artifact_id"]),
+                root,
+            )
+            self.assertIsNotNone(restored_detail)
+            self.assertEqual(restored_detail["existing_file_count"], 1)
+            self.assertEqual(
+                restored_detail["actual_bytes"],
+                len(restored_bytes),
+            )
+            restored_retry = reopened.purge_disk_resource(
+                int(restored["artifact_id"]),
+                root,
+                expected_revision=str(
+                    restored_detail["resource_revision"]
+                ),
+            )
+            self.assertTrue(restored_retry["completed"])
+            self.assertEqual(restored_retry["deleted_files"], 1)
+            self.assertEqual(restored_retry["missing_files"], 0)
+            self.assertEqual(
+                restored_retry["freed_bytes"],
+                len(restored_bytes),
+            )
+
+            for scenario, resource in resources.items():
+                with self.subTest(
+                    scenario=scenario,
+                    phase="retry",
+                ):
+                    self.assertFalse(resource["path"].exists())
+                    self.assertEqual(
+                        reopened.get_artifact(
+                            int(resource["media_id"])
+                        )["state"],
+                        "purged",
+                    )
+                    final_tombstone = reopened.conn.execute(
+                        """
+                        SELECT state, owner_pid, owner_start_id,
+                          finished_at
+                        FROM purge_path_reservations
+                        WHERE storage_key=?
+                        """,
+                        (str(resource["storage_key"]),),
+                    ).fetchone()
+                    self.assertIsNotNone(final_tombstone)
+                    self.assertEqual(
+                        tuple(final_tombstone)[:3],
+                        ("purged", 0, ""),
+                    )
+                    self.assertIsNotNone(
+                        final_tombstone["finished_at"]
+                    )
+                    self.assertEqual(
+                        reopened.conn.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM purge_path_reservations
+                            WHERE storage_key=?
+                            """,
+                            (str(resource["storage_key"]),),
+                        ).fetchone()[0],
+                        1,
+                    )
+
+    def test_partial_purge_keeps_target_anchor_until_other_paths_succeed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "anchor-last"),
+            )
+            anchor_path = root / "anchor-last.m4a"
+            anchor_path.write_bytes(b"anchor")
+            download = store.claim_next_job(
+                ("download",),
+                owner="download",
+                lease_seconds=60,
+            )
+            anchor_id = store.complete_download(
+                download,
+                path=anchor_path,
+                size_bytes=6,
+            )
+            extra_master_path = root / "anchor-last-part-1.m4a"
+            extra_master_path.write_bytes(b"extra")
+            store.record_artifact(
+                media_id,
+                role="master",
+                part_no=1,
+                path=extra_master_path,
+                size_bytes=5,
+            )
+            detail = store.get_disk_resource(anchor_id, root)
+            original_unlink = store_module._unlink_tracked_file
+
+            def fail_extra_master(
+                path: Path,
+                download_root: Path,
+                expected: dict[str, object],
+            ) -> int:
+                if path == extra_master_path.resolve():
+                    raise PermissionError("extra master is read-only")
+                return original_unlink(path, download_root, expected)
+
+            with mock.patch.object(
+                store_module,
+                "_unlink_tracked_file",
+                side_effect=fail_extra_master,
+            ):
+                failed = store.purge_disk_resource(
+                    anchor_id,
+                    root,
+                    expected_revision=str(
+                        detail["resource_revision"]
+                    ),
+                )
+
+            self.assertFalse(failed["completed"])
+            self.assertEqual(failed["deleted_files"], 0)
+            self.assertEqual(failed["failed_files"], 2)
+            self.assertTrue(anchor_path.exists())
+            self.assertTrue(extra_master_path.exists())
+            self.assertEqual(
+                {
+                    str(row["state"])
+                    for row in store.conn.execute(
+                        "SELECT state FROM artifacts WHERE media_id=?",
+                        (media_id,),
+                    )
+                },
+                {"purge_failed"},
+            )
+            self.assertIsNotNone(
+                store.get_disk_resource(anchor_id, root)
+            )
+
+            retried = store.purge_disk_resource(
+                anchor_id,
+                root,
+                expected_revision=str(failed["resource_revision"]),
+            )
+            self.assertTrue(retried["completed"])
+            self.assertFalse(anchor_path.exists())
+            self.assertFalse(extra_master_path.exists())
 
     def test_v1_migration_preserves_jobs_artifacts_and_deliveries(self):
         with tempfile.TemporaryDirectory() as tmp:

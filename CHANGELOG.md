@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-07-27
+
+- Add a paginated, searchable local ASMR resource library to the Telegram
+  control panel, including artifact health, delivery state, and tracked-file
+  details for completed and interrupted live recordings.
+- Add opt-in, confirmation-gated local resource purging that deletes only
+  exact tracked files below the downloads root, blocks unsafe or active
+  resources, cancels retryable work, and preserves database audit records.
+- Harden artifact deletion against concurrent writers and interrupted purges
+  with SQLite path reservations, tombstones, and retryable recovery state.
 - Add a self-contained `AGENT_QUICK_START.md` that an agent can fetch with
   `curl` to configure and verify a basic local service, linked from the README.
 - Rename the public project, CLI, deployment templates, documentation, and

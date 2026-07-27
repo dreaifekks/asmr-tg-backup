@@ -129,6 +129,9 @@ poll_interval_seconds = 10
 # Close the inline panel after this many seconds without a valid interaction.
 # Each button press or accepted text input renews the timer. 0 disables expiry.
 panel_idle_timeout_seconds = 3600
+# Resource browsing is always available. Keep permanent local file deletion
+# disabled until the authorized panel operator explicitly needs it.
+allow_disk_delete = false
 delete_webhook_on_startup = true
 default_routes = ["live"]
 # Every /panel command sends a fresh panel below the command; navigation edits

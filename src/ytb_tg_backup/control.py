@@ -25,6 +25,7 @@ from .youtube import resolve_channel_id
 
 PANEL_STATE_PREFIX = "control_panel_v1"
 PANEL_PAGE_SIZE = 6
+RESOURCE_PAGE_SIZE = 6
 PANEL_SNAPSHOT_MAX_AGE_SECONDS = 30
 PANEL_REVISION_SEPARATOR = "~"
 TWITCH_KINDS = {"vods", "highlights", "uploads"}
@@ -406,7 +407,7 @@ class ControlBot:
             self._apply_panel_action(data, state, message)
         except Exception as exc:
             self.logger.exception("panel callback failed action=%s", data)
-            state["flash"] = f"操作失败：{exc}"
+            state["flash_error"] = f"操作失败：{exc}"
         self._render_panel_message(message, state)
 
     def _apply_panel_action(
@@ -420,6 +421,7 @@ class ControlBot:
             raise ValueError("invalid panel action")
         action = parts[1] if len(parts) > 1 else "home"
         state.pop("flash", None)
+        state.pop("flash_error", None)
         if action == "home":
             state.update({"view": "home", "awaiting": None, "twitch_mode": None})
             return
@@ -442,6 +444,126 @@ class ControlBot:
         if action == "statsrefresh":
             self._panel_snapshot(force=True)
             state.update({"view": "stats", "awaiting": None})
+            return
+        if action == "resources":
+            page = int(parts[2]) if len(parts) > 2 else 0
+            state.update(
+                {
+                    "view": "resources",
+                    "resource_page": max(0, page),
+                    "awaiting": None,
+                }
+            )
+            return
+        if action == "resourcesrefresh":
+            page = int(parts[2]) if len(parts) > 2 else 0
+            state.update(
+                {
+                    "view": "resources",
+                    "resource_page": max(0, page),
+                    "awaiting": None,
+                }
+            )
+            return
+        if action == "ressearch":
+            state.update({"view": "input", "awaiting": "resource_search"})
+            return
+        if action == "resclear":
+            state.update(
+                {
+                    "view": "resources",
+                    "resource_page": 0,
+                    "resource_query": "",
+                    "awaiting": None,
+                }
+            )
+            return
+        if action in {"resource", "resdelask", "resdelete"}:
+            if len(parts) != 3 or not parts[2].isdigit():
+                raise ValueError("invalid resource action")
+            artifact_id = int(parts[2])
+            if action == "resource":
+                resource = self.store.get_disk_resource(
+                    artifact_id,
+                    self.config.download_dir,
+                )
+                if resource is None:
+                    raise ValueError("resource no longer exists")
+                state.update(
+                    {
+                        "view": "resource_detail",
+                        "target_artifact_id": artifact_id,
+                        "awaiting": None,
+                    }
+                )
+                return
+            if not self.config.control.allow_disk_delete:
+                raise ValueError(
+                    "本地删除未启用；请在 [control] 设置 allow_disk_delete=true"
+                )
+            resource = self.store.get_disk_resource(
+                artifact_id,
+                self.config.download_dir,
+            )
+            if resource is None:
+                raise ValueError("resource no longer exists")
+            if action == "resdelask":
+                if bool(resource["running"]):
+                    raise ValueError("资源正在下载或投递，请稍后再试")
+                if int(resource["unsafe_file_count"]) > 0:
+                    raise ValueError("资源包含 downloads 目录外或不安全的路径")
+                state.update(
+                    {
+                        "view": "resource_delete_confirm",
+                        "target_artifact_id": artifact_id,
+                        "target_resource_revision": resource[
+                            "resource_revision"
+                        ],
+                        "awaiting": None,
+                    }
+                )
+                return
+            if artifact_id != int(state.get("target_artifact_id") or -1):
+                raise ValueError("delete confirmation no longer matches this resource")
+            expected_revision = str(
+                state.get("target_resource_revision") or ""
+            )
+            if not expected_revision:
+                raise ValueError("delete confirmation has expired")
+            result = self.store.purge_disk_resource(
+                artifact_id,
+                self.config.download_dir,
+                expected_revision=expected_revision,
+            )
+            if bool(result["completed"]):
+                state.update(
+                    {
+                        "view": "resources",
+                        "awaiting": None,
+                        "flash": (
+                            f"已删除 {_compact_button_label(str(result['title']))}："
+                            f"{result['deleted_files']} 个文件，释放 "
+                            f"{_format_bytes(int(result['freed_bytes']))}"
+                        ),
+                    }
+                )
+                state.pop("target_artifact_id", None)
+                state.pop("target_resource_revision", None)
+            else:
+                errors = "；".join(str(item) for item in result["errors"])
+                state.update(
+                    {
+                        "view": "resource_delete_confirm",
+                        "target_resource_revision": result[
+                            "resource_revision"
+                        ],
+                        "flash_error": (
+                            f"仅删除 {result['deleted_files']} 个文件；"
+                            f"{result['failed_files']} 个失败"
+                            + (f"：{errors}" if errors else "")
+                        ),
+                    }
+                )
             return
         if action == "filter":
             state.update({"view": "filter", "awaiting": None})
@@ -481,9 +603,14 @@ class ControlBot:
             state.update({"view": "filter", "awaiting": None, "flash": "过滤器已恢复默认"})
             return
         if action == "cancel":
+            return_view = (
+                "resources"
+                if state.get("awaiting") == "resource_search"
+                else "home"
+            )
             state.update(
                 {
-                    "view": "home",
+                    "view": return_view,
                     "awaiting": None,
                     "twitch_mode": None,
                     "flash": "已取消输入",
@@ -568,9 +695,14 @@ class ControlBot:
         if not awaiting:
             return
         if text.lower() in {"cancel", "取消"}:
+            return_view = (
+                "resources"
+                if awaiting == "resource_search"
+                else "home"
+            )
             state.update(
                 {
-                    "view": "home",
+                    "view": return_view,
                     "awaiting": None,
                     "twitch_mode": None,
                     "flash": "已取消输入",
@@ -606,10 +738,29 @@ class ControlBot:
                 if reply.startswith("error:"):
                     raise ValueError(reply.removeprefix("error: "))
                 state.update({"view": "filter", "awaiting": None, "flash": reply})
+            elif awaiting == "resource_search":
+                query = " ".join(text.split())
+                if len(query) > 100:
+                    raise ValueError("搜索词最多 100 个字符")
+                if query.lower() in {"*", "all"} or query == "全部":
+                    query = ""
+                state.update(
+                    {
+                        "view": "resources",
+                        "resource_page": 0,
+                        "resource_query": query,
+                        "awaiting": None,
+                        "flash": (
+                            f"正在搜索：{query}"
+                            if query
+                            else "已显示全部本地资源"
+                        ),
+                    }
+                )
             else:
                 raise ValueError("unknown pending panel input")
         except Exception as exc:
-            state["flash"] = f"输入无效：{exc}"
+            state["flash_error"] = f"输入无效：{exc}"
         self._render_panel_message(message, state)
 
     def _cancel_panel_input(self, message: dict[str, Any]) -> bool:
@@ -624,9 +775,14 @@ class ControlBot:
             return True
         if not state.get("awaiting"):
             return False
+        return_view = (
+            "resources"
+            if state.get("awaiting") == "resource_search"
+            else "home"
+        )
         state.update(
             {
-                "view": "home",
+                "view": return_view,
                 "awaiting": None,
                 "twitch_mode": None,
                 "flash": "已取消输入",
@@ -717,6 +873,7 @@ class ControlBot:
 
     def _render_panel(self, state: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         flash = str(state.pop("flash", "") or "")
+        flash_error = str(state.pop("flash_error", "") or "")
         awaiting = state.get("awaiting")
         if awaiting:
             prompts = {
@@ -735,15 +892,28 @@ class ControlBot:
                     "设置全局来源过滤器\n\n"
                     "请发送正则表达式；匹配不区分大小写。"
                 ),
+                "resource_search": (
+                    "搜索本地资源\n\n"
+                    "请发送标题、来源、平台或外部 ID 的关键字。\n"
+                    "发送“全部”可清除搜索。"
+                ),
             }
             text = prompts.get(str(awaiting), "等待输入")
-            if flash:
+            if flash_error:
+                text = f"⚠️ {flash_error}\n\n{text}"
+            elif flash:
                 text = f"⚠️ {flash}\n\n{text}"
             return text, _inline_keyboard([[ _button("取消", "p:cancel") ]])
 
         view = str(state.get("view") or "home")
         if view == "origins":
             text, keyboard = self._render_origins_panel(state)
+        elif view == "resources":
+            text, keyboard = self._render_resources_panel(state)
+        elif view == "resource_detail":
+            text, keyboard = self._render_resource_detail_panel(state)
+        elif view == "resource_delete_confirm":
+            text, keyboard = self._render_resource_delete_confirm_panel(state)
         elif view == "twitch_mode":
             text, keyboard = self._render_twitch_mode_panel()
         elif view == "stats":
@@ -754,7 +924,9 @@ class ControlBot:
             text, keyboard = self._render_delete_confirm_panel(state)
         else:
             text, keyboard = self._render_home_panel()
-        if flash:
+        if flash_error:
+            text = f"⚠️ {flash_error}\n\n{text}"
+        elif flash:
             text = f"✅ {flash}\n\n{text}"
         return text, _inline_keyboard(keyboard)
 
@@ -777,6 +949,10 @@ class ControlBot:
                 f"来源：{enabled}/{len(origins)} 已启用",
                 f"媒体：{summary['known']}（{provider_text}）",
                 f"已上传：{summary['uploaded']}",
+                (
+                    f"可用主归档：{summary['file_count']} · "
+                    f"{_format_bytes(int(summary['file_bytes']))}"
+                ),
                 f"失败：{summary['failed']}  阻断：{summary['blocked']}",
                 f"过滤器：{format_source_filter(snapshot.get('source_filter_pattern'))}",
                 f"面板：{panel_expiry}",
@@ -784,9 +960,10 @@ class ControlBot:
             ]
         )
         return text, [
-            [_button("📚 来源", "p:origins:0"), _button("📊 状态", "p:stats")],
+            [_button("📚 来源", "p:origins:0"), _button("💾 本地资源", "p:resources:0")],
+            [_button("📊 状态", "p:stats"), _button("🔎 过滤器", "p:filter")],
             [_button("➕ YouTube", "p:addyt"), _button("➕ Twitch", "p:addtw")],
-            [_button("🔎 过滤器", "p:filter"), _button("🔄 刷新", "p:refresh")],
+            [_button("🔄 刷新", "p:refresh")],
         ]
 
     def _render_twitch_mode_panel(
@@ -864,6 +1041,263 @@ class ControlBot:
             [
                 [_button("➕ YouTube", "p:addyt"), _button("➕ Twitch", "p:addtw")],
                 [_button("🏠 返回", "p:home"), _button("🔄 刷新", f"p:originsrefresh:{page}")],
+            ]
+        )
+        return "\n".join(lines), keyboard
+
+    def _render_resources_panel(
+        self,
+        state: dict[str, Any],
+    ) -> tuple[str, list[list[dict[str, str]]]]:
+        query = str(state.get("resource_query") or "").strip()
+        page = max(0, int(state.get("resource_page") or 0))
+        library = self.store.list_disk_resources(
+            self.config.download_dir,
+            limit=RESOURCE_PAGE_SIZE,
+            offset=page * RESOURCE_PAGE_SIZE,
+            query=query,
+        )
+        total = int(library["total"])
+        page_count = max(1, (total + RESOURCE_PAGE_SIZE - 1) // RESOURCE_PAGE_SIZE)
+        page = min(page, page_count - 1)
+        if page != int(state.get("resource_page") or 0):
+            library = self.store.list_disk_resources(
+                self.config.download_dir,
+                limit=RESOURCE_PAGE_SIZE,
+                offset=page * RESOURCE_PAGE_SIZE,
+                query=query,
+            )
+        state["resource_page"] = page
+
+        lines = [
+            f"💾 本地资源  {page + 1}/{page_count}",
+            "",
+            (
+                f"受管资源：{total} · 登记文件 "
+                f"{_format_bytes(int(library['recorded_bytes']))}"
+            ),
+            f"搜索：{_compact_text(query, 48) if query else '全部'}",
+            "",
+        ]
+        keyboard: list[list[dict[str, str]]] = []
+        items = list(library["items"])
+        for index, resource in enumerate(
+            items,
+            start=page * RESOURCE_PAGE_SIZE + 1,
+        ):
+            status_icon, status_text = _resource_status(resource)
+            title = _compact_text(str(resource["title"]), 66)
+            date_text = _format_resource_date(
+                resource.get("published_at")
+                or resource.get("artifact_created_at")
+            )
+            lines.extend(
+                [
+                    f"{index}. {status_icon} {title}",
+                    (
+                        f"   {resource['provider']}/{resource['content_kind']} · "
+                        f"{_compact_text(str(resource['origin_name']), 28)} · "
+                        f"{date_text}"
+                    ),
+                    (
+                        f"   {_format_bytes(int(resource['recorded_bytes']))} · "
+                        f"{status_text}"
+                    ),
+                ]
+            )
+            keyboard.append(
+                [
+                    _button(
+                        f"{index}. {_compact_text(str(resource['title']), 34)}",
+                        f"p:resource:{resource['artifact_id']}",
+                    )
+                ]
+            )
+        if not items:
+            lines.append("（没有匹配的受管本地资源）")
+
+        navigation: list[dict[str, str]] = []
+        if page > 0:
+            navigation.append(_button("⬅️", f"p:resources:{page - 1}"))
+        if page + 1 < page_count:
+            navigation.append(_button("➡️", f"p:resources:{page + 1}"))
+        if navigation:
+            keyboard.append(navigation)
+        search_row = [_button("🔍 搜索", "p:ressearch")]
+        if query:
+            search_row.append(_button("清除搜索", "p:resclear"))
+        keyboard.append(search_row)
+        keyboard.append(
+            [
+                _button("🏠 返回", "p:home"),
+                _button("🔄 刷新", f"p:resourcesrefresh:{page}"),
+            ]
+        )
+        return "\n".join(lines), keyboard
+
+    def _render_resource_detail_panel(
+        self,
+        state: dict[str, Any],
+    ) -> tuple[str, list[list[dict[str, str]]]]:
+        artifact_id = int(state.get("target_artifact_id") or -1)
+        resource = self.store.get_disk_resource(
+            artifact_id,
+            self.config.download_dir,
+        )
+        page = max(0, int(state.get("resource_page") or 0))
+        if resource is None:
+            state.update({"view": "resources", "target_artifact_id": None})
+            return (
+                "💾 该资源已不在本地资源库中。",
+                [[_button("返回资源列表", f"p:resources:{page}")]],
+            )
+
+        _, status_text = _resource_status(resource)
+        delivery = _resource_delivery_text(resource)
+        role_counts: dict[str, int] = {}
+        for file_info in resource["files"]:
+            role = str(file_info["role"])
+            role_counts[role] = role_counts.get(role, 0) + 1
+        roles = "、".join(
+            f"{role}×{count}" if count > 1 else role
+            for role, count in role_counts.items()
+        ) or "无"
+        lines = [
+            "🎧 本地资源详情",
+            "",
+            str(resource["title"]),
+            "",
+            f"来源：{resource['origin_name']}",
+            f"平台：{resource['provider']}/{resource['content_kind']}",
+            f"外部 ID：{resource['external_id']}",
+            f"发布时间：{_format_resource_date(resource.get('published_at'))}",
+            f"归档时间：{_format_resource_date(resource.get('artifact_created_at'))}",
+            f"状态：{status_text}；{delivery}",
+            (
+                f"受管文件：{resource['existing_file_count']} 个 · "
+                f"{_format_bytes(int(resource['actual_bytes']))}"
+            ),
+            f"角色：{roles}",
+            f"锚点路径：{_compact_text(str(resource['relative_path']), 180)}",
+        ]
+        if str(resource.get("anchor_role") or "") == "live_segment":
+            lines.append("归档形态：仅有未合并的直播片段（暂无 master）")
+        if int(resource["missing_file_count"]) > 0:
+            lines.append(f"缺失记录：{resource['missing_file_count']} 个文件")
+        if int(resource["unsafe_file_count"]) > 0:
+            lines.append(
+                f"安全限制：{resource['unsafe_file_count']} 个路径不可由面板删除"
+            )
+        if bool(resource["irreplaceable_live"]):
+            lines.append("⚠️ 这是直播录制，本地删除后通常无法重新获取。")
+        lines.extend(["", str(resource["canonical_url"])])
+
+        keyboard: list[list[dict[str, str]]] = []
+        delete_ready = (
+            self.config.control.allow_disk_delete
+            and not bool(resource["running"])
+            and int(resource["unsafe_file_count"]) == 0
+        )
+        if delete_ready:
+            keyboard.append(
+                [
+                    _button(
+                        "🗑 删除本地文件",
+                        f"p:resdelask:{artifact_id}",
+                    )
+                ]
+            )
+        elif not self.config.control.allow_disk_delete:
+            lines.extend(
+                [
+                    "",
+                    "删除保护：当前为只读；需在 [control] 显式设置",
+                    "allow_disk_delete = true 后才会显示删除按钮。",
+                ]
+            )
+        elif bool(resource["running"]):
+            lines.extend(["", "删除保护：资源正在下载或投递，请稍后再试。"])
+        keyboard.append(
+            [
+                _button("⬅️ 返回列表", f"p:resources:{page}"),
+                _button("🏠 首页", "p:home"),
+            ]
+        )
+        return "\n".join(lines), keyboard
+
+    def _render_resource_delete_confirm_panel(
+        self,
+        state: dict[str, Any],
+    ) -> tuple[str, list[list[dict[str, str]]]]:
+        artifact_id = int(state.get("target_artifact_id") or -1)
+        page = max(0, int(state.get("resource_page") or 0))
+        resource = self.store.get_disk_resource(
+            artifact_id,
+            self.config.download_dir,
+        )
+        if resource is None:
+            state.update({"view": "resources", "target_artifact_id": None})
+            return (
+                "💾 该资源已经不在本地资源库中。",
+                [[_button("返回资源列表", f"p:resources:{page}")]],
+            )
+
+        expected = str(state.get("target_resource_revision") or "")
+        current = str(resource["resource_revision"])
+        changed = not expected or expected != current
+        lines = [
+            "⚠️ 永久删除本地备份？",
+            "",
+            str(resource["title"]),
+            "",
+            (
+                f"{resource['existing_file_count']} 个受管文件 · "
+                f"{_format_bytes(int(resource['actual_bytes']))}"
+            ),
+            f"投递：{_resource_delivery_text(resource)}",
+            "",
+            "将删除数据库明确登记且位于 downloads/ 内的本机文件。",
+            "媒体、来源、任务审计与 Telegram 投递历史会保留。",
+            "Telegram 中已经发送的消息不会删除，也不会自动重新下载。",
+            "未登记的 sidecar/orphan 文件不会被猜测或连带删除。",
+        ]
+        if bool(resource["irreplaceable_live"]):
+            lines.extend(
+                [
+                    "",
+                    "🚨 这是直播录制，删除后通常无法从平台重新获得。",
+                ]
+            )
+        keyboard: list[list[dict[str, str]]] = []
+        if changed:
+            lines.extend(
+                [
+                    "",
+                    "资源在确认期间发生了变化；请返回详情后重新确认。",
+                ]
+            )
+        elif bool(resource["running"]):
+            lines.extend(["", "资源正在下载或投递，当前不能删除。"])
+        elif int(resource["unsafe_file_count"]) > 0:
+            lines.extend(["", "资源含不安全路径，面板拒绝执行删除。"])
+        elif not self.config.control.allow_disk_delete:
+            lines.extend(["", "本地删除开关当前已关闭。"])
+        else:
+            keyboard.append(
+                [
+                    _button(
+                        (
+                            "确认永久删除 "
+                            f"{_format_bytes(int(resource['actual_bytes']))}"
+                        ),
+                        f"p:resdelete:{artifact_id}",
+                    )
+                ]
+            )
+        keyboard.append(
+            [
+                _button("取消并返回详情", f"p:resource:{artifact_id}"),
+                _button("返回列表", f"p:resources:{page}"),
             ]
         )
         return "\n".join(lines), keyboard
@@ -1404,6 +1838,72 @@ def _origin_token(origin_id: str) -> str:
 
 def _compact_button_label(value: str) -> str:
     return " ".join(value.replace("\n", " ").split())[:24] or "origin"
+
+
+def _compact_text(value: str, limit: int) -> str:
+    compact = " ".join(value.replace("\n", " ").split())
+    if len(compact) <= limit:
+        return compact or "（未命名）"
+    return compact[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _format_bytes(value: int) -> str:
+    size = max(0, int(value))
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    amount = float(size)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(amount)} {unit}"
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{size} B"
+
+
+def _format_resource_date(value: object) -> str:
+    if not value:
+        return "未知"
+    text = str(value)
+    return text[:10] if len(text) >= 10 else text
+
+
+def _resource_delivery_text(resource: dict[str, object]) -> str:
+    if bool(resource.get("delivered")):
+        return "已投递 Telegram"
+    state = str(resource.get("delivery_job_state") or "")
+    return {
+        "queued": "等待 Telegram 投递",
+        "retry": "Telegram 投递待重试",
+        "running": "正在投递 Telegram",
+        "uncertain": "Telegram 投递结果不确定",
+        "blocked": "Telegram 投递已阻断",
+        "cancelled": "Telegram 投递已取消",
+    }.get(state, "仅本地")
+
+
+def _resource_status(
+    resource: dict[str, object],
+) -> tuple[str, str]:
+    state = str(resource.get("master_state") or "")
+    if state == "purging":
+        return "⏳", "正在清理"
+    if state == "purge_failed":
+        return "⚠️", "上次清理未完成"
+    if not bool(resource.get("master_safe")):
+        return "🔒", "路径不安全，仅可查看"
+    if not bool(resource.get("master_exists")):
+        return "⚠️", "锚点文件缺失"
+    if bool(resource.get("running")):
+        return "🔄", "后台处理中"
+    if str(resource.get("anchor_role") or "") == "live_segment":
+        return "🚨", "仅有未合并直播片段"
+    if bool(resource.get("delivered")):
+        return "✅", "已投递 Telegram"
+    if state == "suppressed":
+        return "🟡", "本地保留，投递已抑制"
+    if state == "staged":
+        return "🟡", "本地暂存"
+    return "💾", _resource_delivery_text(resource)
 
 
 def _button(text: str, callback_data: str) -> dict[str, str]:

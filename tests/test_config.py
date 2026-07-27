@@ -46,7 +46,36 @@ enabled = true
         self.assertEqual(config.telegram.media_type, "audio")
         self.assertFalse(config.control.enabled)
         self.assertEqual(config.control.panel_idle_timeout_seconds, 3600)
+        self.assertFalse(config.control.allow_disk_delete)
         self.assertTrue(config.control.delete_webhook_on_startup)
+
+    def test_disk_delete_requires_explicit_control_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                """
+[control]
+allow_disk_delete = true
+""".strip()
+            )
+
+            config = load_config(path)
+
+        self.assertTrue(config.control.allow_disk_delete)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            invalid_path = Path(tmp) / "config.toml"
+            invalid_path.write_text(
+                """
+[control]
+allow_disk_delete = "false"
+""".strip()
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "control.allow_disk_delete must be true or false",
+            ):
+                load_config(invalid_path)
 
     def test_twitch_credentials_load_from_default_environment_variables(self):
         with tempfile.TemporaryDirectory() as tmp:

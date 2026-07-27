@@ -94,6 +94,8 @@ enabled = false
 poll_interval_seconds = 10
 # Close the inline panel after one idle hour. 0 keeps it active indefinitely.
 panel_idle_timeout_seconds = 3600
+# Browsing local resources is read-only unless this is explicitly enabled.
+allow_disk_delete = false
 delete_webhook_on_startup = true
 default_routes = ["live"]
 # Each /panel sends a fresh message; navigation edits that current message.

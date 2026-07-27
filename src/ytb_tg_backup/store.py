@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import uuid
 
 from .feed import FeedEntry
@@ -157,6 +159,29 @@ CREATE TABLE IF NOT EXISTS artifacts (
   UNIQUE(media_id, role, part_no)
 );
 
+CREATE INDEX IF NOT EXISTS idx_artifacts_resource_library
+ON artifacts(role, state, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_origin_items_media_resource
+ON origin_items(media_id, disposition, first_seen_at, origin_id);
+
+CREATE TABLE IF NOT EXISTS purge_path_reservations (
+  storage_key TEXT PRIMARY KEY,
+  media_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
+  operation_id TEXT NOT NULL,
+  owner_pid INTEGER NOT NULL,
+  owner_start_id TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL,
+  finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_purge_path_reservations_operation
+ON purge_path_reservations(operation_id);
+
+CREATE INDEX IF NOT EXISTS idx_purge_path_reservations_state
+ON purge_path_reservations(state, operation_id);
+
 CREATE TABLE IF NOT EXISTS deliveries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   media_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
@@ -179,6 +204,116 @@ CREATE TABLE IF NOT EXISTS panel_snapshots (
   dirty INTEGER NOT NULL DEFAULT 1,
   generated_at TEXT NOT NULL
 );
+"""
+
+DISK_RESOURCE_CTE = """
+WITH anchor_ids AS (
+  SELECT
+    media_id,
+    COALESCE(
+      MIN(CASE WHEN role='master' AND part_no=0 THEN id END),
+      MIN(CASE WHEN role='live_segment' THEN id END)
+    ) AS artifact_id
+  FROM artifacts
+  WHERE state IN ('ready', 'staged', 'suppressed', 'purging', 'purge_failed')
+  GROUP BY media_id
+),
+resources AS (
+  SELECT
+    a.id AS artifact_id,
+    a.media_id,
+    a.role AS anchor_role,
+    a.path AS master_path,
+    a.size_bytes AS master_recorded_bytes,
+    a.state AS master_state,
+    a.created_at AS artifact_created_at,
+    a.updated_at AS artifact_updated_at,
+    mi.provider,
+    mi.content_kind,
+    mi.external_id,
+    mi.title,
+    mi.canonical_url,
+    mi.published_at,
+    mi.metadata_json AS media_metadata_json,
+    COALESCE(
+      (
+        SELECT o.name
+        FROM origin_items oi
+        JOIN origins o ON o.id=oi.origin_id
+        WHERE oi.media_id=mi.id
+        ORDER BY
+          CASE oi.disposition WHEN 'eligible' THEN 0 ELSE 1 END,
+          oi.first_seen_at,
+          oi.origin_id
+        LIMIT 1
+      ),
+      mi.provider
+    ) AS origin_name,
+    EXISTS(
+      SELECT 1
+      FROM deliveries d
+      WHERE d.media_id=mi.id AND d.sink='telegram'
+    ) AS delivered,
+    (
+      SELECT j.state
+      FROM jobs j
+      WHERE j.media_id=mi.id AND j.job_type='telegram_delivery'
+      ORDER BY
+        CASE j.state
+          WHEN 'running' THEN 0
+          WHEN 'queued' THEN 1
+          WHEN 'retry' THEN 2
+          WHEN 'uncertain' THEN 3
+          WHEN 'blocked' THEN 4
+          ELSE 5
+        END,
+        j.updated_at DESC,
+        j.id DESC
+      LIMIT 1
+    ) AS delivery_job_state,
+    EXISTS(
+      SELECT 1
+      FROM jobs j
+      WHERE j.media_id=mi.id AND j.state='running'
+    ) AS running,
+    CASE
+      WHEN mi.content_kind='live_stream'
+        OR json_extract(mi.metadata_json, '$.recording_mode')='live'
+      THEN 1 ELSE 0
+    END AS irreplaceable_live,
+    (
+      SELECT COUNT(*)
+      FROM artifacts related
+      WHERE related.media_id=mi.id AND related.state!='purged'
+    ) AS artifact_count,
+    (
+      SELECT COALESCE(SUM(related.size_bytes), 0)
+      FROM artifacts related
+      WHERE related.media_id=mi.id AND related.state!='purged'
+    ) AS recorded_bytes,
+    (
+      mi.title || ' ' || mi.external_id || ' ' || mi.provider || ' ' ||
+      mi.content_kind || ' ' ||
+      COALESCE(
+        (
+          SELECT o.name
+          FROM origin_items oi
+          JOIN origins o ON o.id=oi.origin_id
+          WHERE oi.media_id=mi.id
+          ORDER BY
+            CASE oi.disposition WHEN 'eligible' THEN 0 ELSE 1 END,
+            oi.first_seen_at,
+            oi.origin_id
+          LIMIT 1
+        ),
+        ''
+      )
+    ) AS search_text
+  FROM anchor_ids anchor
+  JOIN artifacts a ON a.id=anchor.artifact_id
+  JOIN media_items mi ON mi.id=a.media_id
+  WHERE anchor.artifact_id IS NOT NULL
+)
 """
 
 
@@ -236,6 +371,7 @@ class Store:
         if int(current) >= self.CURRENT_SCHEMA_VERSION:
             self.conn.executescript(V2_SCHEMA)
             self._ensure_panel_snapshot_support()
+            self._recover_incomplete_disk_purges()
             self._ensure_compatibility_views()
             self.conn.commit()
             return
@@ -247,6 +383,7 @@ class Store:
         self._ensure_panel_snapshot_support()
         self.conn.execute("BEGIN IMMEDIATE")
         try:
+            self._recover_incomplete_disk_purges()
             if has_v1:
                 self._migrate_v1_rows()
                 if self._table_exists("videos"):
@@ -262,6 +399,82 @@ class Store:
         except Exception:
             self.conn.rollback()
             raise
+
+    def _recover_incomplete_disk_purges(self) -> None:
+        """Make interrupted panel purges visible and retryable after restart."""
+
+        recovered_at = now_iso()
+        reservation_rows = self.conn.execute(
+            """
+            SELECT storage_key, operation_id, owner_pid, owner_start_id
+            FROM purge_path_reservations
+            WHERE state='active'
+            """
+        ).fetchall()
+        live_operations = {
+            str(row["operation_id"])
+            for row in reservation_rows
+            if _process_instance_is_alive(
+                int(row["owner_pid"]),
+                str(row["owner_start_id"]),
+            )
+        }
+        rows = self.conn.execute(
+            """
+            SELECT id, metadata_json
+            FROM artifacts
+            WHERE state='purging'
+            """
+        ).fetchall()
+        for row in rows:
+            metadata = _json_object(row["metadata_json"])
+            purge_metadata = _json_object(metadata.get("local_purge"))
+            operation_id = str(purge_metadata.get("operation_id") or "")
+            if operation_id and operation_id in live_operations:
+                continue
+            purge_metadata.update(
+                {
+                    "finished_at": recovered_at,
+                    "result": "interrupted",
+                    "error": "service stopped before local deletion completed",
+                }
+            )
+            metadata["local_purge"] = purge_metadata
+            self.conn.execute(
+                """
+                UPDATE artifacts
+                SET state='purge_failed', metadata_json=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                    recovered_at,
+                    int(row["id"]),
+                ),
+            )
+        for reservation in reservation_rows:
+            operation_id = str(reservation["operation_id"])
+            if operation_id in live_operations:
+                continue
+            storage_key = str(reservation["storage_key"])
+            if _path_entry_exists(Path(storage_key)):
+                self.conn.execute(
+                    """
+                    DELETE FROM purge_path_reservations
+                    WHERE storage_key=? AND state='active'
+                    """,
+                    (storage_key,),
+                )
+            else:
+                self.conn.execute(
+                    """
+                    UPDATE purge_path_reservations
+                    SET state='purged', owner_pid=0, owner_start_id='',
+                      finished_at=?
+                    WHERE storage_key=? AND state='active'
+                    """,
+                    (recovered_at, storage_key),
+                )
 
     def _ensure_panel_snapshot_support(self) -> None:
         """Keep the materialized panel row dirty when its source data changes."""
@@ -537,6 +750,823 @@ class Store:
                 """
             )
         }
+
+    def list_disk_resources(
+        self,
+        download_root: Path,
+        *,
+        limit: int = 6,
+        offset: int = 0,
+        query: str = "",
+    ) -> dict[str, object]:
+        """Return one page of tracked disk resources for the control panel.
+
+        The database remains the resource index. Filesystem inspection is
+        limited to the selected page so opening the Telegram panel never turns
+        into a recursive scan of the whole download tree.
+        """
+
+        page_limit = max(1, min(50, int(limit)))
+        page_offset = max(0, int(offset))
+        search = query.strip()
+        where = ""
+        params: list[object] = []
+        if search:
+            terms = search.split()
+            where = "WHERE " + " AND ".join(
+                "lower(search_text) LIKE ? ESCAPE '\\'"
+                for _ in terms
+            )
+            params.extend(_like_pattern(term) for term in terms)
+
+        summary = self.conn.execute(
+            f"""
+            {DISK_RESOURCE_CTE}
+            SELECT COUNT(*) AS count, COALESCE(SUM(recorded_bytes), 0) AS bytes
+            FROM resources
+            {where}
+            """,
+            params,
+        ).fetchone()
+        rows = self.conn.execute(
+            f"""
+            {DISK_RESOURCE_CTE}
+            SELECT *
+            FROM resources
+            {where}
+            ORDER BY
+              COALESCE(published_at, artifact_created_at) DESC,
+              artifact_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, page_limit, page_offset),
+        ).fetchall()
+        return {
+            "items": [
+                _disk_resource_from_row(row, download_root)
+                for row in rows
+            ],
+            "total": int(summary["count"]),
+            "recorded_bytes": int(summary["bytes"]),
+        }
+
+    def get_disk_resource(
+        self,
+        artifact_id: int,
+        download_root: Path,
+    ) -> dict[str, object] | None:
+        row = self.conn.execute(
+            f"""
+            {DISK_RESOURCE_CTE}
+            SELECT * FROM resources WHERE artifact_id=?
+            """,
+            (int(artifact_id),),
+        ).fetchone()
+        if row is None:
+            return None
+
+        resource = _disk_resource_from_row(row, download_root)
+        file_rows = self.conn.execute(
+            """
+            SELECT id, role, part_no, path, size_bytes, state, metadata_json,
+              created_at, updated_at
+            FROM artifacts
+            WHERE media_id=? AND state!='purged'
+            ORDER BY
+              CASE role
+                WHEN 'master' THEN 0
+                WHEN 'telegram_upload' THEN 1
+                WHEN 'thumbnail' THEN 2
+                WHEN 'live_segment' THEN 3
+                ELSE 4
+              END,
+              part_no,
+              id
+            """,
+            (int(row["media_id"]),),
+        ).fetchall()
+        files: list[dict[str, object]] = []
+        inspected_by_id: dict[int, dict[str, object]] = {}
+        seen_paths: set[str] = set()
+        actual_bytes = 0
+        existing_file_count = 0
+        missing_file_count = 0
+        unsafe_file_count = 0
+        for file_row in file_rows:
+            inspected = _inspect_storage_path(
+                Path(str(file_row["path"])),
+                download_root,
+            )
+            inspected_by_id[int(file_row["id"])] = inspected
+            normalized = str(inspected["normalized_path"])
+            duplicate = normalized in seen_paths
+            seen_paths.add(normalized)
+            item: dict[str, object] = {
+                "artifact_id": int(file_row["id"]),
+                "role": str(file_row["role"]),
+                "part_no": int(file_row["part_no"]),
+                "path": str(file_row["path"]),
+                "recorded_bytes": int(file_row["size_bytes"]),
+                "state": str(file_row["state"]),
+                "created_at": str(file_row["created_at"]),
+                "updated_at": str(file_row["updated_at"]),
+                "duplicate_path": duplicate,
+                **inspected,
+            }
+            files.append(item)
+            if duplicate:
+                continue
+            if not bool(inspected["safe"]):
+                unsafe_file_count += 1
+            elif bool(inspected["exists"]):
+                existing_file_count += 1
+                actual_bytes += int(inspected["actual_bytes"])
+            else:
+                missing_file_count += 1
+
+        resource.update(
+            {
+                "files": files,
+                "actual_bytes": actual_bytes,
+                "existing_file_count": existing_file_count,
+                "missing_file_count": missing_file_count,
+                "unsafe_file_count": unsafe_file_count,
+                "resource_revision": _artifact_set_revision(
+                    file_rows,
+                    inspected_by_id,
+                ),
+            }
+        )
+        return resource
+
+    def purge_disk_resource(
+        self,
+        artifact_id: int,
+        download_root: Path,
+        *,
+        expected_revision: str,
+    ) -> dict[str, object]:
+        """Purge exact tracked files while retaining media and delivery history.
+
+        A short ``purging`` tombstone phase keeps workers from treating an
+        intentional deletion as an accidental missing artifact. Related
+        queued/retry/blocked jobs are cancelled before unlinking starts.
+        """
+
+        target_id = int(artifact_id)
+        root = Path(download_root).expanduser()
+        operation_id = uuid.uuid4().hex
+        requested_at = now_iso()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            anchor = self.conn.execute(
+                f"""
+                {DISK_RESOURCE_CTE}
+                SELECT a.*, resources.title AS media_title
+                FROM resources
+                JOIN artifacts a ON a.id=resources.artifact_id
+                WHERE resources.artifact_id=?
+                """,
+                (target_id,),
+            ).fetchone()
+            if anchor is None:
+                raise ValueError("resource no longer exists in the local library")
+
+            media_id = int(anchor["media_id"])
+            running = self.conn.execute(
+                """
+                SELECT job_type
+                FROM jobs
+                WHERE media_id=? AND state='running'
+                ORDER BY id
+                LIMIT 1
+                """,
+                (media_id,),
+            ).fetchone()
+            if running is not None:
+                raise ValueError(
+                    "resource is currently being downloaded or delivered; try again later"
+                )
+
+            artifact_rows = self.conn.execute(
+                """
+                SELECT id, role, part_no, path, size_bytes, state,
+                  metadata_json, updated_at
+                FROM artifacts
+                WHERE media_id=? AND state!='purged'
+                ORDER BY CASE role WHEN 'master' THEN 1 ELSE 0 END, id
+                """,
+                (media_id,),
+            ).fetchall()
+            inspected_by_id: dict[int, dict[str, object]] = {}
+            normalized_paths: set[str] = set()
+            for artifact in artifact_rows:
+                inspected = _inspect_storage_path(
+                    Path(str(artifact["path"])),
+                    root,
+                )
+                if not bool(inspected["safe"]):
+                    raise ValueError(
+                        "refusing to delete an unsafe tracked path: "
+                        f"{inspected['unsafe_reason']}"
+                    )
+                artifact_row_id = int(artifact["id"])
+                inspected_by_id[artifact_row_id] = inspected
+                normalized_paths.add(str(inspected["normalized_path"]))
+            if (
+                _artifact_set_revision(artifact_rows, inspected_by_id)
+                != str(expected_revision)
+            ):
+                raise ValueError(
+                    "resource changed after confirmation; review it again"
+                )
+
+            if self._find_shared_resource_path(
+                media_id,
+                normalized_paths,
+                root,
+            ) is not None:
+                raise ValueError(
+                    "refusing to delete a file referenced by another media item"
+                )
+
+            for storage_key in sorted(normalized_paths):
+                try:
+                    self.conn.execute(
+                        """
+                        INSERT INTO purge_path_reservations(
+                          storage_key, media_id, operation_id, owner_pid,
+                          owner_start_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            storage_key,
+                            media_id,
+                            operation_id,
+                            os.getpid(),
+                            _process_start_id(os.getpid()),
+                            requested_at,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    existing_reservation = self.conn.execute(
+                        """
+                        SELECT media_id, state
+                        FROM purge_path_reservations
+                        WHERE storage_key=?
+                        """,
+                        (storage_key,),
+                    ).fetchone()
+                    storage_is_missing = not any(
+                        bool(inspection["exists"])
+                        for inspection in inspected_by_id.values()
+                        if str(inspection["normalized_path"])
+                        == storage_key
+                    )
+                    storage_is_failed_retry = any(
+                        str(artifact["state"]) == "purge_failed"
+                        and str(
+                            inspected_by_id[int(artifact["id"])][
+                                "normalized_path"
+                            ]
+                        )
+                        == storage_key
+                        for artifact in artifact_rows
+                    )
+                    if (
+                        existing_reservation is not None
+                        and int(existing_reservation["media_id"]) == media_id
+                        and str(existing_reservation["state"]) == "purged"
+                        and (
+                            storage_is_missing
+                            or storage_is_failed_retry
+                        )
+                    ):
+                        cursor = self.conn.execute(
+                            """
+                            UPDATE purge_path_reservations
+                            SET operation_id=?, owner_pid=?,
+                              owner_start_id=?, state='active',
+                              created_at=?, finished_at=NULL
+                            WHERE storage_key=? AND media_id=?
+                              AND state='purged'
+                            """,
+                            (
+                                operation_id,
+                                os.getpid(),
+                                _process_start_id(os.getpid()),
+                                requested_at,
+                                storage_key,
+                                media_id,
+                            ),
+                        )
+                        if cursor.rowcount == 1:
+                            continue
+                    raise ValueError(
+                        "one of the tracked files is already reserved for deletion"
+                    ) from exc
+
+            for artifact in artifact_rows:
+                metadata = _json_object(artifact["metadata_json"])
+                metadata["local_purge"] = {
+                    "operation_id": operation_id,
+                    "requested_at": requested_at,
+                    "previous_state": str(artifact["state"]),
+                    "source": "telegram_panel",
+                }
+                self.conn.execute(
+                    """
+                    UPDATE artifacts
+                    SET state='purging', metadata_json=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                        requested_at,
+                        int(artifact["id"]),
+                    ),
+                )
+            self.conn.execute(
+                """
+                UPDATE jobs
+                SET state='cancelled',
+                  reason_code='resource_purged',
+                  last_error='local archive was deleted from the Telegram panel',
+                  lease_owner=NULL,
+                  lease_token=NULL,
+                  lease_until=NULL,
+                  available_at=?,
+                  finished_at=?,
+                  updated_at=?
+                WHERE media_id=? AND state IN ('queued', 'retry', 'blocked')
+                """,
+                (requested_at, requested_at, requested_at, media_id),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+        return self._purge_reserved_files(
+            media_id=media_id,
+            target_id=target_id,
+            title=str(anchor["media_title"]),
+            artifact_rows=artifact_rows,
+            inspected_by_id=inspected_by_id,
+            root=root,
+            operation_id=operation_id,
+            requested_at=requested_at,
+        )
+
+    def _find_shared_resource_path(
+        self,
+        media_id: int,
+        normalized_paths: set[str],
+        root: Path,
+    ) -> str | None:
+        other_paths = self.conn.execute(
+            """
+            SELECT path
+            FROM artifacts
+            WHERE media_id!=? AND state!='purged'
+            """,
+            (media_id,),
+        ).fetchall()
+        for other in other_paths:
+            inspected = _inspect_storage_path(
+                Path(str(other["path"])),
+                root,
+            )
+            normalized = str(inspected["normalized_path"])
+            if normalized in normalized_paths:
+                return normalized
+        return None
+
+    def _purge_reserved_files(
+        self,
+        *,
+        media_id: int,
+        target_id: int,
+        title: str,
+        artifact_rows: list[sqlite3.Row],
+        inspected_by_id: dict[int, dict[str, object]],
+        root: Path,
+        operation_id: str,
+        requested_at: str,
+    ) -> dict[str, object]:
+        path_groups: dict[str, dict[str, object]] = {}
+        for artifact in artifact_rows:
+            artifact_row_id = int(artifact["id"])
+            inspected = inspected_by_id[artifact_row_id]
+            normalized = str(inspected["normalized_path"])
+            group = path_groups.setdefault(
+                normalized,
+                {
+                    "path": Path(str(artifact["path"])),
+                    "artifact_ids": [],
+                    "roles": [],
+                    "inspection": inspected,
+                },
+            )
+            group["artifact_ids"].append(artifact_row_id)  # type: ignore[union-attr]
+            group["roles"].append(str(artifact["role"]))  # type: ignore[union-attr]
+
+        ordered_groups = sorted(
+            path_groups.values(),
+            key=lambda group: int(
+                target_id
+                in [int(value) for value in group["artifact_ids"]]
+            ),
+        )
+        result_by_id: dict[int, dict[str, object]] = {}
+        deleted_files = 0
+        missing_files = 0
+        freed_bytes = 0
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            current_rows = self.conn.execute(
+                """
+                SELECT id, role, part_no, path, size_bytes, state,
+                  metadata_json, updated_at
+                FROM artifacts
+                WHERE media_id=? AND state!='purged'
+                ORDER BY CASE role WHEN 'master' THEN 1 ELSE 0 END, id
+                """,
+                (media_id,),
+            ).fetchall()
+            expected_shape = [
+                (
+                    int(row["id"]),
+                    str(row["role"]),
+                    int(row["part_no"]),
+                    str(row["path"]),
+                    int(row["size_bytes"]),
+                )
+                for row in artifact_rows
+            ]
+            current_shape = [
+                (
+                    int(row["id"]),
+                    str(row["role"]),
+                    int(row["part_no"]),
+                    str(row["path"]),
+                    int(row["size_bytes"]),
+                )
+                for row in current_rows
+            ]
+            validation_error: str | None = None
+            if current_shape != expected_shape or any(
+                str(row["state"]) != "purging" for row in current_rows
+            ):
+                validation_error = (
+                    "resource changed after deletion was reserved"
+                )
+
+            reserved_paths = {
+                str(row["storage_key"])
+                for row in self.conn.execute(
+                    """
+                    SELECT storage_key
+                    FROM purge_path_reservations
+                    WHERE operation_id=? AND media_id=? AND state='active'
+                    """,
+                    (operation_id, media_id),
+                )
+            }
+            expected_paths = set(path_groups)
+            if validation_error is None and reserved_paths != expected_paths:
+                validation_error = "local deletion reservation was lost"
+
+            running = self.conn.execute(
+                """
+                SELECT 1
+                FROM jobs
+                WHERE media_id=? AND state='running'
+                LIMIT 1
+                """,
+                (media_id,),
+            ).fetchone()
+            if validation_error is None and running is not None:
+                validation_error = (
+                    "resource became active after deletion was reserved"
+                )
+
+            if validation_error is None:
+                for artifact in current_rows:
+                    artifact_row_id = int(artifact["id"])
+                    current = _inspect_storage_path(
+                        Path(str(artifact["path"])),
+                        root,
+                    )
+                    initial = inspected_by_id[artifact_row_id]
+                    if not bool(current["safe"]):
+                        validation_error = (
+                            "refusing to delete an unsafe tracked path: "
+                            f"{current['unsafe_reason']}"
+                        )
+                        break
+                    if not _storage_identity_matches(current, initial):
+                        validation_error = (
+                            "tracked file changed after deletion was reserved"
+                        )
+                        break
+
+            if (
+                validation_error is None
+                and self._find_shared_resource_path(
+                    media_id,
+                    expected_paths,
+                    root,
+                )
+                is not None
+            ):
+                validation_error = (
+                    "tracked file became referenced by another media item"
+                )
+
+            if validation_error is not None:
+                for group in ordered_groups:
+                    result = {
+                        "status": "failed",
+                        "error": validation_error,
+                        "bytes": 0,
+                    }
+                    for artifact_row_id in group["artifact_ids"]:
+                        result_by_id[int(artifact_row_id)] = result
+            else:
+                self.conn.execute(
+                    """
+                    UPDATE jobs
+                    SET state='cancelled',
+                      reason_code='resource_purged',
+                      last_error=(
+                        'local archive was deleted from the Telegram panel'
+                      ),
+                      lease_owner=NULL,
+                      lease_token=NULL,
+                      lease_until=NULL,
+                      available_at=?,
+                      finished_at=?,
+                      updated_at=?
+                    WHERE media_id=?
+                      AND state IN ('queued', 'retry', 'blocked')
+                    """,
+                    (
+                        requested_at,
+                        requested_at,
+                        requested_at,
+                        media_id,
+                    ),
+                )
+                failure_seen = False
+                for group in ordered_groups:
+                    artifact_ids = [
+                        int(value) for value in group["artifact_ids"]
+                    ]
+                    initial = group["inspection"]
+                    if failure_seen:
+                        result = {
+                            "status": "failed",
+                            "error": (
+                                "not attempted after another tracked file "
+                                "failed"
+                            ),
+                            "bytes": 0,
+                        }
+                    elif not bool(initial["exists"]):
+                        result = {
+                            "status": "missing",
+                            "error": None,
+                            "bytes": 0,
+                        }
+                        missing_files += 1
+                    else:
+                        try:
+                            size = _unlink_tracked_file(
+                                Path(str(initial["normalized_path"])),
+                                root,
+                                initial,
+                            )
+                        except FileNotFoundError:
+                            result = {
+                                "status": "missing",
+                                "error": None,
+                                "bytes": 0,
+                            }
+                            missing_files += 1
+                        except (OSError, ValueError) as exc:
+                            result = {
+                                "status": "failed",
+                                "error": str(exc),
+                                "bytes": 0,
+                            }
+                            failure_seen = True
+                        else:
+                            result = {
+                                "status": "deleted",
+                                "error": None,
+                                "bytes": size,
+                            }
+                            deleted_files += 1
+                            freed_bytes += size
+                    for artifact_row_id in artifact_ids:
+                        result_by_id[artifact_row_id] = result
+
+            finished_at = now_iso()
+            failed_paths: set[str] = set()
+            failure_messages: list[str] = []
+            for artifact in artifact_rows:
+                artifact_row_id = int(artifact["id"])
+                outcome = result_by_id[artifact_row_id]
+                metadata = _json_object(artifact["metadata_json"])
+                purge_metadata: dict[str, object] = {
+                    "requested_at": requested_at,
+                    "finished_at": finished_at,
+                    "previous_state": str(artifact["state"]),
+                    "source": "telegram_panel",
+                    "result": str(outcome["status"]),
+                }
+                if outcome["error"]:
+                    purge_metadata["error"] = str(outcome["error"])[:500]
+                metadata["local_purge"] = purge_metadata
+                state = (
+                    "purged"
+                    if outcome["status"] in {"deleted", "missing"}
+                    else "purge_failed"
+                )
+                if state == "purge_failed":
+                    failed_paths.add(
+                        str(
+                            inspected_by_id[artifact_row_id][
+                                "normalized_path"
+                            ]
+                        )
+                    )
+                    failure_messages.append(str(outcome["error"]))
+                self.conn.execute(
+                    """
+                    UPDATE artifacts
+                    SET state=?, metadata_json=?, updated_at=?
+                    WHERE id=? AND state='purging'
+                    """,
+                    (
+                        state,
+                        json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                        finished_at,
+                        artifact_row_id,
+                    ),
+                )
+            for normalized, group in path_groups.items():
+                first_artifact_id = int(group["artifact_ids"][0])
+                outcome = result_by_id[first_artifact_id]
+                if (
+                    outcome["status"] in {"deleted", "missing"}
+                    or not _path_entry_exists(Path(normalized))
+                ):
+                    self.conn.execute(
+                        """
+                        UPDATE purge_path_reservations
+                        SET state='purged', owner_pid=0, owner_start_id='',
+                          finished_at=?
+                        WHERE storage_key=? AND operation_id=?
+                          AND state='active'
+                        """,
+                        (finished_at, normalized, operation_id),
+                    )
+                else:
+                    self.conn.execute(
+                        """
+                        DELETE FROM purge_path_reservations
+                        WHERE storage_key=? AND operation_id=?
+                          AND state='active'
+                        """,
+                        (normalized, operation_id),
+                    )
+            self.conn.commit()
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            try:
+                self._abort_reserved_disk_purge(
+                    operation_id,
+                    artifact_rows,
+                )
+            except Exception:
+                # Startup recovery keeps the durable reservation retryable.
+                pass
+            raise
+
+        anchor_row = self.conn.execute(
+            "SELECT updated_at FROM artifacts WHERE id=?",
+            (target_id,),
+        ).fetchone()
+        remaining_rows = self.conn.execute(
+            """
+            SELECT id, role, part_no, path, size_bytes, state,
+              metadata_json, updated_at
+            FROM artifacts
+            WHERE media_id=? AND state!='purged'
+            ORDER BY CASE role WHEN 'master' THEN 1 ELSE 0 END, id
+            """,
+            (media_id,),
+        ).fetchall()
+        remaining_inspections = {
+            int(row["id"]): _inspect_storage_path(
+                Path(str(row["path"])),
+                root,
+            )
+            for row in remaining_rows
+        }
+        return {
+            "artifact_id": target_id,
+            "media_id": media_id,
+            "title": title,
+            "completed": not failed_paths,
+            "deleted_files": deleted_files,
+            "missing_files": missing_files,
+            "failed_files": len(failed_paths),
+            "freed_bytes": freed_bytes,
+            "errors": list(dict.fromkeys(failure_messages)),
+            "updated_at": (
+                str(anchor_row["updated_at"])
+                if anchor_row is not None
+                else finished_at
+            ),
+            "resource_revision": _artifact_set_revision(
+                remaining_rows,
+                remaining_inspections,
+            ),
+        }
+
+    def _abort_reserved_disk_purge(
+        self,
+        operation_id: str,
+        artifact_rows: list[sqlite3.Row],
+    ) -> None:
+        aborted_at = now_iso()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            for artifact in artifact_rows:
+                metadata = _json_object(artifact["metadata_json"])
+                purge_metadata = _json_object(metadata.get("local_purge"))
+                purge_metadata.update(
+                    {
+                        "finished_at": aborted_at,
+                        "result": "failed",
+                        "error": "local deletion stopped unexpectedly",
+                    }
+                )
+                metadata["local_purge"] = purge_metadata
+                self.conn.execute(
+                    """
+                    UPDATE artifacts
+                    SET state='purge_failed', metadata_json=?, updated_at=?
+                    WHERE id=? AND state='purging'
+                    """,
+                    (
+                        json.dumps(
+                            metadata,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        aborted_at,
+                        int(artifact["id"]),
+                    ),
+                )
+            reservation_rows = self.conn.execute(
+                """
+                SELECT storage_key
+                FROM purge_path_reservations
+                WHERE operation_id=? AND state='active'
+                """,
+                (operation_id,),
+            ).fetchall()
+            for reservation in reservation_rows:
+                storage_key = str(reservation["storage_key"])
+                if _path_entry_exists(Path(storage_key)):
+                    self.conn.execute(
+                        """
+                        DELETE FROM purge_path_reservations
+                        WHERE storage_key=? AND operation_id=?
+                          AND state='active'
+                        """,
+                        (storage_key, operation_id),
+                    )
+                else:
+                    self.conn.execute(
+                        """
+                        UPDATE purge_path_reservations
+                        SET state='purged', owner_pid=0, owner_start_id='',
+                          finished_at=?
+                        WHERE storage_key=? AND operation_id=?
+                          AND state='active'
+                        """,
+                        (aborted_at, storage_key, operation_id),
+                    )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def get_panel_snapshot(
         self,
@@ -872,6 +1902,21 @@ class Store:
     # ------------------------------------------------------------------
     # Durable job, artifact and delivery API
 
+    def _assert_artifact_path_not_reserved(self, path: Path) -> None:
+        storage_key = _storage_key(path)
+        row = self.conn.execute(
+            """
+            SELECT media_id
+            FROM purge_path_reservations
+            WHERE storage_key=?
+            """,
+            (storage_key,),
+        ).fetchone()
+        if row is not None:
+            raise RuntimeError(
+                "artifact path is reserved for deletion from the local library"
+            )
+
     def ensure_delivery_job(self, media_id: int, destination_key: str, *, max_failures: int = 5) -> int:
         job_id = self._ensure_job(
             media_id,
@@ -1111,6 +2156,7 @@ class Store:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             self._assert_lease(job)
+            self._assert_artifact_path_not_reserved(path)
             media = self.conn.execute(
                 "SELECT provider, content_kind, metadata_json FROM media_items WHERE id=?",
                 (job.media_id,),
@@ -1272,6 +2318,7 @@ class Store:
                             UPDATE artifacts SET state='suppressed', updated_at=?
                             WHERE role='master'
                               AND media_id IN ({matching_vod_media})
+                              AND state IN ('ready', 'staged', 'suppressed')
                             """,
                             (now, stream_id),
                         )
@@ -1304,24 +2351,40 @@ class Store:
         metadata: dict[str, object] | None = None,
     ) -> int:
         now = now_iso()
-        self.conn.execute(
-            """
-            INSERT INTO artifacts(
-              media_id, role, part_no, path, size_bytes, state, metadata_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?)
-            ON CONFLICT(media_id, role, part_no) DO UPDATE SET
-              path=excluded.path, size_bytes=excluded.size_bytes, state='ready',
-              metadata_json=excluded.metadata_json, updated_at=excluded.updated_at
-            """,
-            (media_id, role, part_no, str(path), size_bytes, json.dumps(metadata or {}, sort_keys=True), now, now),
-        )
-        self.conn.commit()
-        return int(
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._assert_artifact_path_not_reserved(path)
             self.conn.execute(
-                "SELECT id FROM artifacts WHERE media_id=? AND role=? AND part_no=?",
-                (media_id, role, part_no),
-            ).fetchone()[0]
-        )
+                """
+                INSERT INTO artifacts(
+                  media_id, role, part_no, path, size_bytes, state, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?)
+                ON CONFLICT(media_id, role, part_no) DO UPDATE SET
+                  path=excluded.path, size_bytes=excluded.size_bytes, state='ready',
+                  metadata_json=excluded.metadata_json, updated_at=excluded.updated_at
+                """,
+                (
+                    media_id,
+                    role,
+                    part_no,
+                    str(path),
+                    size_bytes,
+                    json.dumps(metadata or {}, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            artifact_id = int(
+                self.conn.execute(
+                    "SELECT id FROM artifacts WHERE media_id=? AND role=? AND part_no=?",
+                    (media_id, role, part_no),
+                ).fetchone()[0]
+            )
+            self.conn.commit()
+            return artifact_id
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def record_live_segment(
         self,
@@ -1334,6 +2397,7 @@ class Store:
         now = now_iso()
         self.conn.execute("BEGIN IMMEDIATE")
         try:
+            self._assert_artifact_path_not_reserved(path)
             existing = self.conn.execute(
                 """
                 SELECT part_no FROM artifacts
@@ -2285,6 +3349,358 @@ def future_iso(seconds: int) -> str:
 
 def row_dict(row: sqlite3.Row) -> dict[str, object]:
     return dict(row)
+
+
+def _artifact_set_revision(
+    rows: list[sqlite3.Row],
+    inspections: dict[int, dict[str, object]],
+) -> str:
+    digest = hashlib.sha256()
+    for row in sorted(rows, key=lambda item: int(item["id"])):
+        inspected = inspections[int(row["id"])]
+        payload = (
+            int(row["id"]),
+            str(row["role"]),
+            int(row["part_no"]),
+            str(row["path"]),
+            int(row["size_bytes"]),
+            str(row["state"]),
+            str(row["metadata_json"]),
+            str(row["updated_at"]),
+            bool(inspected["exists"]),
+            bool(inspected["safe"]),
+            int(inspected["actual_bytes"]),
+            str(inspected["normalized_path"]),
+            inspected["device"],
+            inspected["inode"],
+            inspected["mtime_ns"],
+            inspected["ctime_ns"],
+        )
+        digest.update(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()[:32]
+
+
+def _disk_resource_from_row(
+    row: sqlite3.Row,
+    download_root: Path,
+) -> dict[str, object]:
+    inspected = _inspect_storage_path(
+        Path(str(row["master_path"])),
+        download_root,
+    )
+    return {
+        "artifact_id": int(row["artifact_id"]),
+        "media_id": int(row["media_id"]),
+        "anchor_role": str(row["anchor_role"]),
+        "master_path": str(row["master_path"]),
+        "master_recorded_bytes": int(row["master_recorded_bytes"]),
+        "master_state": str(row["master_state"]),
+        "artifact_created_at": str(row["artifact_created_at"]),
+        "artifact_updated_at": str(row["artifact_updated_at"]),
+        "provider": str(row["provider"]),
+        "content_kind": str(row["content_kind"]),
+        "external_id": str(row["external_id"]),
+        "title": str(row["title"]),
+        "canonical_url": str(row["canonical_url"]),
+        "published_at": (
+            str(row["published_at"]) if row["published_at"] else None
+        ),
+        "origin_name": str(row["origin_name"]),
+        "delivered": bool(row["delivered"]),
+        "delivery_job_state": (
+            str(row["delivery_job_state"])
+            if row["delivery_job_state"]
+            else None
+        ),
+        "running": bool(row["running"]),
+        "irreplaceable_live": bool(row["irreplaceable_live"]),
+        "artifact_count": int(row["artifact_count"]),
+        "recorded_bytes": int(row["recorded_bytes"]),
+        "master_exists": bool(inspected["exists"]),
+        "master_safe": bool(inspected["safe"]),
+        "master_actual_bytes": int(inspected["actual_bytes"]),
+        "relative_path": str(inspected["relative_path"]),
+        "unsafe_reason": inspected["unsafe_reason"],
+    }
+
+
+def _inspect_storage_path(
+    path: Path,
+    download_root: Path,
+) -> dict[str, object]:
+    root = Path(download_root).expanduser().resolve(strict=False)
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        return {
+            "exists": False,
+            "safe": False,
+            "actual_bytes": 0,
+            "relative_path": candidate.name,
+            "normalized_path": candidate,
+            "unsafe_reason": "relative paths are not managed",
+            "device": None,
+            "inode": None,
+            "mtime_ns": None,
+            "ctime_ns": None,
+        }
+    normalized = candidate.resolve(strict=False)
+    try:
+        relative = normalized.relative_to(root)
+    except ValueError:
+        return {
+            "exists": candidate.exists() or candidate.is_symlink(),
+            "safe": False,
+            "actual_bytes": 0,
+            "relative_path": candidate.name,
+            "normalized_path": normalized,
+            "unsafe_reason": "path is outside the configured downloads directory",
+            "device": None,
+            "inode": None,
+            "mtime_ns": None,
+            "ctime_ns": None,
+        }
+    if relative == Path("."):
+        return {
+            "exists": True,
+            "safe": False,
+            "actual_bytes": 0,
+            "relative_path": ".",
+            "normalized_path": normalized,
+            "unsafe_reason": "the downloads directory itself is not a resource file",
+            "device": None,
+            "inode": None,
+            "mtime_ns": None,
+            "ctime_ns": None,
+        }
+    try:
+        file_stat = candidate.lstat()
+    except FileNotFoundError:
+        return {
+            "exists": False,
+            "safe": True,
+            "actual_bytes": 0,
+            "relative_path": str(relative),
+            "normalized_path": normalized,
+            "unsafe_reason": None,
+            "device": None,
+            "inode": None,
+            "mtime_ns": None,
+            "ctime_ns": None,
+        }
+    except OSError as exc:
+        return {
+            "exists": True,
+            "safe": False,
+            "actual_bytes": 0,
+            "relative_path": str(relative),
+            "normalized_path": normalized,
+            "unsafe_reason": f"cannot inspect tracked path: {exc}",
+            "device": None,
+            "inode": None,
+            "mtime_ns": None,
+            "ctime_ns": None,
+        }
+    if stat.S_ISLNK(file_stat.st_mode):
+        return {
+            "exists": True,
+            "safe": False,
+            "actual_bytes": 0,
+            "relative_path": str(relative),
+            "normalized_path": normalized,
+            "unsafe_reason": "symbolic links are not deleted from the panel",
+            "device": int(file_stat.st_dev),
+            "inode": int(file_stat.st_ino),
+            "mtime_ns": int(file_stat.st_mtime_ns),
+            "ctime_ns": int(file_stat.st_ctime_ns),
+        }
+    if not stat.S_ISREG(file_stat.st_mode):
+        return {
+            "exists": True,
+            "safe": False,
+            "actual_bytes": 0,
+            "relative_path": str(relative),
+            "normalized_path": normalized,
+            "unsafe_reason": "tracked path is not a regular file",
+            "device": int(file_stat.st_dev),
+            "inode": int(file_stat.st_ino),
+            "mtime_ns": int(file_stat.st_mtime_ns),
+            "ctime_ns": int(file_stat.st_ctime_ns),
+        }
+    return {
+        "exists": True,
+        "safe": True,
+        "actual_bytes": int(file_stat.st_size),
+        "relative_path": str(relative),
+        "normalized_path": normalized,
+        "unsafe_reason": None,
+        "device": int(file_stat.st_dev),
+        "inode": int(file_stat.st_ino),
+        "mtime_ns": int(file_stat.st_mtime_ns),
+        "ctime_ns": int(file_stat.st_ctime_ns),
+    }
+
+
+def _storage_key(path: Path) -> str:
+    return str(Path(path).expanduser().resolve(strict=False))
+
+
+def _path_entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return True
+
+
+def _process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _process_start_id(pid: int) -> str:
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields_after_name = stat_text.rsplit(") ", 1)[1].split()
+        return fields_after_name[19]
+    except (IndexError, OSError):
+        return ""
+
+
+def _process_instance_is_alive(pid: int, expected_start_id: str) -> bool:
+    if not _process_is_alive(pid):
+        return False
+    actual_start_id = _process_start_id(pid)
+    if expected_start_id and actual_start_id:
+        return expected_start_id == actual_start_id
+    return True
+
+
+def _storage_identity_matches(
+    current: dict[str, object],
+    expected: dict[str, object],
+) -> bool:
+    if (
+        bool(current["safe"]) != bool(expected["safe"])
+        or bool(current["exists"]) != bool(expected["exists"])
+        or str(current["normalized_path"]) != str(expected["normalized_path"])
+    ):
+        return False
+    if not bool(expected["exists"]):
+        return True
+    return all(
+        current[field] == expected[field]
+        for field in (
+            "device",
+            "inode",
+            "actual_bytes",
+            "mtime_ns",
+            "ctime_ns",
+        )
+    )
+
+
+def _unlink_tracked_file(
+    path: Path,
+    download_root: Path,
+    expected: dict[str, object],
+) -> int:
+    """Unlink a confirmed regular file without following swapped path links."""
+
+    root = Path(download_root).expanduser().resolve(strict=True)
+    normalized = Path(str(expected["normalized_path"]))
+    try:
+        relative = normalized.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            "tracked file moved outside the configured downloads directory"
+        ) from exc
+    if relative == Path(".") or not relative.parts:
+        raise ValueError("the downloads directory itself cannot be deleted")
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("tracked file path contains an unsafe component")
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise OSError("safe no-follow deletion is not supported on this platform")
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    directory_flags = os.O_RDONLY | directory | nofollow | cloexec
+    leaf_flags = getattr(os, "O_PATH", os.O_RDONLY) | nofollow | cloexec
+    directory_fds: list[int] = []
+    leaf_fd: int | None = None
+    try:
+        directory_fds.append(os.open(root, directory_flags))
+        for component in relative.parts[:-1]:
+            directory_fds.append(
+                os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=directory_fds[-1],
+                )
+            )
+        parent_fd = directory_fds[-1]
+        leaf = relative.parts[-1]
+        leaf_fd = os.open(leaf, leaf_flags, dir_fd=parent_fd)
+        opened_stat = os.fstat(leaf_fd)
+        named_stat = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(opened_stat.st_mode) or not stat.S_ISREG(
+            named_stat.st_mode
+        ):
+            raise ValueError("tracked path is no longer a regular file")
+        for actual_stat in (opened_stat, named_stat):
+            if (
+                int(actual_stat.st_dev) != expected["device"]
+                or int(actual_stat.st_ino) != expected["inode"]
+                or int(actual_stat.st_size) != expected["actual_bytes"]
+                or int(actual_stat.st_mtime_ns) != expected["mtime_ns"]
+                or int(actual_stat.st_ctime_ns) != expected["ctime_ns"]
+            ):
+                raise ValueError(
+                    "tracked file changed after deletion was reserved"
+                )
+        os.unlink(leaf, dir_fd=parent_fd)
+        return int(opened_stat.st_size)
+    finally:
+        if leaf_fd is not None:
+            os.close(leaf_fd)
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
+
+def _like_pattern(value: str) -> str:
+    escaped = (
+        value.lower()
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    return f"%{escaped}%"
+
+
+def _json_object(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return dict(value)
+    try:
+        decoded = json.loads(str(value or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(decoded) if isinstance(decoded, dict) else {}
 
 
 def _origin_recording_mode_override(options_json: object) -> str | None:
