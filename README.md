@@ -9,9 +9,17 @@ Helix API.
 YouTube members-only discovery and authentication are outside the main worker's
 public-origin path.
 
-> Handing this repository to a coding agent? Start with
-> [`AGENTS.md`](AGENTS.md) for a safe quick configuration, validation commands,
-> and the boundaries around live provider and Telegram operations.
+## Agent quick start
+
+Give an agent this command to fetch a self-contained local service setup guide:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dreaifekks/asmr-tg-backup/master/AGENT_QUICK_START.md
+```
+
+The guide takes the agent from prerequisites and a private minimal config
+through user-systemd installation and runtime verification, with real origins
+and Telegram delivery kept disabled until the user confirms them.
 
 ## Providers and origins
 

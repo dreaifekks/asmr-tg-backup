@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Add a root `AGENTS.md` quick-configuration entrypoint and link it from the
-  README for coding-agent handoff.
+- Add a self-contained `AGENT_QUICK_START.md` that an agent can fetch with
+  `curl` to configure and verify a basic local service, linked from the README.
 - Rename the public project, CLI, deployment templates, documentation, and
   request identity from `ytb-tg-backup` to the provider-neutral
   `asmr-tg-backup`, while retaining the Python import namespace for compatibility.
