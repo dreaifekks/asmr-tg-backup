@@ -980,6 +980,9 @@ class BackupService:
                 url=str(media["canonical_url"]),
                 feed_name=store.primary_origin_name(job.media_id),
                 video_id=str(media["external_id"]),
+                published_at=(
+                    str(media["published_at"]) if media["published_at"] else None
+                ),
                 thumbnail_path=thumbnail_path,
             )
         except TelegramUploadError as exc:

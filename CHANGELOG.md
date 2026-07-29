@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.3.1 - 2026-07-29
+
+- Fix Telegram filenames for Twitch live recordings by using the persisted
+  media publication date after live merge or audio compression, avoiding the
+  `unknown-date` fallback when the derived artifact name has no date prefix.
+
 ## 0.3.0 - 2026-07-27
 
 - Add a paginated, searchable local ASMR resource library to the Telegram

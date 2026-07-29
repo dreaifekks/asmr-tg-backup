@@ -35,6 +35,24 @@ class TelegramCaptionTest(unittest.TestCase):
         )
         self.assertEqual(filename, "2026-05-12_ASMR _ EarCleaning_ _KU100__ Triggers.m4a")
 
+    def test_upload_filename_uses_published_date_for_live_derivative(self):
+        filename = _upload_filename(
+            file_path=Path("twitch_316244257650.live-merged.tg64k.m4a"),
+            title="Live ASMR",
+            video_id="316244257650",
+            published_at="2026-07-29T14:08:51Z",
+        )
+        self.assertEqual(filename, "2026-07-29_Live ASMR.m4a")
+
+    def test_upload_filename_falls_back_to_path_for_invalid_published_date(self):
+        filename = _upload_filename(
+            file_path=Path("2026-05-12_old-title_A55ZVGZcfv8.m4a"),
+            title="ASMR",
+            video_id="A55ZVGZcfv8",
+            published_at="not-a-date",
+        )
+        self.assertEqual(filename, "2026-05-12_ASMR.m4a")
+
     def test_upload_uses_safe_temp_path_with_display_filename(self):
         captured: dict[str, object] = {}
 

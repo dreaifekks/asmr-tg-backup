@@ -340,6 +340,28 @@ class PipelineV2Test(unittest.TestCase):
             self.assertEqual(telegram.upload.call_args.args[0], master_path)
             service.store.close()
 
+    def test_delivery_passes_media_published_at_to_telegram(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service, media_id = self._service_with_media(Path(tmp), "dated-live")
+            service.store.conn.execute(
+                "UPDATE media_items SET published_at=? WHERE id=?",
+                ("2026-07-29T14:08:51Z", media_id),
+            )
+            master_path = Path(tmp) / "twitch_316244257650.live-merged.mp4"
+            master_path.write_bytes(b"video")
+            downloader = self._downloader(master_path)
+            telegram = mock.Mock()
+            telegram.upload.return_value = 889
+
+            self.assertEqual(self._run_one(service, downloader, telegram, owner="download"), 1)
+            self.assertEqual(self._run_one(service, downloader, telegram, owner="delivery"), 1)
+
+            self.assertEqual(
+                telegram.upload.call_args.kwargs["published_at"],
+                "2026-07-29T14:08:51Z",
+            )
+            service.store.close()
+
     def test_worker_uses_its_thread_local_store_for_source_filter(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

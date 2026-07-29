@@ -39,6 +39,7 @@ class TelegramUploader:
         url: str,
         feed_name: str,
         video_id: str,
+        published_at: str | None = None,
         thumbnail_path: Path | None = None,
     ) -> int:
         self.validate()
@@ -51,7 +52,12 @@ class TelegramUploader:
         method, file_field = self._upload_target()
         endpoint = f"{self.config.api_base.rstrip('/')}/bot{self.config.bot_token}/{method}"
         caption = self._caption(title=title, url=url, feed_name=feed_name, video_id=video_id)
-        upload_filename = _upload_filename(file_path=file_path, title=title, video_id=video_id)
+        upload_filename = _upload_filename(
+            file_path=file_path,
+            title=title,
+            video_id=video_id,
+            published_at=published_at,
+        )
         upload_timeout_seconds = int(getattr(self.config, "upload_timeout_seconds", 7200))
 
         with tempfile.TemporaryDirectory(prefix="ytb-tg-upload-") as tmp:
@@ -166,11 +172,28 @@ def _tag_from_feed_name(feed_name: str) -> str:
     return tag[:80]
 
 
-def _upload_filename(*, file_path: Path, title: str, video_id: str) -> str:
-    date = _date_from_path(file_path) or "unknown-date"
+def _upload_filename(
+    *,
+    file_path: Path,
+    title: str,
+    video_id: str,
+    published_at: str | None = None,
+) -> str:
+    date = (
+        _date_from_published_at(published_at)
+        or _date_from_path(file_path)
+        or "unknown-date"
+    )
     clean_title = _clean_filename(title) or _clean_filename(video_id) or "media"
     suffix = file_path.suffix.lower() or ".m4a"
     return f"{date}_{clean_title}{suffix}"
+
+
+def _date_from_published_at(published_at: str | None) -> str | None:
+    if not published_at:
+        return None
+    match = re.match(r"(\d{4}-\d{2}-\d{2})(?:T|$)", published_at.strip())
+    return match.group(1) if match else None
 
 
 def _date_from_path(file_path: Path) -> str | None:
