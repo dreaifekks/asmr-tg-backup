@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.3.2 - 2026-08-02
+
+- Preserve compatible source audio when preparing Telegram audio from a video
+  master, avoiding an unnecessary low-bitrate AAC transcode for Twitch live
+  recordings and other retained-video profiles.
+- Raise the adaptive AAC fallback ceiling from 64 kbps to 256 kbps when the
+  upload limit permits, while retaining lower bitrate candidates for genuinely
+  constrained deliveries.
+- Write audio-copy and fallback-encoding attempts through temporary files so
+  incompatible or oversized candidates do not leave partial artifacts behind.
+
 ## 0.3.1 - 2026-07-29
 
 - Fix Telegram filenames for Twitch live recordings by using the persisted

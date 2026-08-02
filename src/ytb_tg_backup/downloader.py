@@ -471,36 +471,104 @@ class Downloader:
         if not ffmpeg:
             return DownloadResult(file_path=file_path, file_size=file_path.stat().st_size)
 
+        if needs_audio_derivative:
+            copied = self._copy_audio_for_upload(file_path, max_bytes)
+            if copied is not None:
+                return copied
+
         duration = self._duration_seconds(file_path)
         bitrate = _target_audio_bitrate_kbps(max_bytes=max_bytes, duration_seconds=duration)
-        for candidate_bitrate in _bitrate_candidates(bitrate):
-            output = file_path.with_name(f"{file_path.stem}.tg{candidate_bitrate}k.m4a")
+        with tempfile.TemporaryDirectory(
+            prefix=".tg-audio-encode-",
+            dir=file_path.parent,
+        ) as temp_dir:
+            for candidate_bitrate in _bitrate_candidates(bitrate):
+                output = file_path.with_name(f"{file_path.stem}.tg{candidate_bitrate}k.m4a")
+                temporary_output = Path(temp_dir) / f"audio-{candidate_bitrate}k.m4a"
+                cmd = [
+                    ffmpeg,
+                    "-nostdin",
+                    "-y",
+                    "-i",
+                    str(file_path),
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    f"{candidate_bitrate}k",
+                    "-movflags",
+                    "+faststart",
+                    str(temporary_output),
+                ]
+                self.logger.info("shrinking audio for upload path=%s bitrate=%sk", file_path, candidate_bitrate)
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    timeout=self.config.download.ffmpeg_timeout_seconds,
+                )
+                size = temporary_output.stat().st_size
+                if size <= max_bytes or candidate_bitrate == 24:
+                    os.replace(temporary_output, output)
+                    return DownloadResult(file_path=output, file_size=size)
+        return DownloadResult(file_path=file_path, file_size=file_path.stat().st_size)
+
+    def _copy_audio_for_upload(
+        self,
+        file_path: Path,
+        max_bytes: int,
+    ) -> DownloadResult | None:
+        """Extract an M4A-compatible audio stream without another lossy encode."""
+        output = file_path.with_name(f"{file_path.stem}.tgaudio.m4a")
+        with tempfile.TemporaryDirectory(
+            prefix=".tg-audio-copy-",
+            dir=output.parent,
+        ) as temp_dir:
+            temporary_output = Path(temp_dir) / "audio.m4a"
             cmd = [
-                ffmpeg,
+                self.config.download.ffmpeg,
+                "-nostdin",
                 "-y",
                 "-i",
                 str(file_path),
+                "-map",
+                "0:a:0",
                 "-vn",
                 "-c:a",
-                "aac",
-                "-b:a",
-                f"{candidate_bitrate}k",
+                "copy",
                 "-movflags",
                 "+faststart",
-                str(output),
+                str(temporary_output),
             ]
-            self.logger.info("shrinking audio for upload path=%s bitrate=%sk", file_path, candidate_bitrate)
-            subprocess.run(
-                cmd,
-                check=True,
-                text=True,
-                capture_output=True,
-                timeout=self.config.download.ffmpeg_timeout_seconds,
-            )
-            size = output.stat().st_size
-            if size <= max_bytes or candidate_bitrate == 24:
-                return DownloadResult(file_path=output, file_size=size)
-        return DownloadResult(file_path=file_path, file_size=file_path.stat().st_size)
+            self.logger.info("copying audio for upload path=%s", file_path)
+            try:
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    timeout=self.config.download.ffmpeg_timeout_seconds,
+                )
+            except subprocess.CalledProcessError as exc:
+                self.logger.info(
+                    "audio stream copy unavailable; falling back to AAC encoding path=%s error=%s",
+                    file_path,
+                    exc,
+                )
+                return None
+            size = temporary_output.stat().st_size
+            if size > max_bytes:
+                self.logger.info(
+                    "copied audio exceeds upload limit; falling back to AAC encoding path=%s size=%s",
+                    file_path,
+                    size,
+                )
+                return None
+            os.replace(temporary_output, output)
+        return DownloadResult(file_path=output, file_size=output.stat().st_size)
 
     def prepare_thumbnail_for_upload(self, video_id: str, *, provider: str | None = None) -> Path | None:
         source = self._find_thumbnail_file(video_id, provider=provider)
@@ -733,17 +801,28 @@ def _target_audio_bitrate_kbps(*, max_bytes: int, duration_seconds: float) -> in
         return 40
     # Leave container overhead and Telegram multipart headroom.
     kbps = int((max_bytes * 8 * 0.90) / duration_seconds / 1000)
-    return max(24, min(64, kbps))
+    return max(24, min(256, kbps))
 
 
 def _bitrate_candidates(start_kbps: int) -> list[int]:
-    candidates = [start_kbps, start_kbps - 8, start_kbps - 16, 32, 24]
-    clean: list[int] = []
-    for value in candidates:
-        value = max(24, min(64, value))
-        if value not in clean:
-            clean.append(value)
-    return clean
+    start_kbps = max(24, min(256, start_kbps))
+    candidates = {
+        start_kbps,
+        max(24, start_kbps - 8),
+        max(24, start_kbps - 16),
+        192,
+        128,
+        96,
+        64,
+        48,
+        40,
+        32,
+        24,
+    }
+    return sorted(
+        (value for value in candidates if value <= start_kbps),
+        reverse=True,
+    )
 
 
 def _safe_provider_name(provider: str | None) -> str:
