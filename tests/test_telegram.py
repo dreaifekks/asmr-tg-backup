@@ -6,11 +6,193 @@ from unittest import mock
 
 from ytb_tg_backup.config import TelegramConfig
 from ytb_tg_backup.telegram import (
+    TelegramTextNotifier,
     TelegramUploader,
     TelegramUploadError,
     _tag_from_feed_name,
     _upload_filename,
 )
+
+
+class TelegramTextNotifierTest(unittest.TestCase):
+    def test_send_text_works_while_media_uploads_are_disabled(self):
+        captured: dict[str, object] = {}
+        token = "123456:super-secret-token"
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout='{"ok": true, "result": {"message_id": 456}}\n200',
+                stderr="",
+            )
+
+        notifier = TelegramTextNotifier(
+            TelegramConfig(
+                enabled=False,
+                bot_token=token,
+                chat_id="@member-notifications",
+            )
+        )
+        with (
+            mock.patch(
+                "ytb_tg_backup.telegram.shutil.which",
+                return_value="/usr/bin/curl",
+            ),
+            mock.patch("ytb_tg_backup.telegram.subprocess.run", fake_run),
+        ):
+            message_id = notifier.send_text("Member stream is live")
+
+        self.assertEqual(message_id, 456)
+        command = captured["cmd"]
+        kwargs = captured["kwargs"]
+        self.assertNotIn(token, " ".join(command))
+        self.assertIn("chat_id=@member-notifications", command)
+        self.assertIn("text=Member stream is live", command)
+        self.assertIn(f"/bot{token}/sendMessage", kwargs["input"])
+        self.assertEqual(kwargs["timeout"], 60)
+        self.assertTrue(kwargs["check"])
+
+    def test_send_text_accepts_chat_id_override_and_timeout(self):
+        captured: dict[str, object] = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["timeout"] = kwargs["timeout"]
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout='{"ok": true, "result": {"message_id": "789"}}',
+                stderr="",
+            )
+
+        notifier = TelegramTextNotifier(
+            TelegramConfig(
+                enabled=False,
+                bot_token="token",
+                chat_id="@default",
+            )
+        )
+        with (
+            mock.patch(
+                "ytb_tg_backup.telegram.shutil.which",
+                return_value="/usr/bin/curl",
+            ),
+            mock.patch("ytb_tg_backup.telegram.subprocess.run", fake_run),
+        ):
+            message_id = notifier.send_text(
+                "override",
+                chat_id="@override",
+                timeout_seconds=17,
+            )
+
+        self.assertEqual(message_id, 789)
+        self.assertIn("chat_id=@override", captured["cmd"])
+        self.assertNotIn("chat_id=@default", captured["cmd"])
+        self.assertEqual(captured["timeout"], 17)
+
+    def test_send_text_requires_token_destination_and_curl_independently_of_enabled(self):
+        cases = (
+            (
+                TelegramConfig(enabled=False, chat_id="@channel"),
+                None,
+                "telegram.bot_token",
+                "/usr/bin/curl",
+            ),
+            (
+                TelegramConfig(enabled=False, bot_token="token"),
+                None,
+                "chat_id",
+                "/usr/bin/curl",
+            ),
+            (
+                TelegramConfig(
+                    enabled=False,
+                    bot_token="token",
+                    chat_id="@channel",
+                ),
+                None,
+                "curl is required",
+                None,
+            ),
+        )
+        for config, chat_id, expected, curl_path in cases:
+            with self.subTest(expected=expected), mock.patch(
+                "ytb_tg_backup.telegram.shutil.which",
+                return_value=curl_path,
+            ), self.assertRaisesRegex(TelegramUploadError, expected):
+                TelegramTextNotifier(config).send_text("notification", chat_id=chat_id)
+
+    def test_send_text_redacts_token_and_preserves_uncertain_semantics(self):
+        token = "123456:super-secret-token"
+        failures = (
+            (
+                subprocess.CalledProcessError(
+                    22,
+                    ["curl"],
+                    output=f'{{"ok": false, "error_code": 429, "token": "{token}"}}\n429',
+                    stderr="",
+                ),
+                False,
+            ),
+            (
+                subprocess.CalledProcessError(
+                    22,
+                    ["curl"],
+                    output=f'{{"ok": false, "error_code": 500, "token": "{token}"}}\n500',
+                    stderr="",
+                ),
+                True,
+            ),
+            (
+                subprocess.CalledProcessError(
+                    56,
+                    ["curl"],
+                    stderr=f"connection reset after sending {token}",
+                ),
+                True,
+            ),
+            (
+                subprocess.TimeoutExpired(["curl"], 60),
+                True,
+            ),
+            (
+                subprocess.CompletedProcess(
+                    ["curl"],
+                    0,
+                    stdout='{"ok": true, "result": {}}',
+                    stderr="",
+                ),
+                True,
+            ),
+        )
+        notifier = TelegramTextNotifier(
+            TelegramConfig(
+                enabled=False,
+                bot_token=token,
+                chat_id="@channel",
+            )
+        )
+        for failure, expected_uncertain in failures:
+            patch_kwargs = (
+                {"side_effect": failure}
+                if isinstance(failure, BaseException)
+                else {"return_value": failure}
+            )
+            with self.subTest(failure=type(failure).__name__), (
+                mock.patch(
+                    "ytb_tg_backup.telegram.shutil.which",
+                    return_value="/usr/bin/curl",
+                )
+            ), mock.patch(
+                "ytb_tg_backup.telegram.subprocess.run",
+                **patch_kwargs,
+            ), self.assertRaises(TelegramUploadError) as raised:
+                notifier.send_text("notification")
+            self.assertEqual(raised.exception.uncertain, expected_uncertain)
+            self.assertNotIn(token, str(raised.exception))
 
 
 class TelegramCaptionTest(unittest.TestCase):

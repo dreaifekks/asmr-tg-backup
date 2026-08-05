@@ -1,16 +1,146 @@
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
 from ytb_tg_backup.config import load_config
 from ytb_tg_backup.feed import FeedEntry
+from ytb_tg_backup.models import MediaCandidate
 from ytb_tg_backup.service import BackupService
 from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
 
 
 class BackupServiceTest(unittest.TestCase):
+    def test_existing_download_job_is_cancelled_when_channel_moves_to_dev(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+download_delay_seconds = 0
+
+[[origins]]
+id = "youtube-member"
+provider = "youtube"
+kind = "uploads"
+name = "Member channel"
+external_id = "UC1234567890123456789012"
+enabled = false
+
+[dev.youtube_membership]
+enabled = true
+origin_ids = ["youtube-member"]
+""".strip()
+            )
+            service = BackupService(load_config(config_path))
+            try:
+                service.initialize()
+                service.store.upsert_discovered(
+                    "youtube-member",
+                    MediaCandidate(
+                        provider="youtube",
+                        content_kind="video",
+                        external_id="old-member-job",
+                        title="ASMR old member job",
+                        url="https://www.youtube.com/watch?v=old-member-job",
+                        published_at="2026-08-01T00:00:00+00:00",
+                    ),
+                    disposition="eligible",
+                    max_failures=5,
+                )
+                with mock.patch.object(service.downloader, "probe") as probe:
+                    service.process_pending()
+                probe.assert_not_called()
+                row = service.store.conn.execute(
+                    "SELECT state, reason_code FROM jobs WHERE job_type = 'download'"
+                ).fetchone()
+            finally:
+                service.store.close()
+
+        self.assertEqual(tuple(row), ("cancelled", "dev_membership_reserved"))
+
+    def test_dev_membership_origin_never_enters_production_source_poll(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[[origins]]
+id = "youtube-member"
+provider = "youtube"
+kind = "uploads"
+name = "Member channel"
+external_id = "UC1234567890123456789012"
+enabled = false
+
+[dev.youtube_membership]
+enabled = true
+origin_ids = ["youtube-member"]
+""".strip()
+            )
+            service = BackupService(load_config(config_path))
+            try:
+                with mock.patch.object(
+                    service.sources,
+                    "get",
+                    wraps=service.sources.get,
+                ) as get_source:
+                    service.poll_once(process=False)
+                get_source.assert_not_called()
+                self.assertEqual(service.store.counts_by_status(), {})
+            finally:
+                service.store.close()
+
+    def test_run_starts_dev_youtube_membership_only_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[[origins]]
+id = "youtube-member"
+provider = "youtube"
+kind = "uploads"
+name = "Member channel"
+external_id = "UC1234567890123456789012"
+enabled = false
+
+[dev.youtube_membership]
+enabled = true
+origin_ids = ["youtube-member"]
+""".strip()
+            )
+            service = BackupService(load_config(config_path))
+            thread_names: list[str] = []
+
+            def run_dev() -> None:
+                thread_names.append(threading.current_thread().name)
+                service.stop()
+
+            with (
+                mock.patch.object(service, "initialize"),
+                mock.patch.object(service, "_log_startup_warnings"),
+                mock.patch.object(service, "_worker_loop"),
+                mock.patch.object(service, "_source_poll_loop"),
+                mock.patch.object(
+                    service,
+                    "_dev_youtube_membership_loop",
+                    side_effect=run_dev,
+                ) as dev_loop,
+            ):
+                service.run_forever()
+
+            dev_loop.assert_called_once_with()
+            self.assertEqual(thread_names, ["dev-youtube-membership"])
+            service.store.close()
+
     def test_initialize_hardens_all_provider_archive_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

@@ -725,11 +725,52 @@ class Store:
         return True
 
     def delete_control_origin(self, origin_id: str) -> bool:
-        cursor = self.conn.execute(
-            "DELETE FROM origins WHERE id=? AND managed_by='control'",
+        row = self.conn.execute(
+            "SELECT 1 FROM origins WHERE id=? AND managed_by='control'",
             (origin_id,),
-        )
-        self.conn.commit()
+        ).fetchone()
+        if row is None:
+            return False
+        return self._delete_origin_with_job_cleanup(origin_id)
+
+    def _delete_origin_with_job_cleanup(self, origin_id: str) -> bool:
+        now = now_iso()
+        with self.conn:
+            orphaned_media_ids = [
+                int(row["media_id"])
+                for row in self.conn.execute(
+                    """
+                    SELECT DISTINCT oi.media_id
+                    FROM origin_items oi
+                    WHERE oi.origin_id=?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM origin_items other
+                        WHERE other.media_id=oi.media_id
+                          AND other.origin_id!=oi.origin_id
+                          AND other.disposition='eligible'
+                      )
+                    """,
+                    (origin_id,),
+                )
+            ]
+            if orphaned_media_ids:
+                placeholders = ",".join("?" for _ in orphaned_media_ids)
+                self.conn.execute(
+                    f"""
+                    UPDATE jobs
+                    SET state='cancelled', reason_code='origin_deleted',
+                        last_error='last eligible origin was deleted',
+                        lease_owner=NULL, lease_token=NULL, lease_until=NULL,
+                        updated_at=?, finished_at=?
+                    WHERE media_id IN ({placeholders})
+                      AND state IN ('queued', 'retry')
+                    """,
+                    (now, now, *orphaned_media_ids),
+                )
+            cursor = self.conn.execute(
+                "DELETE FROM origins WHERE id=?",
+                (origin_id,),
+            )
         return cursor.rowcount == 1
 
     def counts_by_provider(self) -> dict[str, int]:
@@ -1661,9 +1702,7 @@ class Store:
         return cursor.rowcount
 
     def delete_origin(self, origin_id: str) -> bool:
-        cursor = self.conn.execute("DELETE FROM origins WHERE id = ?", (origin_id,))
-        self.conn.commit()
-        return cursor.rowcount > 0
+        return self._delete_origin_with_job_cleanup(origin_id)
 
     def origin_has_items(
         self,
@@ -2524,7 +2563,7 @@ class Store:
         return list(
             self.conn.execute(
                 """
-                SELECT o.id, o.name, oi.disposition
+                SELECT o.id, o.name, o.provider, o.external_id, oi.disposition
                 FROM origin_items oi JOIN origins o ON o.id=oi.origin_id
                 WHERE oi.media_id=? ORDER BY oi.first_seen_at, o.id
                 """,

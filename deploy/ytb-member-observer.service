@@ -1,0 +1,19 @@
+[Unit]
+Description=Development-only anonymous YouTube membership metadata observer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/dev/ytb-tg-backup
+ExecStart=%h/dev/ytb-tg-backup/.venv/bin/python -m ytb_tg_backup.dev.member_observer run --config %h/dev/ytb-tg-backup/members-observer.local.toml
+Restart=on-failure
+RestartSec=5min
+TimeoutStopSec=4min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

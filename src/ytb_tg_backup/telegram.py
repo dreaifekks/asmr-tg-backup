@@ -17,6 +17,120 @@ class TelegramUploadError(RuntimeError):
         self.uncertain = uncertain
 
 
+class TelegramTextNotifier:
+    """Send metadata-only Telegram notifications without enabling media uploads."""
+
+    def __init__(self, config: TelegramConfig):
+        self.config = config
+
+    def send_text(
+        self,
+        text: str,
+        *,
+        chat_id: str | None = None,
+        timeout_seconds: int = 60,
+    ) -> int:
+        destination = self.config.chat_id if chat_id is None else str(chat_id)
+        if not self.config.bot_token:
+            raise TelegramUploadError(
+                "telegram.bot_token is required for Telegram text notifications"
+            )
+        if not destination:
+            raise TelegramUploadError(
+                "a Telegram chat_id is required for Telegram text notifications"
+            )
+        if shutil.which("curl") is None:
+            raise TelegramUploadError("curl is required for Telegram text notifications")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+
+        endpoint = (
+            f"{self.config.api_base.rstrip('/')}/"
+            f"bot{self.config.bot_token}/sendMessage"
+        )
+        cmd = [
+            "curl",
+            "--config",
+            "-",
+            "--fail-with-body",
+            "--silent",
+            "--show-error",
+            "--request",
+            "POST",
+            "--write-out",
+            "\n%{http_code}",
+            "--form-string",
+            f"chat_id={destination}",
+            "--form-string",
+            f"text={text}",
+        ]
+        try:
+            completed = subprocess.run(
+                cmd,
+                check=True,
+                text=True,
+                capture_output=True,
+                input=_curl_stdin_config(endpoint),
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            raise TelegramUploadError(
+                f"Telegram text notification timed out after {timeout_seconds} seconds",
+                uncertain=True,
+            ) from None
+        except subprocess.CalledProcessError as exc:
+            response_body, http_status = _split_curl_output(
+                exc.stdout or exc.output or ""
+            )
+            detail = _redact_bot_token(
+                exc.stderr or response_body,
+                self.config.bot_token,
+            )
+            suffix = f": {detail[:500]}" if detail else ""
+            ambiguous_http = http_status == 408 or (
+                http_status is not None and http_status >= 500
+            )
+            raise TelegramUploadError(
+                "Telegram text notification command failed with exit code "
+                f"{exc.returncode}{suffix}",
+                uncertain=ambiguous_http
+                or exc.returncode not in {3, 5, 6, 7, 22, 60, 77},
+            ) from None
+
+        response_body, _ = _split_curl_output(completed.stdout)
+        try:
+            payload = json.loads(response_body)
+        except json.JSONDecodeError as exc:
+            response = _redact_bot_token(
+                response_body[:200],
+                self.config.bot_token,
+            )
+            raise TelegramUploadError(
+                f"Telegram returned non-JSON response: {response}",
+                uncertain=True,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise TelegramUploadError(
+                "Telegram returned a non-object response",
+                uncertain=True,
+            )
+        if not payload.get("ok"):
+            error_payload = _redact_bot_token(
+                str(payload),
+                self.config.bot_token,
+            )
+            raise TelegramUploadError(
+                f"Telegram text notification failed: {error_payload}"
+            )
+        try:
+            return int(payload["result"]["message_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TelegramUploadError(
+                "Telegram reported success without a valid message_id",
+                uncertain=True,
+            ) from exc
+
+
 class TelegramUploader:
     def __init__(self, config: TelegramConfig):
         self.config = config

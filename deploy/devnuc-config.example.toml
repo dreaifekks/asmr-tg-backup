@@ -71,6 +71,22 @@ max_upload_bytes = 52428800
 upload_timeout_seconds = 7200
 caption_template = "{title}\n\n{url}\n\n#{tag}"
 
+# Experimental anonymous YouTube membership discovery and text notifications.
+# This path never accepts cookies/auth arguments and never queues downloads.
+# origin_ids is an explicit allowlist of disabled, dev-only YouTube uploads or
+# vod_after_live origins declared above. Keep both switches false by default.
+[dev.youtube_membership]
+enabled = false
+notify = false
+origin_ids = []
+yt_dlp = "/home/your-user/dev/asmr-tg-backup/.venv/bin/yt-dlp"
+poll_interval_seconds = 1800
+request_timeout_seconds = 180
+request_spacing_seconds = 5.0
+tab_limit = 30
+# Leave empty to use telegram.chat_id when notify=true.
+chat_id = ""
+
 # Configure the user service with a mode-0600 EnvironmentFile containing
 # TWITCH_CLIENT_ID and either TWITCH_ACCESS_TOKEN or TWITCH_CLIENT_SECRET.
 [twitch]

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add a default-off `[dev.youtube_membership]` workflow for anonymous,
+  metadata-only YouTube membership lifecycle observation and optional Telegram
+  text notifications, isolated from production origins, download jobs, cookies,
+  and user yt-dlp configuration.
+- Move the standalone multi-day membership surface observer under the
+  development package while retaining its previous module path as a
+  compatibility entry point.
+
 ## 0.3.2 - 2026-08-02
 
 - Preserve compatible source audio when preparing Telegram audio from a video

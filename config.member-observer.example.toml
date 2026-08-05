@@ -1,0 +1,25 @@
+[observer]
+# Development-only, anonymous, metadata-only observer. It never downloads media
+# and rejects authentication/cookie arguments.
+# Relative paths resolve from this config file's directory.
+data_dir = "work/member-observer"
+yt_dlp = ".venv/bin/yt-dlp"
+poll_interval_seconds = 1800
+request_timeout_seconds = 180
+request_spacing_seconds = 5
+tab_limit = 30
+anonymous_tabs = ["streams", "videos"]
+anonymous_members_playlist = true
+seed_probe_keyword_limit_per_channel = 5
+retry_probe_limit_per_channel = 5
+pause_hours_on_challenge = 6
+# Required for the long-running `run` command. Set this to a future UTC deadline.
+# stop_at = "2026-08-01T12:00:00Z"
+log_level = "INFO"
+
+[[channels]]
+# Replace all three values before the first observation.
+id = "replace-me"
+name = "Replace Me"
+channel_id = "UC_REPLACE_WITH_CHANNEL_ID"
+enabled = true

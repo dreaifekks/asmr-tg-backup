@@ -104,6 +104,31 @@ class StoreV2Test(unittest.TestCase):
             self.assertTrue(store.delete_control_origin(twitch.id))
             self.assertIsNotNone(store.conn.execute("SELECT 1 FROM origins WHERE id='config-yt'").fetchone())
 
+    def test_deleting_last_eligible_origin_cancels_its_pending_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            origin = Origin(
+                "db:youtube:uploads:member",
+                "youtube",
+                "uploads",
+                "Member",
+                "UC-member",
+            )
+            store.upsert_control_origin(origin, created_by="123")
+            store.upsert_discovered(
+                origin.id,
+                candidate("youtube", "member-video"),
+            )
+
+            self.assertTrue(store.delete_control_origin(origin.id))
+            row = store.conn.execute(
+                "SELECT state, reason_code FROM jobs WHERE job_type='download'"
+            ).fetchone()
+
+            self.assertEqual(tuple(row), ("cancelled", "origin_deleted"))
+            self.assertEqual(store.media_origins(1), [])
+
     def test_control_twitch_recording_mode_preserves_options_and_invalidates_poll_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.db")

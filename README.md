@@ -6,8 +6,9 @@ the archived files to Telegram. The built-in providers are YouTube official
 channel feeds, generic RSS feeds, and Twitch VOD/live discovery through the
 Helix API.
 
-YouTube members-only discovery and authentication are outside the main worker's
-public-origin path.
+YouTube members-only media remains outside the production download path. An
+explicitly enabled, anonymous metadata notification experiment is available
+under `[dev.youtube_membership]`; it does not authenticate or download media.
 
 ## Agent quick start
 
@@ -80,6 +81,80 @@ The legacy `[[channels]]` and `[[feeds]]` config forms remain accepted and are
 translated to origins at load time. The Telegram control panel manages dynamic
 YouTube and Twitch origins; the old `/sub` commands remain as YouTube-compatible
 aliases.
+
+## Development YouTube membership notifications
+
+`[dev.youtube_membership]` is a default-off, anonymous experiment for learning
+when member videos, upcoming streams, live starts, and stream ends appear on
+public YouTube surfaces. It checks the channel Atom feed, `streams` tab, and
+the automatically maintained `UUMO...` members playlist, then uses a
+metadata-only yt-dlp probe.
+
+This path is deliberately isolated from normal origins after it selects its
+channel allowlist:
+
+- it writes to `<data_dir>/dev/youtube-membership.db`, never the main
+  `state.db`;
+- it cannot create download or Telegram media-delivery jobs;
+- the production worker skips reserved channel IDs and cancels old queued
+  download/delivery jobs for them before any external media action;
+- it does not accept cookies, browser profiles, authentication, arbitrary
+  extractor arguments, or a download switch;
+- it ignores `[download].extra_args` and every yt-dlp call includes
+  `--ignore-config`, so a user-level yt-dlp config cannot add cookies silently;
+- optional Telegram output is text only and does not require
+  `telegram.enabled = true`.
+
+Declare a dedicated, disabled YouTube origin, then allowlist its ID. Requiring
+`enabled = false` prevents the production source worker from polling the same
+channel and creating download jobs:
+
+```toml
+[[origins]]
+id = "youtube-member-test"
+provider = "youtube"
+kind = "uploads"
+name = "Member test channel"
+external_id = "UC_CHANNEL_ID"
+enabled = false
+
+[dev.youtube_membership]
+enabled = true
+notify = false
+origin_ids = ["youtube-member-test"]
+yt_dlp = "yt-dlp"
+poll_interval_seconds = 1800
+request_timeout_seconds = 180
+request_spacing_seconds = 5.0
+tab_limit = 30
+chat_id = ""
+```
+
+Run one silent baseline and inspect the separate state before enabling text
+notifications:
+
+```bash
+asmr-tg-backup dev youtube-membership once --config config.toml
+asmr-tg-backup dev youtube-membership status --config config.toml
+```
+
+The first successful snapshot of each surface is baseline-only and does not
+send historical discoveries. After verifying it, set `notify = true` and
+configure `telegram.bot_token` plus either `dev.youtube_membership.chat_id` or
+`telegram.chat_id`. Keep `telegram.enabled = false` if normal downloaded media
+must not be delivered. The normal `asmr-tg-backup run` command starts this dev
+observer in its own thread when `enabled = true`; it can also run alone:
+
+```bash
+asmr-tg-backup dev youtube-membership run --config config.toml
+```
+
+Rate-limit and bot-check signals pause all dev YouTube requests for six hours.
+Removed/private/unavailable items stop immediately, while transient probe
+errors, including generic `no_formats`, stop after five attempts. Telegram
+results with uncertain delivery are not retried automatically. See
+[`docs/youtube-membership-dev.md`](docs/youtube-membership-dev.md) for the state
+model and the separate long-form observer.
 
 ## Twitch API credentials
 

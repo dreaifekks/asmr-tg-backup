@@ -141,6 +141,14 @@ class BackupService:
                 ),
             )
         )
+        if self.config.dev.youtube_membership.enabled:
+            workers.append(
+                threading.Thread(
+                    target=self._dev_youtube_membership_loop,
+                    name="dev-youtube-membership",
+                    daemon=True,
+                )
+            )
         if self.config.control.enabled:
             workers.append(
                 threading.Thread(
@@ -209,7 +217,23 @@ class BackupService:
         active_store = store or self.store
         active_sources = sources or self.sources
         source_filter_pattern, source_filter = self._compiled_source_filter(active_store)
+        dev_membership_channel_ids = {
+            configured.external_id
+            for configured in self.config.origins
+            if configured.id in self.config.dev.youtube_membership.origin_ids
+        }
         for origin in self._all_origins(active_store):
+            if (
+                self.config.dev.youtube_membership.enabled
+                and origin.provider == "youtube"
+                and origin.external_id in dev_membership_channel_ids
+            ):
+                self.logger.debug(
+                    "origin reserved for dev membership observer; production "
+                    "poll skipped id=%s",
+                    origin.id,
+                )
+                continue
             if not origin.enabled:
                 self.logger.debug("origin disabled id=%s", origin.id)
                 continue
@@ -484,6 +508,35 @@ class BackupService:
                 if store is not None:
                     store.close()
 
+    def _dev_youtube_membership_loop(self) -> None:
+        # Keep the experimental observer out of the production source, Store,
+        # Downloader and job paths. The import is intentionally lazy so a
+        # disabled dev feature has no runtime side effects.
+        while not self._stop_event.is_set():
+            runner = None
+            try:
+                from .dev.youtube_membership import YoutubeMembershipDevRunner
+
+                runner = YoutubeMembershipDevRunner(
+                    self.config,
+                    stop_event=self._stop_event,
+                )
+                runner.run_forever()
+            except Exception:
+                self.logger.exception(
+                    "dev YouTube membership worker crashed; reconnecting"
+                )
+            finally:
+                if runner is not None:
+                    try:
+                        runner.close()
+                    except Exception:
+                        self.logger.exception(
+                            "could not close dev YouTube membership runner"
+                        )
+            if not self._stop_event.is_set():
+                self._stop_event.wait(10)
+
     def _process_available(
         self,
         store: Store,
@@ -608,6 +661,16 @@ class BackupService:
 
         source_filter_pattern, source_filter = self._compiled_source_filter(store)
         origin_rows = store.media_origins(job.media_id)
+        if self._media_reserved_for_dev_membership(media, origin_rows):
+            store.cancel_job(
+                job,
+                reason_code="dev_membership_reserved",
+                error=(
+                    "YouTube media is reserved for the anonymous dev membership "
+                    "observer or has no retained eligible origin provenance"
+                ),
+            )
+            return
         if source_filter is not None and not any(
             text_matches_source_filter(source_filter, row["id"], row["name"], media["title"])
             for row in origin_rows
@@ -918,6 +981,19 @@ class BackupService:
         if media is None:
             store.block_job(job, reason_code="media_missing", error="media item no longer exists")
             return
+        if self._media_reserved_for_dev_membership(
+            media,
+            store.media_origins(job.media_id),
+        ):
+            store.cancel_job(
+                job,
+                reason_code="dev_membership_reserved",
+                error=(
+                    "YouTube media is reserved for the anonymous dev membership "
+                    "observer or has no retained eligible origin provenance"
+                ),
+            )
+            return
         if artifact is None or artifact["state"] != "ready" or not Path(str(artifact["path"])).exists():
             try:
                 metadata = json.loads(str(media["metadata_json"] or "{}"))
@@ -1202,6 +1278,36 @@ class BackupService:
         age = (datetime.now(timezone.utc) - first_seen.astimezone(timezone.utc)).total_seconds()
         return age >= self.config.app.download_delay_seconds
 
+    def _media_reserved_for_dev_membership(
+        self,
+        media: sqlite3.Row,
+        origin_rows: list[sqlite3.Row],
+    ) -> bool:
+        if (
+            not self.config.dev.youtube_membership.enabled
+            or str(media["provider"]) != "youtube"
+        ):
+            return False
+        selected_channel_ids = {
+            origin.external_id
+            for origin in self.config.origins
+            if origin.id in self.config.dev.youtube_membership.origin_ids
+        }
+        eligible_rows = [
+            row for row in origin_rows if str(row["disposition"]) == "eligible"
+        ]
+        if not eligible_rows:
+            # Older databases may already contain orphaned work from origins
+            # deleted before origin cleanup cancelled their jobs. While this
+            # safety-sensitive dev mode is enabled, fail closed rather than
+            # run an anonymous-unverifiable YouTube job with production args.
+            return True
+        return any(
+            str(row["provider"]) == "youtube"
+            and str(row["external_id"]) in selected_channel_ids
+            for row in origin_rows
+        )
+
     def _log_startup_warnings(self) -> None:
         missing = self.downloader.check_tools()
         if missing:
@@ -1212,6 +1318,12 @@ class BackupService:
             self.logger.warning("%s", exc)
         if self.config.control.enabled and not self.config.control.allowed_user_ids:
             self.logger.warning("control bot has no allowed_user_ids; chat-only authorization permits every member of an allowed chat")
+        if self.config.dev.youtube_membership.enabled:
+            self.logger.warning(
+                "DEV YouTube membership observer enabled: selected channels are "
+                "excluded from production polling; the dev path uses anonymous "
+                "metadata/text notifications only and never downloads media"
+            )
 
     def _source_filter_pattern(self, store: Store | None = None) -> str | None:
         pattern = (store or self.store).get_bot_state(SOURCE_FILTER_STATE_KEY)

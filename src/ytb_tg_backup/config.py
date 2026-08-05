@@ -7,7 +7,7 @@ import tomllib
 from typing import Any
 
 from .models import Origin
-from .youtube import youtube_channel_feed_url
+from .youtube import is_channel_id, youtube_channel_feed_url
 
 
 @dataclass(frozen=True)
@@ -121,6 +121,26 @@ class ControlConfig:
 
 
 @dataclass(frozen=True)
+class DevYoutubeMembershipConfig:
+    enabled: bool = False
+    notify: bool = False
+    origin_ids: list[str] = field(default_factory=list)
+    yt_dlp: str = "yt-dlp"
+    poll_interval_seconds: int = 1800
+    request_timeout_seconds: int = 180
+    request_spacing_seconds: float = 5.0
+    tab_limit: int = 30
+    chat_id: str = ""
+
+
+@dataclass(frozen=True)
+class DevConfig:
+    youtube_membership: DevYoutubeMembershipConfig = field(
+        default_factory=DevYoutubeMembershipConfig
+    )
+
+
+@dataclass(frozen=True)
 class Config:
     path: Path
     rsshub: RsshubConfig
@@ -132,6 +152,7 @@ class Config:
     control: ControlConfig
     origins: list[Origin] = field(default_factory=list)
     twitch: TwitchConfig = field(default_factory=TwitchConfig)
+    dev: DevConfig = field(default_factory=DevConfig)
 
     @property
     def db_path(self) -> Path:
@@ -178,7 +199,10 @@ def load_config(path: str | Path) -> Config:
             id=str(item["id"]),
             name=str(item.get("name") or item["id"]),
             channel_id=str(item["channel_id"]),
-            enabled=bool(item.get("enabled", True)),
+            enabled=_strict_bool(
+                item.get("enabled", True),
+                label=f"channel {item['id']!r} enabled",
+            ),
             routes=[str(route).strip("/") for route in item.get("routes", ["channel"])],
         )
         for item in raw.get("channels", [])
@@ -189,7 +213,10 @@ def load_config(path: str | Path) -> Config:
             id=str(item["id"]),
             name=str(item.get("name") or item["id"]),
             url=str(item["url"]),
-            enabled=bool(item.get("enabled", True)),
+            enabled=_strict_bool(
+                item.get("enabled", True),
+                label=f"feed {item['id']!r} enabled",
+            ),
         )
         for item in raw.get("feeds", [])
     ]
@@ -281,6 +308,19 @@ def load_config(path: str | Path) -> Config:
     )
 
     origins = _load_origins(raw.get("origins", []), channels, raw_feeds)
+    dev = _load_dev_config(raw.get("dev", {}), origins, telegram)
+    if dev.youtube_membership.enabled:
+        ambiguous_auth_sections = sorted(
+            str(key)
+            for key in raw
+            if "auth" in str(key).lower() or "cookie" in str(key).lower()
+        )
+        if ambiguous_auth_sections:
+            raise ValueError(
+                "dev.youtube_membership is anonymous-only; unsupported top-level "
+                "authentication/cookie section(s): "
+                + ", ".join(ambiguous_auth_sections)
+            )
 
     return Config(
         path=config_path,
@@ -293,6 +333,7 @@ def load_config(path: str | Path) -> Config:
         control=control,
         origins=origins,
         twitch=twitch,
+        dev=dev,
     )
 
 
@@ -338,7 +379,10 @@ def _load_origins(
                 kind=kind,
                 name=str(item.get("name") or origin_id),
                 external_id=external_id,
-                enabled=bool(item.get("enabled", True)),
+                enabled=_strict_bool(
+                    item.get("enabled", True),
+                    label=f"origin {origin_id!r} enabled",
+                ),
                 bootstrap=bootstrap,
                 credential_ref=str(item["credential_ref"]) if item.get("credential_ref") else None,
                 options=options,
@@ -399,6 +443,173 @@ def _strict_bool(value: object, *, label: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{label} must be true or false")
     return value
+
+
+def _load_dev_config(
+    raw_dev: object,
+    origins: list[Origin],
+    telegram: TelegramConfig,
+) -> DevConfig:
+    if not isinstance(raw_dev, dict):
+        raise ValueError("dev must be a table")
+    _reject_unknown_keys(raw_dev, {"youtube_membership"}, label="dev")
+
+    raw_membership = raw_dev.get("youtube_membership", {})
+    if not isinstance(raw_membership, dict):
+        raise ValueError("dev.youtube_membership must be a table")
+    _reject_unknown_keys(
+        raw_membership,
+        {
+            "enabled",
+            "notify",
+            "origin_ids",
+            "yt_dlp",
+            "poll_interval_seconds",
+            "request_timeout_seconds",
+            "request_spacing_seconds",
+            "tab_limit",
+            "chat_id",
+        },
+        label="dev.youtube_membership",
+    )
+
+    origin_ids = _strict_string_list(
+        raw_membership.get("origin_ids", []),
+        label="dev.youtube_membership.origin_ids",
+    )
+    enabled = _strict_bool(
+        raw_membership.get("enabled", False),
+        label="dev.youtube_membership.enabled",
+    )
+    notify = _strict_bool(
+        raw_membership.get("notify", False),
+        label="dev.youtube_membership.notify",
+    )
+    membership = DevYoutubeMembershipConfig(
+        enabled=enabled,
+        notify=notify,
+        origin_ids=origin_ids,
+        yt_dlp=str(raw_membership.get("yt_dlp", "yt-dlp")).strip(),
+        poll_interval_seconds=max(
+            300,
+            int(raw_membership.get("poll_interval_seconds", 1800)),
+        ),
+        request_timeout_seconds=max(
+            30,
+            int(raw_membership.get("request_timeout_seconds", 180)),
+        ),
+        request_spacing_seconds=max(
+            0.0,
+            float(raw_membership.get("request_spacing_seconds", 5.0)),
+        ),
+        tab_limit=max(1, min(100, int(raw_membership.get("tab_limit", 30)))),
+        chat_id=str(raw_membership.get("chat_id", "")).strip(),
+    )
+
+    if not membership.yt_dlp:
+        raise ValueError("dev.youtube_membership.yt_dlp must not be empty")
+
+    if membership.notify and not membership.enabled:
+        raise ValueError(
+            "dev.youtube_membership.notify=true requires enabled=true"
+        )
+    if membership.enabled:
+        if not membership.origin_ids:
+            raise ValueError(
+                "dev.youtube_membership.enabled=true requires at least one origin_id"
+            )
+        origins_by_id = {origin.id: origin for origin in origins}
+        selected_channel_ids: dict[str, str] = {}
+        for origin_id in membership.origin_ids:
+            origin = origins_by_id.get(origin_id)
+            if origin is None:
+                raise ValueError(
+                    "dev.youtube_membership origin_id does not exist: "
+                    f"{origin_id}"
+                )
+            if (
+                origin.enabled
+                or origin.provider != "youtube"
+                or origin.kind not in {"uploads", "vod_after_live"}
+            ):
+                raise ValueError(
+                    "dev.youtube_membership origin_id must reference a disabled "
+                    "dev-only YouTube uploads or vod_after_live origin: "
+                    f"{origin_id}"
+                )
+            if not is_channel_id(origin.external_id):
+                raise ValueError(
+                    "dev.youtube_membership origin_id must use a resolved UC "
+                    f"channel ID: {origin_id}"
+                )
+            unsupported_options = sorted(
+                key for key in origin.options if key != "routes"
+            )
+            if origin.credential_ref or unsupported_options:
+                details = [*unsupported_options]
+                if origin.credential_ref:
+                    details.append("credential_ref")
+                raise ValueError(
+                    "dev.youtube_membership selected origins are anonymous-only; "
+                    f"unsupported option(s) on {origin_id}: "
+                    + ", ".join(sorted(details))
+                )
+            previous_origin_id = selected_channel_ids.get(origin.external_id)
+            if previous_origin_id:
+                raise ValueError(
+                    "dev.youtube_membership selected origins must reference "
+                    "unique YouTube channels: "
+                    f"{previous_origin_id}, {origin_id}"
+                )
+            selected_channel_ids[origin.external_id] = origin_id
+
+        production_conflicts = sorted(
+            origin.id
+            for origin in origins
+            if origin.enabled
+            and origin.provider == "youtube"
+            and origin.external_id in selected_channel_ids
+        )
+        if production_conflicts:
+            raise ValueError(
+                "dev.youtube_membership channels must not also appear in enabled "
+                "production YouTube origins: "
+                + ", ".join(production_conflicts)
+            )
+    if membership.notify:
+        if not telegram.bot_token.strip():
+            raise ValueError(
+                "dev.youtube_membership.notify=true requires telegram.bot_token"
+            )
+        if not (membership.chat_id or telegram.chat_id.strip()):
+            raise ValueError(
+                "dev.youtube_membership.notify=true requires "
+                "dev.youtube_membership.chat_id or telegram.chat_id"
+            )
+
+    return DevConfig(youtube_membership=membership)
+
+
+def _reject_unknown_keys(
+    raw: dict[str, Any],
+    allowed: set[str],
+    *,
+    label: str,
+) -> None:
+    unknown = sorted(str(key) for key in raw if key not in allowed)
+    if unknown:
+        raise ValueError(f"unsupported {label} option(s): {', '.join(unknown)}")
+
+
+def _strict_string_list(value: object, *, label: str) -> list[str]:
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ValueError(f"{label} must be an array of non-empty strings")
+    result = [item.strip() for item in value]
+    if len(result) != len(set(result)):
+        raise ValueError(f"{label} must not contain duplicate values")
+    return result
 
 
 def _load_download_profiles(raw_profiles: dict[str, Any]) -> dict[str, DownloadProfile]:

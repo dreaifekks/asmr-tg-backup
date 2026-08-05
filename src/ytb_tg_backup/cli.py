@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import signal
 import sys
+import threading
 
 from .config import load_config
 from .service import BackupService
@@ -42,9 +44,40 @@ def main(argv: list[str] | None = None) -> int:
     enqueue_parser.add_argument("--feed-name", default="Manual")
     enqueue_parser.add_argument("--title")
 
+    dev_parser = subparsers.add_parser(
+        "dev",
+        help="Run isolated development-only tools",
+    )
+    dev_tools = dev_parser.add_subparsers(dest="dev_tool", required=True)
+    membership_parser = dev_tools.add_parser(
+        "youtube-membership",
+        help="Observe anonymous YouTube membership metadata without downloads",
+    )
+    membership_commands = membership_parser.add_subparsers(
+        dest="dev_action",
+        required=True,
+    )
+    for action in ("once", "run", "status"):
+        action_parser = membership_commands.add_parser(action)
+        _add_late_config(action_parser)
+        if action == "status":
+            action_parser.add_argument("--limit", type=int, default=20)
+
     args = parser.parse_args(argv)
     config = load_config(args.config)
     _configure_logging(config.app.log_level)
+
+    if args.command == "dev":
+        if args.dev_tool != "youtube-membership":
+            parser.error("unknown dev tool")
+        if (
+            args.dev_action in {"once", "run"}
+            and not config.dev.youtube_membership.enabled
+        ):
+            parser.error(
+                "dev.youtube_membership.enabled=true is required for this command"
+            )
+        return _run_dev_youtube_membership(config, args)
 
     service = BackupService(config)
     if args.command == "init":
@@ -96,6 +129,47 @@ def _configure_logging(level: str) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
+
+
+def _run_dev_youtube_membership(config, args) -> int:
+    # This command deliberately does not construct BackupService: the dev
+    # runner owns separate state and never enters the production Store or
+    # Downloader paths.
+    from .dev.youtube_membership import YoutubeMembershipDevRunner
+
+    stop_event = threading.Event()
+    runner = YoutubeMembershipDevRunner(config, stop_event=stop_event)
+    try:
+        if args.dev_action == "once":
+            print(json.dumps(runner.run_once(), ensure_ascii=False, indent=2))
+            return 0
+        if args.dev_action == "status":
+            print(
+                json.dumps(
+                    runner.status(limit=max(1, args.limit)),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.dev_action == "run":
+            previous_handlers: dict[signal.Signals, object] = {}
+
+            def request_stop(_signum, _frame) -> None:
+                stop_event.set()
+
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                previous_handlers[sig] = signal.getsignal(sig)
+                signal.signal(sig, request_stop)
+            try:
+                runner.run_forever()
+            finally:
+                for sig, handler in previous_handlers.items():
+                    signal.signal(sig, handler)
+            return 0
+        raise ValueError(f"unsupported dev action: {args.dev_action}")
+    finally:
+        runner.close()
 
 
 def _print_status(config, limit: int) -> None:
