@@ -1392,6 +1392,112 @@ class TwitchLiveServiceTest(unittest.TestCase):
                 self.assertEqual(live_deliveries, 1)
                 service.store.close()
 
+    def test_matching_live_completion_does_not_revive_panel_purged_vod(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            service = self._service(
+                tmp_path,
+                include_vod_origin=True,
+                download_delay_seconds=0,
+            )
+            download_root = service.config.download_dir
+            download_root.mkdir(parents=True, exist_ok=True)
+            stream_id = "purged-vod-stream"
+            vod_media_id, _ = service.store.upsert_discovered(
+                "twitch-vod",
+                _vod_candidate(stream_id),
+            )
+            vod_job = service.store.claim_next_job(
+                ("download",),
+                owner="standard-worker",
+                lease_seconds=60,
+                download_lane="standard",
+            )
+            self.assertIsNotNone(vod_job)
+            self.assertEqual(vod_job.media_id, vod_media_id)
+            vod_path = download_root / "purged-vod.mp4"
+            vod_path.write_bytes(b"vod archive")
+            vod_artifact_id = service.store.complete_download(
+                vod_job,
+                path=vod_path,
+                size_bytes=vod_path.stat().st_size,
+            )
+            vod_detail = service.store.get_disk_resource(
+                vod_artifact_id,
+                download_root,
+            )
+            self.assertIsNotNone(vod_detail)
+
+            purge = service.store.purge_disk_resource(
+                vod_artifact_id,
+                download_root,
+                expected_revision=str(
+                    vod_detail["resource_revision"]
+                ),
+            )
+
+            self.assertTrue(purge["completed"])
+            self.assertFalse(vod_path.exists())
+            self.assertEqual(
+                service.store.get_artifact(vod_media_id)["state"],
+                "purged",
+            )
+            self.assertEqual(
+                service.store.list_disk_resources(download_root)["total"],
+                0,
+            )
+
+            live_media_id, _ = service.store.upsert_discovered(
+                "twitch-live",
+                _live_candidate(stream_id),
+                job_payload={
+                    "download_lane": "live",
+                    "recording_mode": "live",
+                },
+            )
+            live_job = service.store.claim_next_job(
+                ("download",),
+                owner="live-worker",
+                lease_seconds=60,
+                download_lane="live",
+            )
+            self.assertIsNotNone(live_job)
+            self.assertEqual(live_job.media_id, live_media_id)
+            live_path = download_root / "matching-live.ts"
+            live_path.write_bytes(b"live archive")
+            live_artifact_id = service.store.complete_download(
+                live_job,
+                path=live_path,
+                size_bytes=live_path.stat().st_size,
+            )
+
+            self.assertEqual(
+                service.store.get_artifact(vod_media_id)["state"],
+                "purged",
+            )
+            self.assertIsNone(
+                service.store.get_disk_resource(
+                    vod_artifact_id,
+                    download_root,
+                )
+            )
+            library = service.store.list_disk_resources(download_root)
+            self.assertEqual(library["total"], 1)
+            self.assertEqual(len(library["items"]), 1)
+            self.assertEqual(
+                library["items"][0]["artifact_id"],
+                live_artifact_id,
+            )
+            self.assertEqual(
+                library["items"][0]["media_id"],
+                live_media_id,
+            )
+            self.assertEqual(
+                library["items"][0]["content_kind"],
+                "live_stream",
+            )
+            service.store.close()
+
     def test_delivered_vod_suppresses_later_live_delivery(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
