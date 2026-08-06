@@ -143,7 +143,10 @@ so it does not depend on email delivery or require a public webhook. Twitch
 also offers the near-real-time EventSub `stream.online` event, but WebSocket
 subscriptions require a user access token and still need a Get Streams
 reconciliation after disconnects; EventSub is not required for this polling
-mode.
+mode. Origins configured with a Twitch login persist the resolved numeric
+broadcaster ID in their SQLite checkpoint and refresh that lookup on the first
+successful poll at or after 12:00 Asia/Tokyo each day; the faster Get Streams
+schedule reuses the cached ID.
 
 Live jobs skip `[app].download_delay_seconds` and do not occupy the normal
 download/Telegram worker lane. `live_download_timeout_seconds = 0` allows a

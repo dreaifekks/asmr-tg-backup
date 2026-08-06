@@ -6,6 +6,7 @@ import json
 import re
 import socket
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
@@ -15,6 +16,14 @@ from .config import TwitchConfig
 from .feed import fetch_feed, parse_feed
 from .models import DiscoveryResult, MediaCandidate, Origin
 from .youtube import youtube_channel_feed_url
+
+
+TOKYO_TIMEZONE = timezone(timedelta(hours=9), name="Asia/Tokyo")
+TWITCH_USER_CACHE_FIELDS = (
+    "broadcaster_lookup",
+    "broadcaster_id",
+    "broadcaster_refresh_after",
+)
 
 
 class SourceError(RuntimeError):
@@ -110,9 +119,20 @@ class TwitchHelixSource:
 
     def discover(self, origin: Origin, checkpoint: str | None = None) -> DiscoveryResult:
         self._validate_config()
-        user_id = self._resolve_user_id(origin.external_id)
+        previous = _decode_twitch_checkpoint(checkpoint)
+        user_id, refreshed_user_cache = self._resolve_user_id(
+            origin.external_id,
+            previous,
+        )
+        previous.update(refreshed_user_cache)
         if origin.kind == "vods" and twitch_recording_mode(origin, self.config) == "live":
-            return self._discover_live(origin, user_id, checkpoint)
+            return self._discover_live(
+                origin,
+                user_id,
+                checkpoint,
+                previous,
+                user_cache_refreshed=bool(refreshed_user_cache),
+            )
 
         video_type = {
             "vods": "archive",
@@ -122,7 +142,6 @@ class TwitchHelixSource:
         if video_type is None:
             raise SourceError(f"unsupported Twitch origin kind: {origin.kind}", code="invalid_origin")
 
-        previous = _decode_twitch_checkpoint(checkpoint)
         previous_id = str(previous.get("external_id") or "")
         items: list[MediaCandidate] = []
         newest_checkpoint: dict[str, str] | None = None
@@ -150,6 +169,7 @@ class TwitchHelixSource:
                     break
                 if newest_checkpoint is None:
                     newest_checkpoint = {
+                        **_twitch_user_cache(previous),
                         "external_id": external_id,
                         "published_at": published_at or "",
                     }
@@ -199,11 +219,21 @@ class TwitchHelixSource:
         origin: Origin,
         user_id: str,
         checkpoint: str | None,
+        previous: dict[str, str],
+        *,
+        user_cache_refreshed: bool,
     ) -> DiscoveryResult:
         payload = self._api_json("streams", {"user_id": user_id, "first": "1"})
         streams = _payload_list(payload, "data")
         if not streams:
-            return DiscoveryResult(items=[], cursor=checkpoint)
+            return DiscoveryResult(
+                items=[],
+                cursor=(
+                    _encode_twitch_checkpoint(previous)
+                    if user_cache_refreshed
+                    else checkpoint
+                ),
+            )
         raw = streams[0]
         if not isinstance(raw, dict):
             raise SourceError("Twitch API returned an invalid stream item", code="invalid_response")
@@ -215,6 +245,7 @@ class TwitchHelixSource:
             raise SourceError("Twitch API returned an incomplete stream item", code="invalid_response")
 
         next_checkpoint = {
+            **_twitch_user_cache(previous),
             "external_id": stream_id,
             "published_at": started_at or "",
         }
@@ -248,20 +279,51 @@ class TwitchHelixSource:
             cursor=_encode_twitch_checkpoint(next_checkpoint),
         )
 
-    def _resolve_user_id(self, value: str) -> str:
+    def _resolve_user_id(
+        self,
+        value: str,
+        checkpoint: dict[str, str],
+    ) -> tuple[str, dict[str, str]]:
         candidate = value.strip()
         if candidate.isdigit():
-            return candidate
+            return candidate, {}
         login = candidate.removeprefix("@").lower()
         if not re.fullmatch(r"[a-z0-9_]{1,25}", login):
             raise SourceError("invalid Twitch broadcaster id or login", code="invalid_origin")
-        payload = self._api_json("users", {"login": login})
-        users = _payload_list(payload, "data")
-        if users and not isinstance(users[0], dict):
-            raise SourceError("Twitch API returned an invalid user item", code="invalid_response")
-        if not users or not users[0].get("id"):
-            raise SourceError(f"Twitch broadcaster not found: {login}", code="not_found")
-        return str(users[0]["id"])
+        now = datetime.now(timezone.utc)
+        cached_user_id = str(checkpoint.get("broadcaster_id") or "")
+        cache_matches = (
+            checkpoint.get("broadcaster_lookup") == login
+            and cached_user_id.isdigit()
+        )
+        refresh_after = _parse_utc_datetime(
+            checkpoint.get("broadcaster_refresh_after")
+        )
+        if cache_matches and refresh_after is not None and now < refresh_after:
+            return cached_user_id, {}
+        try:
+            payload = self._api_json("users", {"login": login})
+            users = _payload_list(payload, "data")
+            if users and not isinstance(users[0], dict):
+                raise SourceError(
+                    "Twitch API returned an invalid user item",
+                    code="invalid_response",
+                )
+            if not users or not users[0].get("id"):
+                raise SourceError(
+                    f"Twitch broadcaster not found: {login}",
+                    code="not_found",
+                )
+            user_id = str(users[0]["id"])
+        except SourceError:
+            if not cache_matches:
+                raise
+            return cached_user_id, _new_twitch_user_cache(
+                login,
+                cached_user_id,
+                now,
+            )
+        return user_id, _new_twitch_user_cache(login, user_id, now)
 
     def _validate_config(self) -> None:
         if not self.config.client_id or not (self._access_token or self.config.client_secret):
@@ -448,6 +510,46 @@ def _int_header(headers: object, name: str) -> int | None:
         return None
 
 
+def _parse_utc_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _next_tokyo_noon(now: datetime) -> datetime:
+    tokyo_now = now.astimezone(TOKYO_TIMEZONE)
+    next_noon = tokyo_now.replace(hour=12, minute=0, second=0, microsecond=0)
+    if tokyo_now >= next_noon:
+        next_noon += timedelta(days=1)
+    return next_noon.astimezone(timezone.utc)
+
+
+def _new_twitch_user_cache(
+    login: str,
+    user_id: str,
+    now: datetime,
+) -> dict[str, str]:
+    return {
+        "broadcaster_lookup": login,
+        "broadcaster_id": user_id,
+        "broadcaster_refresh_after": _next_tokyo_noon(now).isoformat(),
+    }
+
+
+def _twitch_user_cache(value: dict[str, str]) -> dict[str, str]:
+    return {
+        field: value[field]
+        for field in TWITCH_USER_CACHE_FIELDS
+        if value.get(field)
+    }
+
+
 def _decode_twitch_checkpoint(value: str | None) -> dict[str, str]:
     if not value:
         return {}
@@ -459,20 +561,42 @@ def _decode_twitch_checkpoint(value: str | None) -> dict[str, str]:
         raise SourceError("stored Twitch checkpoint is not an object", code="invalid_checkpoint")
     external_id = str(payload.get("external_id") or "")
     published_at = str(payload.get("published_at") or "")
-    if not external_id:
+    user_cache = {
+        field: str(payload.get(field) or "")
+        for field in TWITCH_USER_CACHE_FIELDS
+        if payload.get(field)
+    }
+    if not external_id and not (
+        user_cache.get("broadcaster_lookup")
+        and user_cache.get("broadcaster_id")
+    ):
         raise SourceError("stored Twitch checkpoint has no external_id", code="invalid_checkpoint")
-    return {"external_id": external_id, "published_at": published_at}
+    result = {"external_id": external_id, "published_at": published_at}
+    result.update(user_cache)
+    return result
 
 
 def _encode_twitch_checkpoint(value: dict[str, str] | None) -> str | None:
-    if not value or not value.get("external_id"):
+    if not value:
         return None
+    external_id = str(value.get("external_id") or "")
+    user_cache = _twitch_user_cache(value)
+    if not external_id and not (
+        user_cache.get("broadcaster_lookup")
+        and user_cache.get("broadcaster_id")
+    ):
+        return None
+    payload: dict[str, object] = {**user_cache}
+    if external_id:
+        payload.update(
+            {
+                "external_id": external_id,
+                "published_at": value.get("published_at", ""),
+            }
+        )
+    payload["version"] = 2 if user_cache else 1
     return json.dumps(
-        {
-            "external_id": value["external_id"],
-            "published_at": value.get("published_at", ""),
-            "version": 1,
-        },
+        payload,
         separators=(",", ":"),
         sort_keys=True,
     )

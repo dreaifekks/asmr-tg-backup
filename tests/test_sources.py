@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import json
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
@@ -12,6 +13,7 @@ from ytb_tg_backup.sources import (
     SourceRegistry,
     TwitchHelixSource,
     YouTubePublicSource,
+    _next_tokyo_noon,
 )
 
 
@@ -53,6 +55,101 @@ def _video(video_id: str, *, published_at: str) -> dict[str, object]:
 
 
 class TwitchHelixSourceTest(unittest.TestCase):
+    def test_login_lookup_is_persisted_until_next_tokyo_noon(self):
+        source = TwitchHelixSource(
+            TwitchConfig(
+                client_id="client",
+                access_token="token",
+                recording_mode="live",
+            )
+        )
+        origin = Origin(
+            id="twitch-login-live",
+            provider="twitch",
+            kind="vods",
+            name="Twitch Login Live",
+            external_id="example_login",
+            options={"recording_mode": "live"},
+        )
+        responses = (
+            {"data": [{"id": "12345"}]},
+            {"data": [], "pagination": {}},
+            {"data": [], "pagination": {}},
+        )
+
+        with mock.patch.object(source, "_api_json", side_effect=responses) as api_json:
+            first = source.discover(origin)
+            second = source.discover(origin, first.cursor)
+
+        first_checkpoint = json.loads(first.cursor)
+        refresh_after = datetime.fromisoformat(
+            first_checkpoint["broadcaster_refresh_after"]
+        )
+        self.assertEqual(first_checkpoint["broadcaster_lookup"], "example_login")
+        self.assertEqual(first_checkpoint["broadcaster_id"], "12345")
+        self.assertEqual(first_checkpoint["version"], 2)
+        self.assertEqual(
+            (refresh_after.astimezone(timezone.utc).hour, refresh_after.minute),
+            (3, 0),
+        )
+        self.assertEqual(second.cursor, first.cursor)
+        self.assertEqual(
+            [call.args[0] for call in api_json.call_args_list],
+            ["users", "streams", "streams"],
+        )
+
+    def test_expired_login_lookup_refreshes_before_stream_poll(self):
+        source = TwitchHelixSource(
+            TwitchConfig(
+                client_id="client",
+                access_token="token",
+                recording_mode="live",
+            )
+        )
+        origin = Origin(
+            id="twitch-login-live",
+            provider="twitch",
+            kind="vods",
+            name="Twitch Login Live",
+            external_id="example_login",
+            options={"recording_mode": "live"},
+        )
+        checkpoint = json.dumps(
+            {
+                "broadcaster_lookup": "example_login",
+                "broadcaster_id": "11111",
+                "broadcaster_refresh_after": "2000-01-01T03:00:00+00:00",
+                "version": 2,
+            }
+        )
+
+        with mock.patch.object(
+            source,
+            "_api_json",
+            side_effect=(
+                {"data": [{"id": "22222"}]},
+                {"data": [], "pagination": {}},
+            ),
+        ) as api_json:
+            result = source.discover(origin, checkpoint)
+
+        refreshed = json.loads(result.cursor)
+        self.assertEqual(refreshed["broadcaster_id"], "22222")
+        self.assertEqual(
+            [call.args[0] for call in api_json.call_args_list],
+            ["users", "streams"],
+        )
+
+    def test_next_tokyo_noon_is_same_day_before_noon_and_next_day_at_noon(self):
+        self.assertEqual(
+            _next_tokyo_noon(datetime(2026, 7, 25, 2, 59, tzinfo=timezone.utc)),
+            datetime(2026, 7, 25, 3, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            _next_tokyo_noon(datetime(2026, 7, 25, 3, 0, tzinfo=timezone.utc)),
+            datetime(2026, 7, 26, 3, 0, tzinfo=timezone.utc),
+        )
+
     def test_login_lookup_rejects_non_object_user_items(self):
         source = TwitchHelixSource(TwitchConfig(client_id="client", access_token="token"))
         origin = Origin(
