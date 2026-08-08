@@ -7,7 +7,6 @@ from unittest import mock
 
 from ytb_tg_backup.config import TwitchConfig
 from ytb_tg_backup.models import Origin
-from ytb_tg_backup.proxy import build_url_opener
 from ytb_tg_backup.sources import (
     RssSource,
     SourceError,
@@ -21,20 +20,6 @@ from ytb_tg_backup.sources import (
 class _JsonResponse:
     def __init__(self, payload):
         self.body = json.dumps(payload).encode("utf-8")
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, traceback):
-        return False
-
-    def read(self, size: int = -1):
-        return self.body if size < 0 else self.body[:size]
-
-
-class _BytesResponse:
-    def __init__(self, body: bytes):
-        self.body = body
 
     def __enter__(self):
         return self
@@ -374,76 +359,6 @@ class RssSourceTest(unittest.TestCase):
 
 
 class SourceRegistryTest(unittest.TestCase):
-    def test_http_proxy_opener_is_isolated_and_covers_http_and_https(self):
-        child_opener = mock.Mock()
-        with mock.patch(
-            "ytb_tg_backup.proxy.build_opener",
-            return_value=child_opener,
-        ) as build_opener:
-            opener = build_url_opener("http://127.0.0.1:7890")
-
-        handler = build_opener.call_args.args[0]
-        self.assertEqual(
-            handler.proxies,
-            {
-                "http": "http://127.0.0.1:7890",
-                "https": "http://127.0.0.1:7890",
-            },
-        )
-        self.assertIs(opener, child_opener.open)
-
-    def test_registry_routes_youtube_feed_through_injected_opener(self):
-        feed = b"""
-<feed xmlns="http://www.w3.org/2005/Atom"
-      xmlns:yt="http://www.youtube.com/xml/schemas/2015">
-  <entry>
-    <yt:videoId>proxy-video</yt:videoId>
-    <title>Proxy video</title>
-    <link href="https://www.youtube.com/watch?v=proxy-video" />
-    <published>2026-08-08T00:00:00Z</published>
-  </entry>
-</feed>
-"""
-        opener = mock.Mock(return_value=_BytesResponse(feed))
-        registry = SourceRegistry(TwitchConfig(), opener=opener)
-
-        result = registry.get("youtube").discover(
-            Origin(
-                id="youtube-proxy",
-                provider="youtube",
-                kind="uploads",
-                name="YouTube Proxy",
-                external_id="UCabcdefghij1234567890",
-            )
-        )
-
-        self.assertEqual([item.external_id for item in result.items], ["proxy-video"])
-        request = opener.call_args.args[0]
-        self.assertEqual(
-            request.full_url,
-            "https://www.youtube.com/feeds/videos.xml?channel_id=UCabcdefghij1234567890",
-        )
-
-    def test_registry_routes_twitch_api_through_injected_opener(self):
-        opener = mock.Mock(
-            return_value=_JsonResponse(
-                {
-                    "data": [_video("proxy-vod", published_at="2026-08-08T00:00:00Z")],
-                    "pagination": {},
-                }
-            )
-        )
-        registry = SourceRegistry(
-            TwitchConfig(client_id="client", access_token="token"),
-            opener=opener,
-        )
-
-        result = registry.get("twitch").discover(_twitch_origin(bootstrap="latest"))
-
-        self.assertEqual([item.external_id for item in result.items], ["proxy-vod"])
-        request = opener.call_args.args[0]
-        self.assertEqual(urlsplit(request.full_url).hostname, "api.twitch.tv")
-
     def test_registry_contains_youtube_and_twitch_adapters(self):
         registry = SourceRegistry(TwitchConfig())
 

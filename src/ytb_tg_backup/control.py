@@ -13,7 +13,6 @@ from urllib.request import Request, urlopen
 
 from .config import Config
 from .models import Origin
-from .proxy import build_proxy_env, build_url_opener
 from .source_filter import (
     DEFAULT_SOURCE_FILTER_PATTERN,
     SOURCE_FILTER_STATE_KEY,
@@ -38,9 +37,6 @@ class ControlBot:
         self.config = config
         self.store = store
         self.logger = logger
-        source_proxy_url = config.proxy.url if config.proxy.sources else ""
-        self._source_opener = build_url_opener(source_proxy_url)
-        self._source_proxy_env = build_proxy_env(source_proxy_url)
 
     def process_once(self, timeout_seconds: int | None = None) -> None:
         if not self.config.control.enabled:
@@ -209,7 +205,7 @@ class ControlBot:
             if not remaining:
                 return "usage: /origin add youtube [uploads] <@handle|channel_id> [name]"
             source_ref = remaining[0]
-            external_id = self._resolve_channel_id(source_ref)
+            external_id = resolve_channel_id(source_ref, self.config.download.yt_dlp)
         elif provider == "twitch":
             kind = "vods"
             if remaining and remaining[0].lower() in TWITCH_KINDS:
@@ -1575,7 +1571,7 @@ class ControlBot:
             return "usage: /sub add [live|channel] <@handle|channel_id> [name]"
 
         channel_ref = args[0]
-        channel_id = self._resolve_channel_id(channel_ref)
+        channel_id = resolve_channel_id(channel_ref, self.config.download.yt_dlp)
         sub_id = _subscription_id(route, channel_ref)
         name = " ".join(args[1:]) if len(args) > 1 else _default_name(channel_ref)
         return self._save_subscription(
@@ -1590,7 +1586,7 @@ class ControlBot:
         if len(args) < 2:
             return "usage: /sub_add <id> <channel_id|@handle> [routes=live,channel] [name]"
         sub_id = _validate_id(args[0])
-        channel_id = self._resolve_channel_id(args[1])
+        channel_id = resolve_channel_id(args[1], self.config.download.yt_dlp)
         routes = list(self.config.control.default_routes)
         name_parts: list[str] = []
         for arg in args[2:]:
@@ -1626,16 +1622,6 @@ class ControlBot:
         )
         action = "added" if created else "updated"
         return f"{action}: {sub_id} -> {channel_id} routes={','.join(routes)}"
-
-    def _resolve_channel_id(self, channel_ref: str) -> str:
-        if not self.config.proxy.url or not self.config.proxy.sources:
-            return resolve_channel_id(channel_ref, self.config.download.yt_dlp)
-        return resolve_channel_id(
-            channel_ref,
-            self.config.download.yt_dlp,
-            opener=self._source_opener,
-            subprocess_env=self._source_proxy_env,
-        )
 
     def _sub_del(self, args: list[str]) -> str:
         if len(args) != 1:

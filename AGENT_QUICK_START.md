@@ -9,7 +9,7 @@ RSS, archives audio with `yt-dlp`, and can deliver it to Telegram.
 
 - Checkout: `~/dev/asmr-tg-backup`
 - Private config: `~/.config/asmr-tg-backup/config.toml`
-- Optional credentials/proxy environment: `~/.config/asmr-tg-backup/env`
+- Optional Twitch environment: `~/.config/asmr-tg-backup/env`
 - State and downloads: `~/.local/share/asmr-tg-backup`
 - User service: `asmr-tg-backup.service`
 
@@ -44,13 +44,8 @@ Ask the user for only the inputs needed by the selected providers:
 - Twitch, if used:
   - `TWITCH_CLIENT_ID`;
   - either `TWITCH_ACCESS_TOKEN` or `TWITCH_CLIENT_SECRET`.
-- Media proxy, if wanted:
-  - proxy protocol and address;
-  - whether it must cover source discovery/APIs, downloads, or both.
 
-Do not request Telegram, Twitch, or proxy credentials when those features are
-not needed. If a proxy URL contains credentials, have the user store it
-privately through `url_env`; do not ask them to paste the secret into chat.
+Do not request Telegram or Twitch secrets when those features are not needed.
 
 ## 1. Inspect prerequisites
 
@@ -130,12 +125,6 @@ max_items_per_poll = 3
 worker_count = 1
 log_level = "INFO"
 
-[proxy]
-url = ""
-url_env = ""
-sources = false
-downloads = false
-
 [download]
 yt_dlp = "/home/USERNAME/dev/asmr-tg-backup/.venv/bin/yt-dlp"
 ffmpeg = "ffmpeg"
@@ -206,44 +195,7 @@ enabled = false
 Use `bootstrap = "latest"` by default. Use `"all"` only when the user
 explicitly wants a backfill.
 
-## 5. Configure optional proxy, delivery, and control
-
-The copied public config keeps both scopes `false`; proxying is an explicit
-opt-in. Leave both URL fields empty and both scopes disabled when no
-application-scoped proxy is wanted. When a proxy is requested for the complete
-media path, prefer an HTTP proxy and update the existing table:
-
-```toml
-[proxy]
-url = "http://127.0.0.1:7890"
-url_env = ""
-sources = true
-downloads = true
-```
-
-This applies to source discovery/provider APIs and yt-dlp, but `[proxy]` is not
-injected into Telegram. In particular, a local `[telegram].api_base` such as
-`http://127.0.0.1:18081` is unaffected. Do not substitute process-wide
-`HTTP_PROXY` variables for this scoped configuration; those variables also
-retain their normal effect on urllib and curl.
-
-SOCKS is downloads-only and must use `sources = false`. Twitch live HLS may
-delegate traffic to ffmpeg, so SOCKS is not guaranteed for live recording;
-prefer HTTP when live traffic must use the proxy.
-
-For a proxy URL containing credentials, leave `url` empty and name one
-environment variable instead:
-
-```toml
-[proxy]
-url = ""
-url_env = "ASMR_TG_BACKUP_PROXY"
-sources = true
-downloads = true
-```
-
-Set only one of `url` or `url_env`. A configured `url_env` must exist when the
-service starts; verify that its value is non-empty before enabling real traffic.
+## 5. Configure optional delivery and control
 
 For Telegram delivery, set the real values only in the private config. Keep it
 disabled during setup:
@@ -270,7 +222,7 @@ allowed_message_thread_ids = []
 Every configured authorization dimension must match. Prefer an allowed user ID;
 do not leave control enabled with all allowlists empty.
 
-For Twitch and credentialed proxy URLs, store sensitive values outside TOML:
+For Twitch, store credentials outside TOML:
 
 ```bash
 touch ~/.config/asmr-tg-backup/env
@@ -283,8 +235,6 @@ The environment file contains:
 TWITCH_CLIENT_ID=...
 TWITCH_ACCESS_TOKEN=...
 # Or use TWITCH_CLIENT_SECRET instead of TWITCH_ACCESS_TOKEN.
-# If [proxy].url_env names this variable:
-ASMR_TG_BACKUP_PROXY=http://user:password@proxy.example:8080
 ```
 
 Never commit or echo this file.

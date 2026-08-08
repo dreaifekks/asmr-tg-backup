@@ -6,7 +6,6 @@ import json
 
 from ytb_tg_backup.config import ChannelConfig, expand_channel_feeds, load_config
 from ytb_tg_backup.feed import fetch_feed, parse_feed
-from ytb_tg_backup.proxy import build_url_opener
 from ytb_tg_backup.store import Store
 
 
@@ -31,14 +30,12 @@ def main() -> int:
     ]
     feeds = list(config.feeds)
     feeds.extend(expand_channel_feeds(config.rsshub, dynamic_channels, prefix="db:"))
-    proxy_url = config.proxy.url if config.proxy.sources else ""
-    opener = build_url_opener(proxy_url) if proxy_url else None
 
     result = []
     for feed in feeds:
         if not feed.enabled:
             continue
-        xml = fetch_feed(feed.url, opener=opener)
+        xml = fetch_feed(feed.url)
         entries = parse_feed(xml, feed.id, feed.name)
         result.append(
             {

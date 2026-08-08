@@ -11,19 +11,6 @@ worker_poll_interval_seconds = 2
 job_lease_seconds = 900
 log_level = "INFO"
 
-# Optional media proxy. This public example is explicitly opt-in: leave both
-# scopes false until a proxy URL and its intended traffic scopes are confirmed.
-# Set either url or url_env, never both. Prefer url_env when the URL contains
-# credentials and store its value in a mode-0600 systemd EnvironmentFile.
-# HTTP proxies may cover both source discovery/APIs and yt-dlp downloads.
-# SOCKS proxies support downloads only (set sources=false); Twitch live HLS may
-# delegate network access to ffmpeg and is not guaranteed to use a SOCKS proxy.
-[proxy]
-url = ""
-url_env = ""
-sources = false
-downloads = false
-
 # Origins are provider-backed remote sources. IDs must be unique within this
 # config. bootstrap="latest" makes only the newest matching first-seen item
 # eligible; use bootstrap="all" only when an intentional backfill is wanted.

@@ -14,7 +14,6 @@ import threading
 import time
 
 from .config import Config, DownloadProfile
-from .proxy import build_proxy_env
 
 
 WAIT_LIVE_STATUSES = {"is_live", "is_upcoming", "post_live"}
@@ -81,9 +80,6 @@ class Downloader:
     def __init__(self, config: Config, logger: logging.Logger):
         self.config = config
         self.logger = logger
-        self._proxy_env = build_proxy_env(
-            config.proxy.url if config.proxy.downloads else ""
-        )
 
     def check_tools(self) -> list[str]:
         missing = []
@@ -133,7 +129,6 @@ class Downloader:
                 text=True,
                 capture_output=True,
                 timeout=self.config.download.probe_timeout_seconds,
-                env=self._proxy_env,
             )
         except subprocess.CalledProcessError as exc:
             detail = f"{exc.stderr or ''}\n{exc.stdout or ''}".lower()
@@ -273,7 +268,6 @@ class Downloader:
                 text=True,
                 capture_output=True,
                 timeout=self.config.download.download_timeout_seconds,
-                env=self._proxy_env,
             )
         printed_paths = [Path(line.strip()) for line in completed.stdout.splitlines() if line.strip()]
         candidates = [path for path in printed_paths if _looks_like_media(path)]
@@ -722,7 +716,6 @@ class Downloader:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
-            env=self._proxy_env,
         )
         while True:
             try:
