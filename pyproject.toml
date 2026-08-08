@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asmr-tg-backup"
-version = "0.3.2"
+version = "0.4.0"
 description = "Discover public media from provider-backed origins, archive it with yt-dlp, and optionally deliver it to Telegram."
 license = {file = "LICENSE"}
 requires-python = ">=3.11"

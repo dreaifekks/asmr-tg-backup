@@ -9,6 +9,8 @@ from urllib.parse import parse_qs, quote, urlparse, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
+from .proxy import UrlOpener
+
 
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
 YT_NS = "{http://www.youtube.com/xml/schemas/2015}"
@@ -26,9 +28,14 @@ class FeedEntry:
     updated_at: str | None
 
 
-def fetch_feed(url: str, timeout: int = 30) -> bytes:
+def fetch_feed(
+    url: str,
+    timeout: int = 30,
+    *,
+    opener: UrlOpener | None = None,
+) -> bytes:
     request = Request(_quote_url_for_request(url), headers={"User-Agent": "asmr-tg-backup/0.1"})
-    with urlopen(request, timeout=timeout) as response:
+    with (opener or urlopen)(request, timeout=timeout) as response:
         payload = response.read(MAX_FEED_BYTES + 1)
     if len(payload) > MAX_FEED_BYTES:
         raise ValueError(f"feed response exceeds {MAX_FEED_BYTES} bytes")

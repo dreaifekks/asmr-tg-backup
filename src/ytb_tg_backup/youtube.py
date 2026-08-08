@@ -5,6 +5,8 @@ import subprocess
 from urllib.parse import quote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
+from .proxy import UrlOpener
+
 
 YOUTUBE_FEED_BASE_URL = "https://www.youtube.com/feeds/videos.xml"
 CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{20,}$")
@@ -20,7 +22,13 @@ def youtube_channel_feed_url(channel_id: str) -> str:
     return f"{YOUTUBE_FEED_BASE_URL}?channel_id={quote(channel_id.strip(), safe='')}"
 
 
-def resolve_channel_id(channel_ref: str, yt_dlp: str) -> str:
+def resolve_channel_id(
+    channel_ref: str,
+    yt_dlp: str,
+    *,
+    opener: UrlOpener | None = None,
+    subprocess_env: dict[str, str] | None = None,
+) -> str:
     value = channel_ref.strip()
     if is_channel_id(value):
         return value
@@ -38,7 +46,11 @@ def resolve_channel_id(channel_ref: str, yt_dlp: str) -> str:
     else:
         raise ValueError("official YouTube feed requires a UC channel_id, @handle, or canonical YouTube URL")
 
-    html_channel_id = _resolve_channel_id_from_html(url)
+    html_channel_id = (
+        _resolve_channel_id_from_html(url)
+        if opener is None
+        else _resolve_channel_id_from_html(url, opener=opener)
+    )
     if html_channel_id:
         return html_channel_id
 
@@ -52,7 +64,14 @@ def resolve_channel_id(channel_ref: str, yt_dlp: str) -> str:
         url,
     ]
     try:
-        completed = subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=120)
+        completed = subprocess.run(
+            cmd,
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=120,
+            env=subprocess_env,
+        )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
         raise RuntimeError(f"failed to resolve YouTube channel id for {value}: {exc}") from exc
 
@@ -98,10 +117,14 @@ def _canonical_channel_url(value: str) -> tuple[str, str | None]:
     raise ValueError("URL must be a canonical YouTube /channel/UC... or /@handle URL")
 
 
-def _resolve_channel_id_from_html(url: str) -> str | None:
+def _resolve_channel_id_from_html(
+    url: str,
+    *,
+    opener: UrlOpener | None = None,
+) -> str | None:
     request = Request(_quote_url(url), headers={"User-Agent": "asmr-tg-backup/0.1"})
     try:
-        with urlopen(request, timeout=30) as response:
+        with (opener or urlopen)(request, timeout=30) as response:
             html = response.read().decode("utf-8", errors="replace")
     except Exception:
         return None

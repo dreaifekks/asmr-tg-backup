@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 import uuid
 
 from .config import Config
@@ -25,6 +26,7 @@ from .downloader import (
 )
 from .feed import fetch_feed
 from .models import ClaimedJob, MediaCandidate, Origin
+from .proxy import build_url_opener
 from .source_filter import (
     DEFAULT_SOURCE_FILTER_PATTERN,
     SOURCE_FILTER_STATE_KEY,
@@ -1038,10 +1040,19 @@ class BackupService:
             self.logger.warning("could not fail job id=%s because its lease was lost", job.id)
 
     def _new_source_registry(self) -> SourceRegistry:
+        proxy_url = self.config.proxy.url if self.config.proxy.sources else ""
+        if not proxy_url:
+            return SourceRegistry(
+                self.config.twitch,
+                youtube_fetcher=lambda url: fetch_feed(url),
+                rss_fetcher=lambda url: fetch_feed(url),
+            )
+        opener = build_url_opener(proxy_url)
         return SourceRegistry(
             self.config.twitch,
-            youtube_fetcher=lambda url: fetch_feed(url),
-            rss_fetcher=lambda url: fetch_feed(url),
+            youtube_fetcher=lambda url: fetch_feed(url, opener=opener),
+            rss_fetcher=lambda url: fetch_feed(url, opener=opener),
+            opener=opener,
         )
 
     def _all_origins(self, store: Store | None = None) -> list[Origin]:
@@ -1229,10 +1240,17 @@ class BackupService:
                 text += f": {detail[:1000]}"
         else:
             text = str(exc)
+        proxy_password = (
+            urlsplit(self.config.proxy.url).password
+            if self.config.proxy.url
+            else None
+        )
         for secret in (
             self.config.telegram.bot_token,
             self.config.twitch.access_token,
             self.config.twitch.client_secret,
+            self.config.proxy.url,
+            proxy_password,
         ):
             if secret:
                 text = text.replace(secret, "<redacted>")

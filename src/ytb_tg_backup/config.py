@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import re
 import tomllib
 from typing import Any
+from urllib.parse import urlsplit
 
 from .models import Origin
 from .youtube import youtube_channel_feed_url
@@ -79,6 +81,14 @@ class DownloadConfig:
 
 
 @dataclass(frozen=True)
+class ProxyConfig:
+    url: str = ""
+    url_env: str = ""
+    sources: bool = False
+    downloads: bool = False
+
+
+@dataclass(frozen=True)
 class TelegramConfig:
     enabled: bool = False
     bot_token: str = ""
@@ -130,6 +140,7 @@ class Config:
     download: DownloadConfig
     telegram: TelegramConfig
     control: ControlConfig
+    proxy: ProxyConfig
     origins: list[Origin] = field(default_factory=list)
     twitch: TwitchConfig = field(default_factory=TwitchConfig)
 
@@ -218,6 +229,38 @@ def load_config(path: str | Path) -> Config:
         provider_profiles=provider_profiles,
     )
 
+    proxy_raw = raw.get("proxy", {})
+    if not isinstance(proxy_raw, dict):
+        raise ValueError("proxy must be a table")
+    proxy_url = str(proxy_raw.get("url", "")).strip()
+    proxy_url_env = str(proxy_raw.get("url_env", "")).strip()
+    if proxy_url and proxy_url_env:
+        raise ValueError("proxy.url and proxy.url_env are mutually exclusive")
+    if proxy_url_env:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", proxy_url_env):
+            raise ValueError("proxy.url_env must be an environment variable name")
+        if proxy_url_env not in os.environ:
+            raise ValueError(f"proxy environment variable {proxy_url_env} is not set")
+        proxy_url = os.environ[proxy_url_env].strip()
+        if not proxy_url:
+            raise ValueError(f"proxy environment variable {proxy_url_env} is empty")
+    proxy_sources = _strict_bool(
+        proxy_raw.get("sources", False),
+        label="proxy.sources",
+    )
+    proxy_downloads = _strict_bool(
+        proxy_raw.get("downloads", False),
+        label="proxy.downloads",
+    )
+    if proxy_url:
+        _validate_proxy_url(proxy_url, sources=proxy_sources)
+    proxy = ProxyConfig(
+        url=proxy_url,
+        url_env=proxy_url_env,
+        sources=proxy_sources,
+        downloads=proxy_downloads,
+    )
+
     telegram_raw = raw.get("telegram", {})
     telegram = TelegramConfig(
         enabled=bool(telegram_raw.get("enabled", False)),
@@ -291,6 +334,7 @@ def load_config(path: str | Path) -> Config:
         download=download,
         telegram=telegram,
         control=control,
+        proxy=proxy,
         origins=origins,
         twitch=twitch,
     )
@@ -399,6 +443,32 @@ def _strict_bool(value: object, *, label: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{label} must be true or false")
     return value
+
+
+def _validate_proxy_url(value: str, *, sources: bool) -> None:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid proxy URL: {exc}") from exc
+    allowed_schemes = {"http", "https", "socks4", "socks4a", "socks5", "socks5h"}
+    if parsed.scheme.lower() not in allowed_schemes:
+        raise ValueError(
+            "proxy.url must use http, https, socks4, socks4a, socks5, or socks5h"
+        )
+    if not parsed.hostname or port is None:
+        raise ValueError("proxy.url must include a host and port")
+    if port <= 0:
+        raise ValueError("proxy.url port must be between 1 and 65535")
+    if any(
+        char.isspace() or ord(char) < 32 or ord(char) == 127
+        for char in parsed.hostname
+    ):
+        raise ValueError("proxy.url host must not contain whitespace or control characters")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("proxy.url must not include a path, query, or fragment")
+    if sources and parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("proxy.sources=true requires an http or https proxy URL")
 
 
 def _load_download_profiles(raw_profiles: dict[str, Any]) -> dict[str, DownloadProfile]:

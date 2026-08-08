@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 from .config import TwitchConfig
 from .feed import fetch_feed, parse_feed
 from .models import DiscoveryResult, MediaCandidate, Origin
+from .proxy import UrlOpener
 from .youtube import youtube_channel_feed_url
 
 
@@ -113,9 +114,10 @@ class RssSource:
 class TwitchHelixSource:
     provider = "twitch"
 
-    def __init__(self, config: TwitchConfig):
+    def __init__(self, config: TwitchConfig, *, opener: UrlOpener | None = None):
         self.config = config
         self._access_token = config.access_token
+        self._opener = opener
 
     def discover(self, origin: Origin, checkpoint: str | None = None) -> DiscoveryResult:
         self._validate_config()
@@ -345,7 +347,10 @@ class TwitchHelixSource:
             },
         )
         try:
-            with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
+            with (self._opener or urlopen)(
+                request,
+                timeout=self.config.request_timeout_seconds,
+            ) as response:
                 payload = _read_json_response(response, label="Twitch API")
         except HTTPError as exc:
             if exc.code == 401 and retry_auth and self.config.client_secret:
@@ -379,7 +384,10 @@ class TwitchHelixSource:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
+            with (self._opener or urlopen)(
+                request,
+                timeout=self.config.request_timeout_seconds,
+            ) as response:
                 payload = _read_json_response(response, label="Twitch OAuth")
         except HTTPError as exc:
             raise SourceError(f"Twitch OAuth HTTP {exc.code}", code="auth_invalid") from None
@@ -396,12 +404,22 @@ class SourceRegistry:
         self,
         twitch: TwitchConfig,
         *,
-        youtube_fetcher: Callable[[str], bytes] = fetch_feed,
-        rss_fetcher: Callable[[str], bytes] = fetch_feed,
+        youtube_fetcher: Callable[[str], bytes] | None = None,
+        rss_fetcher: Callable[[str], bytes] | None = None,
+        opener: UrlOpener | None = None,
     ):
-        youtube = YouTubePublicSource(youtube_fetcher)
-        rss = RssSource(rss_fetcher)
-        twitch_source = TwitchHelixSource(twitch)
+        source_opener = opener
+        youtube = YouTubePublicSource(
+            youtube_fetcher
+            if youtube_fetcher is not None
+            else (lambda url: fetch_feed(url, opener=source_opener))
+        )
+        rss = RssSource(
+            rss_fetcher
+            if rss_fetcher is not None
+            else (lambda url: fetch_feed(url, opener=source_opener))
+        )
+        twitch_source = TwitchHelixSource(twitch, opener=source_opener)
         self._defaults: dict[str, SourceAdapter] = {
             "youtube": youtube,
             "rss": rss,

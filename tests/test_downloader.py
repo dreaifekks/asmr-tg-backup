@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -11,6 +12,153 @@ from ytb_tg_backup.downloader import Downloader, _bitrate_candidates, _looks_lik
 
 
 class DownloaderHelpersTest(unittest.TestCase):
+    def test_probe_passes_proxy_in_an_isolated_child_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp_path}"
+
+[proxy]
+url = "http://127.0.0.1:7890"
+sources = false
+downloads = true
+""".strip()
+            )
+            payload = json.dumps(
+                {"id": "proxy123", "title": "Proxy test", "live_status": "not_live"}
+            )
+            parent_env = {"PRESERVED_FOR_CHILD": "yes"}
+
+            with mock.patch.dict(os.environ, parent_env, clear=True):
+                downloader = Downloader(load_config(config_path), logging.getLogger("test"))
+                with mock.patch(
+                    "ytb_tg_backup.downloader.subprocess.run",
+                    return_value=subprocess.CompletedProcess([], 0, payload, ""),
+                ) as run:
+                    downloader.probe("https://www.youtube.com/watch?v=proxy123")
+
+                child_env = run.call_args.kwargs["env"]
+                self.assertIsNot(child_env, os.environ)
+                self.assertEqual(child_env["PRESERVED_FOR_CHILD"], "yes")
+                for name in (
+                    "http_proxy",
+                    "https_proxy",
+                    "all_proxy",
+                    "HTTP_PROXY",
+                    "HTTPS_PROXY",
+                    "ALL_PROXY",
+                ):
+                    self.assertEqual(child_env[name], "http://127.0.0.1:7890")
+                self.assertEqual(dict(os.environ), parent_env)
+
+    def test_download_proxy_can_be_disabled_without_exporting_proxy_variables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp_path}"
+
+[proxy]
+url = "http://127.0.0.1:7890"
+sources = true
+downloads = false
+""".strip()
+            )
+            payload = json.dumps(
+                {"id": "direct123", "title": "Direct test", "live_status": "not_live"}
+            )
+
+            with mock.patch.dict(os.environ, {"PARENT_ONLY": "yes"}, clear=True):
+                downloader = Downloader(load_config(config_path), logging.getLogger("test"))
+                with mock.patch(
+                    "ytb_tg_backup.downloader.subprocess.run",
+                    return_value=subprocess.CompletedProcess([], 0, payload, ""),
+                ) as run:
+                    downloader.probe("https://www.youtube.com/watch?v=direct123")
+
+                self.assertIsNone(run.call_args.kwargs.get("env"))
+                self.assertEqual(dict(os.environ), {"PARENT_ONLY": "yes"})
+
+    def test_download_passes_the_same_proxy_environment_to_yt_dlp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp_path}"
+
+[proxy]
+url = "socks5://127.0.0.1:7891"
+sources = false
+downloads = true
+""".strip()
+            )
+            media_path = tmp_path / "downloaded.m4a"
+            media_path.write_bytes(b"audio")
+
+            with mock.patch.dict(os.environ, {"PARENT_ONLY": "yes"}, clear=True):
+                downloader = Downloader(load_config(config_path), logging.getLogger("test"))
+                with mock.patch(
+                    "ytb_tg_backup.downloader.subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        ["yt-dlp"],
+                        0,
+                        stdout=f"{media_path}\n",
+                        stderr="",
+                    ),
+                ) as run:
+                    downloader.download(
+                        "proxy-download",
+                        "https://www.youtube.com/watch?v=proxy-download",
+                    )
+
+                child_env = run.call_args.kwargs["env"]
+                self.assertEqual(child_env["PARENT_ONLY"], "yes")
+                self.assertEqual(child_env["all_proxy"], "socks5://127.0.0.1:7891")
+                self.assertEqual(child_env["ALL_PROXY"], "socks5://127.0.0.1:7891")
+                self.assertEqual(dict(os.environ), {"PARENT_ONLY": "yes"})
+
+    def test_live_download_passes_proxy_environment_to_yt_dlp_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp_path}"
+
+[proxy]
+url = "http://127.0.0.1:7890"
+downloads = true
+""".strip()
+            )
+            process = mock.Mock()
+            process.communicate.return_value = ("media.m4a\n", "")
+            process.returncode = 0
+
+            with mock.patch.dict(os.environ, {"PARENT_ONLY": "yes"}, clear=True):
+                downloader = Downloader(load_config(config_path), logging.getLogger("test"))
+                with mock.patch(
+                    "ytb_tg_backup.downloader.subprocess.Popen",
+                    return_value=process,
+                ) as popen:
+                    completed = downloader._run_live_download(
+                        ["yt-dlp", "https://www.twitch.tv/example"],
+                        cancel_events=(),
+                    )
+
+        self.assertEqual(completed.returncode, 0)
+        child_env = popen.call_args.kwargs["env"]
+        self.assertEqual(child_env["PARENT_ONLY"], "yes")
+        self.assertEqual(child_env["https_proxy"], "http://127.0.0.1:7890")
+        self.assertEqual(child_env["ALL_PROXY"], "http://127.0.0.1:7890")
+
     def test_youtube_probe_keeps_upcoming_metadata_without_formats(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

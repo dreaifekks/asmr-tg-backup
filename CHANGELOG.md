@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-08-08
+
+- Add scoped media proxy configuration for provider source requests and
+  yt-dlp downloads, with environment-backed credentials, no application-proxy
+  injection into Telegram traffic, opt-in source/download scopes, and explicit
+  SOCKS/ffmpeg limitations.
+- Cache Twitch broadcaster IDs between polls to avoid repeated user lookup
+  requests while the service remains running.
+
 ## 0.3.2 - 2026-08-02
 
 - Preserve compatible source audio when preparing Telegram audio from a video

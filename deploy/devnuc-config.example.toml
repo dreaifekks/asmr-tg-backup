@@ -11,6 +11,17 @@ worker_poll_interval_seconds = 2
 job_lease_seconds = 900
 log_level = "INFO"
 
+# Optional media proxy. The empty URL and false scopes keep this example direct.
+# For a local HTTP proxy, set url="http://127.0.0.1:7890" and enable both scopes.
+# Use url_env instead when the URL contains credentials; its value
+# belongs in the service's mode-0600 EnvironmentFile. SOCKS is downloads-only
+# and is not guaranteed for Twitch live traffic delegated to ffmpeg.
+[proxy]
+url = ""
+url_env = ""
+sources = false
+downloads = false
+
 [[origins]]
 id = "youtube-placeholder"
 provider = "youtube"

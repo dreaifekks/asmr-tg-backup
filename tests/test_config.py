@@ -44,10 +44,133 @@ enabled = true
             "bestaudio/best",
         )
         self.assertEqual(config.telegram.media_type, "audio")
+        self.assertEqual(config.proxy.url, "")
+        self.assertEqual(config.proxy.url_env, "")
+        self.assertFalse(config.proxy.sources)
+        self.assertFalse(config.proxy.downloads)
         self.assertFalse(config.control.enabled)
         self.assertEqual(config.control.panel_idle_timeout_seconds, 3600)
         self.assertFalse(config.control.allow_disk_delete)
         self.assertTrue(config.control.delete_webhook_on_startup)
+
+    def test_proxy_can_load_inline_http_url_and_scope_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                """
+[proxy]
+url = "http://127.0.0.1:7890"
+sources = true
+downloads = false
+""".strip()
+            )
+
+            config = load_config(path)
+
+        self.assertEqual(config.proxy.url, "http://127.0.0.1:7890")
+        self.assertEqual(config.proxy.url_env, "")
+        self.assertTrue(config.proxy.sources)
+        self.assertFalse(config.proxy.downloads)
+
+    def test_proxy_url_can_be_loaded_from_environment_without_mutating_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                """
+[proxy]
+url_env = "ASMR_TG_BACKUP_PROXY"
+sources = false
+downloads = true
+""".strip()
+            )
+            original = {"ASMR_TG_BACKUP_PROXY": "socks5://127.0.0.1:7891"}
+
+            with mock.patch.dict(os.environ, original, clear=True):
+                config = load_config(path)
+                self.assertEqual(dict(os.environ), original)
+
+        self.assertEqual(config.proxy.url, "socks5://127.0.0.1:7891")
+        self.assertEqual(config.proxy.url_env, "ASMR_TG_BACKUP_PROXY")
+        self.assertFalse(config.proxy.sources)
+        self.assertTrue(config.proxy.downloads)
+
+    def test_proxy_url_and_url_env_are_mutually_exclusive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                """
+[proxy]
+url = "http://127.0.0.1:7890"
+url_env = "ASMR_TG_BACKUP_PROXY"
+""".strip()
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"ASMR_TG_BACKUP_PROXY": "http://127.0.0.1:7890"},
+                clear=True,
+            ), self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                load_config(path)
+
+    def test_proxy_url_env_must_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text('[proxy]\nurl_env = "ASMR_TG_BACKUP_PROXY"')
+
+            with mock.patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(
+                ValueError,
+                "ASMR_TG_BACKUP_PROXY.*not set",
+            ):
+                load_config(path)
+
+    def test_proxy_url_env_must_not_resolve_to_an_empty_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text('[proxy]\nurl_env = "ASMR_TG_BACKUP_PROXY"')
+
+            with mock.patch.dict(
+                os.environ,
+                {"ASMR_TG_BACKUP_PROXY": "   "},
+                clear=True,
+            ), self.assertRaises(ValueError):
+                load_config(path)
+
+    def test_source_proxy_requires_http_while_download_only_accepts_socks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                """
+[proxy]
+url = "socks5://127.0.0.1:7891"
+sources = true
+""".strip()
+            )
+            with self.assertRaisesRegex(ValueError, "sources=true requires an http or https"):
+                load_config(path)
+
+            path.write_text(
+                """
+[proxy]
+url = "socks5://127.0.0.1:7891"
+sources = false
+downloads = true
+""".strip()
+            )
+            config = load_config(path)
+
+        self.assertEqual(config.proxy.url, "socks5://127.0.0.1:7891")
+
+    def test_proxy_rejects_unusable_port_and_whitespace_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            for proxy_url, message in (
+                ("http://127.0.0.1:0", "port"),
+                ("http://proxy host:7890", "whitespace"),
+            ):
+                with self.subTest(proxy_url=proxy_url):
+                    path.write_text(f'[proxy]\nurl = "{proxy_url}"')
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_config(path)
 
     def test_disk_delete_requires_explicit_control_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp:

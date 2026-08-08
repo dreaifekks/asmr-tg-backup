@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 import logging
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -11,6 +12,20 @@ from ytb_tg_backup.control import ControlBot, _origin_token
 from ytb_tg_backup.models import MediaCandidate, Origin
 from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
 from ytb_tg_backup.store import Store
+
+
+class _JsonResponse:
+    def __init__(self, payload: dict):
+        self.body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self):
+        return self.body
 
 
 def _current_panel_callback(
@@ -103,7 +118,7 @@ default_routes = ["live"]
             self.assertFalse(bot._authorized({"from": {"id": 123}, "chat": {"id": -100}, "message_thread_id": 99}))
             self.assertFalse(bot._authorized({"from": {"id": 456}, "chat": {"id": -200}, "message_thread_id": 99}))
 
-            def fake_resolve(channel_ref: str, yt_dlp: str) -> str:
+            def fake_resolve(channel_ref: str, yt_dlp: str, **_kwargs) -> str:
                 return {
                     "@nightmare": "UCnightmare11111111111111",
                     "@nightmare2": "UCnightmare22222222222222",
@@ -135,6 +150,89 @@ default_routes = ["live"]
             self.assertIn("/panel", help_text)
             self.assertIn("/origin add twitch", help_text)
             self.assertIn("Default source filter is /ASMR/i", help_text)
+
+    def test_youtube_control_resolution_uses_source_proxy_in_child_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[proxy]
+url = "http://127.0.0.1:7890"
+sources = true
+downloads = false
+
+[control]
+enabled = true
+allowed_user_ids = ["123"]
+""".strip()
+            )
+            parent_env = {"PARENT_ONLY": "yes"}
+
+            with mock.patch.dict(os.environ, parent_env, clear=True):
+                config = load_config(config_path)
+                store = Store(config.db_path)
+                store.initialize()
+                bot = ControlBot(config, store, logging.getLogger("test"))
+                message = {"from": {"id": 123}, "chat": {"id": -100}}
+                with mock.patch(
+                    "ytb_tg_backup.control.resolve_channel_id",
+                    return_value="UCproxy111111111111111111",
+                ) as resolve:
+                    reply = bot._execute(
+                        "/origin add youtube @proxy Proxy Channel",
+                        message,
+                    )
+
+                self.assertIn("youtube/uploads", reply)
+                self.assertEqual(resolve.call_args.args, ("@proxy", "yt-dlp"))
+                self.assertTrue(callable(resolve.call_args.kwargs["opener"]))
+                child_env = resolve.call_args.kwargs["subprocess_env"]
+                self.assertIsNot(child_env, os.environ)
+                self.assertEqual(child_env["http_proxy"], "http://127.0.0.1:7890")
+                self.assertEqual(child_env["HTTPS_PROXY"], "http://127.0.0.1:7890")
+                self.assertEqual(dict(os.environ), parent_env)
+
+    def test_telegram_control_api_does_not_use_the_application_proxy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[proxy]
+url = "http://127.0.0.1:7890"
+sources = true
+downloads = true
+
+[telegram]
+bot_token = "test-token"
+api_base = "http://127.0.0.1:18081"
+""".strip()
+            )
+            parent_env = {"PARENT_ONLY": "yes"}
+
+            with mock.patch.dict(os.environ, parent_env, clear=True):
+                config = load_config(config_path)
+                store = Store(config.db_path)
+                store.initialize()
+                bot = ControlBot(config, store, logging.getLogger("test"))
+                with mock.patch(
+                    "ytb_tg_backup.control.urlopen",
+                    return_value=_JsonResponse({"ok": True, "result": {}}),
+                ) as direct_urlopen:
+                    response = bot._api("getMe", {})
+
+                self.assertTrue(response["ok"])
+                request = direct_urlopen.call_args.args[0]
+                self.assertEqual(
+                    request.full_url,
+                    "http://127.0.0.1:18081/bottest-token/getMe",
+                )
+                self.assertEqual(dict(os.environ), parent_env)
 
     def test_provider_neutral_origin_commands(self):
         with tempfile.TemporaryDirectory() as tmp:
