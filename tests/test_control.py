@@ -29,6 +29,85 @@ def _current_panel_callback(
 
 
 class ControlBotTest(unittest.TestCase):
+    def test_loopback_api_uses_an_opener_with_proxies_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+    [app]
+    data_dir = "{tmp}"
+
+    [telegram]
+    bot_token = "secret-token"
+
+    [telegram.bot_api]
+    api_base = "http://[::1]:18081"
+    """.strip()
+            )
+            config = load_config(config_path)
+            bot = ControlBot(config, mock.Mock(), logging.getLogger("test"))
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.read.return_value = b'{"ok": true, "result": true}'
+            opener = mock.Mock()
+            opener.open.return_value = response
+            proxy_handler = mock.sentinel.proxy_handler
+
+            with (
+                mock.patch(
+                    "ytb_tg_backup.control.ProxyHandler",
+                    return_value=proxy_handler,
+                ) as proxy_handler_factory,
+                mock.patch(
+                    "ytb_tg_backup.control.build_opener",
+                    return_value=opener,
+                ) as build_opener,
+                mock.patch("ytb_tg_backup.control.urlopen") as urlopen,
+            ):
+                result = bot._api("getMe", {}, request_timeout_seconds=17)
+
+        self.assertTrue(result["ok"])
+        proxy_handler_factory.assert_called_once_with({})
+        build_opener.assert_called_once_with(proxy_handler)
+        urlopen.assert_not_called()
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "http://[::1]:18081/botsecret-token/getMe")
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], 17)
+
+    def test_non_loopback_api_keeps_using_urlopen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+    [app]
+    data_dir = "{tmp}"
+
+    [telegram]
+    bot_token = "secret-token"
+
+    [telegram.bot_api]
+    api_base = "https://telegram.example"
+    """.strip()
+            )
+            config = load_config(config_path)
+            bot = ControlBot(config, mock.Mock(), logging.getLogger("test"))
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.read.return_value = b'{"ok": true, "result": true}'
+
+            with (
+                mock.patch("ytb_tg_backup.control.build_opener") as build_opener,
+                mock.patch(
+                    "ytb_tg_backup.control.urlopen",
+                    return_value=response,
+                ) as urlopen,
+            ):
+                result = bot._api("getMe", {})
+
+        self.assertTrue(result["ok"])
+        build_opener.assert_not_called()
+        urlopen.assert_called_once()
+
     def test_get_updates_uses_long_poll_and_a_longer_http_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"

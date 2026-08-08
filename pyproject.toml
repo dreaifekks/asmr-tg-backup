@@ -1,20 +1,56 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "asmr-tg-backup"
 version = "0.3.2"
 description = "Discover public media from provider-backed origins, archive it with yt-dlp, and optionally deliver it to Telegram."
-license = {file = "LICENSE"}
-requires-python = ">=3.11"
-dependencies = []
-classifiers = [
-    "License :: OSI Approved :: Apache Software License",
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    {name = "dreaife"},
 ]
+keywords = ["asmr", "media-archiver", "telegram", "twitch", "youtube", "yt-dlp"]
+requires-python = ">=3.11"
+dependencies = [
+    "Telethon>=1.44,<2",
+    "yt-dlp",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+[project.optional-dependencies]
+performance = [
+    "cryptg>=0.5,<1",
+]
+docs = [
+    "mkdocs-material>=9.5,<10",
+    "mkdocs-static-i18n[material]>=1.3,<2",
+]
+
+[project.urls]
+Homepage = "https://github.com/dreaifekks/asmr-tg-backup"
+Documentation = "https://dreaifekks.github.io/asmr-tg-backup/"
+Repository = "https://github.com/dreaifekks/asmr-tg-backup.git"
+Issues = "https://github.com/dreaifekks/asmr-tg-backup/issues"
+Changelog = "https://github.com/dreaifekks/asmr-tg-backup/blob/master/CHANGELOG.md"
 
 [project.scripts]
 asmr-tg-backup = "ytb_tg_backup.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+ytb_tg_backup = ["config.example.toml"]

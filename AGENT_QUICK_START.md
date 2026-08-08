@@ -58,11 +58,11 @@ command -v ffmpeg
 command -v ffprobe
 ```
 
-Required:
+Required before source installation:
 
 - Python 3.11 or newer;
 - Git;
-- `yt-dlp`.
+- network access for pip to install the declared `yt-dlp` dependency.
 
 `curl` is required for Telegram delivery. `ffmpeg` and `ffprobe` are strongly
 recommended and `ffmpeg` is required for Twitch live recording. If a required
@@ -88,14 +88,14 @@ git status --short --branch
 
 ## 3. Create the Python environment
 
-The project has no required runtime Python libraries, but the editable install
-provides the `asmr-tg-backup` command. With approval for package downloads:
+The editable install provides the `asmr-tg-backup` command and installs the
+declared `yt-dlp` runtime dependency. With approval for package downloads:
 
 ```bash
 cd ~/dev/asmr-tg-backup
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip setuptools
-.venv/bin/python -m pip install -e . yt-dlp
+.venv/bin/python -m pip install -e .
 .venv/bin/asmr-tg-backup --help
 ```
 
@@ -138,6 +138,17 @@ write_thumbnail = true
 enabled = false
 bot_token = ""
 chat_id = ""
+upload_transport = "mtproto"
+
+[telegram.mtproto]
+session_path = "telegram-mtproto.session"
+max_upload_bytes = 1990000000
+
+[telegram.bot_api]
+api_base = "https://api.telegram.org"
+max_upload_bytes = 49000000
+split_large_audio = true
+max_upload_parts = 10
 
 [control]
 enabled = false
@@ -205,9 +216,18 @@ disabled during setup:
 enabled = false # switch to true only after explicit approval
 bot_token = "BOT_TOKEN"
 chat_id = "-1001234567890"
-api_base = "https://api.telegram.org"
+upload_transport = "mtproto"
 media_type = "audio"
+
+[telegram.mtproto]
+session_path = "telegram-mtproto.session"
+max_upload_bytes = 1990000000
 ```
+
+Source checkouts need a complete Telegram application credential pair for
+MTProto. Put it in the private environment file below, never in the repository.
+To use Bot API instead, set `upload_transport = "bot_api"` and configure the
+existing `[telegram.bot_api]` table.
 
 For the Telegram control panel, keep it disabled during setup:
 
@@ -235,6 +255,8 @@ The environment file contains:
 TWITCH_CLIENT_ID=...
 TWITCH_ACCESS_TOKEN=...
 # Or use TWITCH_CLIENT_SECRET instead of TWITCH_ACCESS_TOKEN.
+ASMR_TG_MTPROTO_API_ID=...
+ASMR_TG_MTPROTO_API_HASH=...
 ```
 
 Never commit or echo this file.

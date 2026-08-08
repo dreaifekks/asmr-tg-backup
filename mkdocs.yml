@@ -1,0 +1,76 @@
+# yaml-language-server: $schema=https://squidfunk.github.io/mkdocs-material/schema.json
+
+site_name: asmr-tg-backup
+site_description: Archive public media and optionally deliver it to Telegram.
+site_url: https://dreaifekks.github.io/asmr-tg-backup/
+repo_url: https://github.com/dreaifekks/asmr-tg-backup
+repo_name: dreaifekks/asmr-tg-backup
+edit_uri: edit/master/docs/
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - content.action.edit
+    - content.code.copy
+    - search.highlight
+    - search.suggest
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: suffix
+      fallback_to_default: false
+      reconfigure_material: true
+      reconfigure_search: true
+      languages:
+        - locale: en
+          default: true
+          name: English
+          build: true
+        - locale: zh
+          name: 简体中文
+          build: true
+          site_description: 发现并归档公开媒体，并可选择将文件发送到 Telegram。
+          nav_translations:
+            Home: 首页
+            Get started: 开始使用
+            Choose a deployment: 选择部署方式
+            Docker Compose: Docker Compose
+            PyPI and native Linux: PyPI 与原生 Linux
+            Configure: 配置
+            Sources and downloads: 来源与下载
+            Telegram delivery: Telegram 投递
+            Control panel: 控制面板
+            Operate: 运行与维护
+            Troubleshoot: 故障排查
+            Reference: 参考
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Get started:
+      - Choose a deployment: getting-started/index.md
+      - Docker Compose: getting-started/docker-compose.md
+      - PyPI and native Linux: getting-started/pypi.md
+  - Configure:
+      - Sources and downloads: configuration/sources.md
+      - Telegram delivery: configuration/telegram.md
+      - Control panel: configuration/control-panel.md
+  - Operate: operations.md
+  - Troubleshoot: troubleshooting.md
+  - Reference: reference.md

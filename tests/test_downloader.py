@@ -2,6 +2,7 @@ import json
 import logging
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -11,6 +12,40 @@ from ytb_tg_backup.downloader import Downloader, _bitrate_candidates, _looks_lik
 
 
 class DownloaderHelpersTest(unittest.TestCase):
+    def test_video_dimensions_are_read_from_first_video_stream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{tmp_path}"')
+            downloader = Downloader(load_config(config_path), logging.getLogger("test"))
+            media_path = tmp_path / "video.mp4"
+            media_path.write_bytes(b"video")
+
+            with mock.patch(
+                "ytb_tg_backup.downloader.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 0, "1920x1080\n", ""),
+            ) as run:
+                dimensions = downloader.media_video_dimensions(media_path)
+
+        self.assertEqual(dimensions, (1920, 1080))
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-select_streams") + 1], "v:0")
+
+    def test_default_yt_dlp_runs_from_the_current_python_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{tmp_path}"')
+            downloader = Downloader(load_config(config_path), logging.getLogger("test"))
+
+            with mock.patch(
+                "ytb_tg_backup.downloader.importlib.util.find_spec",
+                return_value=object(),
+            ):
+                command = downloader._yt_dlp_command()
+
+        self.assertEqual(command, [sys.executable, "-m", "yt_dlp"])
+
     def test_youtube_probe_keeps_upcoming_metadata_without_formats(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -127,6 +162,49 @@ class DownloaderHelpersTest(unittest.TestCase):
             self.assertEqual(result.file_path, media_path)
             self.assertEqual(result.file_size, len(b"audio"))
             run.assert_not_called()
+
+    def test_oversize_audio_is_split_into_playable_stream_copy_parts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{tmp_path}"')
+            downloader = Downloader(load_config(config_path), logging.getLogger("test"))
+            media_path = tmp_path / "archive.m4a"
+            media_path.write_bytes(b"a" * 25)
+
+            def complete_split(command, **_kwargs):
+                pattern = str(command[-1])
+                for index in range(3):
+                    Path(pattern.replace("%03d", f"{index:03d}")).write_bytes(b"p" * 9)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(
+                downloader,
+                "_duration_seconds",
+                return_value=90,
+            ), mock.patch(
+                "ytb_tg_backup.downloader.subprocess.run",
+                side_effect=complete_split,
+            ) as run:
+                results = downloader.split_audio_for_upload(
+                    media_path,
+                    max_bytes=10,
+                    max_parts=3,
+                )
+
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("-c:a") + 1], "copy")
+            self.assertEqual(command[command.index("-f") + 1], "segment")
+            self.assertEqual(len(results), 3)
+            self.assertEqual([result.file_size for result in results], [9, 9, 9])
+            self.assertEqual(
+                [result.file_path.name for result in results],
+                [
+                    "archive.tgpart01-of-03.m4a",
+                    "archive.tgpart02-of-03.m4a",
+                    "archive.tgpart03-of-03.m4a",
+                ],
+            )
 
     def test_oversize_stream_copy_falls_back_to_aac_encoding(self):
         with tempfile.TemporaryDirectory() as tmp:

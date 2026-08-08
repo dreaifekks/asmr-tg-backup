@@ -64,12 +64,25 @@ audio_quality = "0"
 enabled = false
 bot_token = ""
 chat_id = "@your_channel"
-api_base = "https://api.telegram.org"
+upload_transport = "mtproto"
 media_type = "audio"
 send_as_document = false
-max_upload_bytes = 52428800
 upload_timeout_seconds = 7200
 caption_template = "{title}\n\n{url}\n\n#{tag}"
+
+[telegram.mtproto]
+# To use your own application credentials, set both values here or provide
+# ASMR_TG_MTPROTO_API_ID and ASMR_TG_MTPROTO_API_HASH in the user service.
+# api_id = 123456
+# api_hash = "0123456789abcdef0123456789abcdef"
+session_path = "telegram-mtproto.session"
+max_upload_bytes = 1990000000
+
+[telegram.bot_api]
+api_base = "https://api.telegram.org"
+max_upload_bytes = 49000000
+split_large_audio = true
+max_upload_parts = 10
 
 # Configure the user service with a mode-0600 EnvironmentFile containing
 # TWITCH_CLIENT_ID and either TWITCH_ACCESS_TOKEN or TWITCH_CLIENT_SECRET.

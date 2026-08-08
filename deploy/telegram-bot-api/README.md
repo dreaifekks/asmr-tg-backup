@@ -2,6 +2,11 @@
 
 Reusable Docker Compose service for a local Telegram Bot API endpoint.
 
+For a new full-stack deployment, prefer the repository-root `compose.yaml`,
+which builds `asmr-tg-backup` and enables this API with the `local-api` profile.
+This directory remains available when one host-level Bot API is intentionally
+shared by several native services.
+
 It is intended to be shared by local services on the same host. The compose file
 binds the API and stats ports to `127.0.0.1` only:
 
@@ -44,8 +49,12 @@ For `asmr-tg-backup`, set:
 
 ```toml
 [telegram]
+upload_transport = "bot_api"
+
+[telegram.bot_api]
 api_base = "http://127.0.0.1:18081"
 max_upload_bytes = 1990000000
+split_large_audio = false
 ```
 
 When a bot token is switched to a local Bot API server, Telegram may require

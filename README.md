@@ -9,6 +9,43 @@ Helix API.
 YouTube members-only discovery and authentication are outside the main worker's
 public-origin path.
 
+## Installation paths
+
+- **PyPI** is the lightest native path: `pipx install asmr-tg-backup`, then run
+  `asmr-tg-backup setup`. Official releases default to direct MTProto media
+  uploads after the bot token and destination are configured.
+- **Docker Compose** runs the same application with persistent state under
+  `/data`. The official GHCR image also defaults to MTProto; source builds can
+  provide their own Telegram application ID/hash as a complete environment
+  pair.
+- **Bot API** is an advanced transport. It can use an existing trusted URL, a
+  preinstalled native service, the optional Compose `local-api` profile, or the
+  official API with playable audio splitting as a final fallback.
+
+This application uses the Telegram API. It always needs the user's own bot
+token, and keeps its MTProto session in the private application data directory.
+Source checkouts can provide their own application credentials with
+`ASMR_TG_MTPROTO_API_ID` and `ASMR_TG_MTPROTO_API_HASH`; set both or neither.
+
+The PyPI wheel does not contain or download Telegram's C++
+`telegram-bot-api` executable. For the optional native local-API path, follow
+the official
+[source build instructions](https://github.com/tdlib/telegram-bot-api#installation).
+`setup` only validates the existing executable and registers this project's
+user unit. Telegram upstream does not publish a prebuilt binary, Docker image,
+or systemd unit for this server.
+
+The bilingual English/Simplified Chinese Material documentation source lives
+in [`docs/`](docs/index.md) and is configured for
+<https://dreaifekks.github.io/asmr-tg-backup/>.
+
+Preview it locally with English at `/` and Chinese at `/zh/`:
+
+```bash
+python3 -m pip install -e ".[docs]"
+mkdocs serve --dev-addr 127.0.0.1:8000
+```
+
 ## Agent quick start
 
 Give an agent this command to fetch a self-contained local service setup guide:
@@ -195,7 +232,7 @@ Live recording explicitly uses yt-dlp's default current-position behavior.
 `--live-from-start` is experimental for Twitch and may depend on the associated
 VOD, so it is not used for subscriber-locked archival.
 
-## First setup
+## Source checkout setup
 
 ```bash
 python3 -m venv .venv
@@ -203,6 +240,9 @@ python3 -m venv .venv
 pip install -e .
 cp config.example.toml config.toml
 chmod 600 config.toml
+# Source builds using MTProto must export both application values.
+export ASMR_TG_MTPROTO_API_ID=123456
+export ASMR_TG_MTPROTO_API_HASH=0123456789abcdef0123456789abcdef
 asmr-tg-backup init --config config.toml
 asmr-tg-backup poll --config config.toml --once
 ```
@@ -210,18 +250,18 @@ asmr-tg-backup poll --config config.toml --once
 Required host tools:
 
 - `python3 >= 3.11`
-- `yt-dlp`
-- `curl` when Telegram delivery is enabled
+- `curl` when the Bot API transport or Telegram control panel is enabled
 
 `ffmpeg` and `ffprobe` are recommended for audio extraction, media merging,
-upload-size reduction, and thumbnail conversion. `ffmpeg` is required when
+playable upload segmentation, and thumbnail conversion. `ffmpeg` is required when
 Twitch `recording_mode = "live"` is enabled.
 
 ## State and automatic migration
 
-State lives below `[app].data_dir` in `state.db`, `downloads/`, and the yt-dlp
-archive file. Schema v2 stores `origins`, `media_items`, `origin_items`, `jobs`,
-`artifacts`, and `deliveries` separately.
+State lives below `[app].data_dir` in `state.db`, `downloads/`, the yt-dlp
+archive file, and the private MTProto session when that transport is used.
+Schema v2 stores `origins`, `media_items`, `origin_items`, `jobs`, `artifacts`,
+and `deliveries` separately.
 
 Opening an existing v1 database automatically:
 
@@ -439,10 +479,27 @@ the default.
 ## Telegram delivery
 
 Uploads remain disabled until `[telegram].enabled = true` and a bot token and
-destination are configured. For large archives, use the local Telegram Bot API
-service under `deploy/telegram-bot-api` or choose a smaller download format.
-Files above `telegram.max_upload_bytes` are reduced when possible; an
-unshrinkable oversize file is blocked rather than retried forever.
+destination are configured. New setups select `upload_transport = "mtproto"`:
+the bot signs in through MTProto, uploads one media file directly, preserves its
+title and cover, and stores its reusable session below the application data
+directory. Official PyPI and GHCR releases are ready for this path; source
+builds must provide both `ASMR_TG_MTPROTO_API_ID` and
+`ASMR_TG_MTPROTO_API_HASH`, or set the corresponding private TOML values.
+
+Set `upload_transport = "bot_api"` for an existing, native, or Compose-managed
+Bot API. The official cloud Bot API uses a 49 MB safety limit; oversized audio
+can be split with ffmpeg into 2-10 independently playable items in one media
+group. Each item has a distinct `Part i/n` title and its own cover attachment.
+Custom or local Bot API endpoints can instead use a larger single-file limit.
+
+On native Linux, the advanced local-service setup branch can register an
+already installed official-source `telegram-bot-api` executable at
+`127.0.0.1:18081`. Its service data is separate from the MTProto session.
+
+`setup` never calls Telegram's cloud `logOut` method. If a bot token is already
+in use at `api.telegram.org`, perform Telegram's official
+[local-server migration procedure](https://github.com/tdlib/telegram-bot-api#moving-a-bot-to-a-local-server)
+as a separate, explicit operation before using that token locally.
 
 Caption templates may use `{title}`, `{url}`, `{feed_name}`, `{video_id}`, and
 `{tag}`. Downloaded files are stored below provider-specific directories such as

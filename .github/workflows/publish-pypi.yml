@@ -1,0 +1,148 @@
+name: Publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install the project and runtime dependencies
+        run: python -m pip install .
+      - name: Run unit tests
+        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m unittest discover -s tests -v
+
+  build:
+    name: Build and verify distributions
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Verify tag and package versions
+        shell: bash
+        run: |
+          project_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          package_version="$(PYTHONPATH=src python -c 'import ytb_tg_backup; print(ytb_tg_backup.__version__)')"
+          if [[ "$project_version" != "$package_version" ]]; then
+            echo "::error::pyproject version $project_version does not match package version $package_version"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_NAME" != "v$project_version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package version v$project_version"
+            exit 1
+          fi
+      - name: Install build tools
+        run: python -m pip install --upgrade build twine
+      - name: Generate official MTProto defaults
+        env:
+          ASMR_TG_MTPROTO_API_ID: ${{ secrets.ASMR_TG_MTPROTO_API_ID }}
+          ASMR_TG_MTPROTO_API_HASH: ${{ secrets.ASMR_TG_MTPROTO_API_HASH }}
+        run: python scripts/generate_official_defaults.py
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Check distribution metadata
+        run: python -m twine check --strict dist/*
+      - name: Smoke-test the built wheel
+        shell: bash
+        run: |
+          python -m venv .wheel-smoke
+          .wheel-smoke/bin/python -m pip install --upgrade pip
+          .wheel-smoke/bin/python -m pip install dist/*.whl
+          .wheel-smoke/bin/python - <<'PY'
+          from ytb_tg_backup._official_defaults import MTPROTO_API_HASH, MTPROTO_API_ID
+
+          assert isinstance(MTPROTO_API_ID, int) and MTPROTO_API_ID > 0
+          assert isinstance(MTPROTO_API_HASH, str) and len(MTPROTO_API_HASH) == 32
+          PY
+          .wheel-smoke/bin/asmr-tg-backup --version
+          .wheel-smoke/bin/asmr-tg-backup --help
+          smoke_home="$RUNNER_TEMP/asmr-tg-backup-smoke"
+          config_path="$smoke_home/.config/asmr-tg-backup/config.toml"
+          HOME="$smoke_home" .wheel-smoke/bin/asmr-tg-backup init-config --output "$config_path"
+          test "$(stat -c '%a' "$config_path")" = "600"
+          HOME="$smoke_home" .wheel-smoke/bin/asmr-tg-backup init --config "$config_path"
+          HOME="$smoke_home" .wheel-smoke/bin/asmr-tg-backup status --config "$config_path"
+      - name: Upload distributions
+        uses: actions/upload-artifact@v5
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish distributions to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/asmr-tg-backup
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v6
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish distributions
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-image:
+    name: Publish the release wheel as a GHCR image
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Download the verified Python distributions
+        uses: actions/download-artifact@v6
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build, verify, and publish the wheel-backed image
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          version="${GITHUB_REF_NAME#v}"
+          docker build --target wheel-runtime --tag "$image:$version" --tag "$image:latest" .
+          docker run --rm "$image:$version" --version
+          docker push "$image:$version"
+          docker push "$image:latest"

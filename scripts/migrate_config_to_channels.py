@@ -47,7 +47,7 @@ def migrate(raw: dict, *, ffmpeg: str | None) -> dict:
         if converted is None:
             retained_feeds.append(dict(feed))
             continue
-        if "base_url" not in rsshub:
+        if converted["base_url"] and "base_url" not in rsshub:
             rsshub["base_url"] = converted["base_url"]
         key = (converted["name"], converted["channel_id"])
         existing = converted_by_key.setdefault(
@@ -90,7 +90,7 @@ def migrate(raw: dict, *, ffmpeg: str | None) -> dict:
 
     return {
         "app": dict(raw.get("app") or {}),
-        "rsshub": rsshub or {"base_url": "https://rss.dreaife.tokyo"},
+        "rsshub": rsshub,
         "channels": channels,
         "feeds": retained_feeds,
         "download": download,
@@ -109,7 +109,7 @@ def convert_feed(feed: dict) -> dict | None:
     if route not in {"channel", "live", "user"}:
         return None
     channel_id = "/".join(parts[2:])
-    base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else "https://rss.dreaife.tokyo"
+    base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
     feed_id = str(feed.get("id") or channel_id)
     name = str(feed.get("name") or feed_id)
     return {

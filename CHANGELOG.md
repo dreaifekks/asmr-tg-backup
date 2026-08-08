@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Split cloud-API audio uploads into independently playable parts and submit
+  them as one Telegram media group. Each part now has a distinct `Part i/n`
+  audio title and an independently attached cover, while preserving quality
+  and the existing uncertain-delivery protection for ambiguous outcomes.
+- Add direct MTProto media upload as the default transport, with a persistent
+  private session, a 1.99 GB application safety limit, runtime application
+  credential overrides, and optional `cryptg` acceleration. Keep Bot API as an
+  explicit advanced transport and playable cloud-API splitting as its final
+  oversize fallback.
+- Add a container image and Compose deployment with persistent MTProto state,
+  while retaining an optional local Telegram Bot API profile, custom API
+  endpoints, and direct loopback-safe native deployments.
+- Force loopback Telegram upload and control requests to bypass inherited HTTP
+  proxies so bot-token URLs stay on the local host.
+- Prepare the Python distribution for PyPI with a packaged safe config
+  template, Telethon and yt-dlp dependencies, build and Trusted Publishing
+  checks, and an official GHCR image built from the same verified wheel. Add an
+  interactive one-time setup that defaults to MTProto and exposes existing,
+  local, and official-splitting Bot API paths as advanced choices. The wheel
+  never bundles or downloads the C++ server executable.
+- Add a bilingual English/Simplified Chinese MkDocs Material documentation
+  site covering deployment, configuration, operation, architecture, security,
+  and troubleshooting.
+
 ## 0.3.2 - 2026-08-02
 
 - Preserve compatible source audio when preparing Telegram audio from a video

@@ -10,8 +10,12 @@ venv/
 build/
 dist/
 pip-wheel-metadata/
+site/
 
 # Local config, state, and generated data
+.env
+.env.*
+!.env.example
 config.toml
 *.local.toml
 outputs/
@@ -22,6 +26,11 @@ download-archive.txt
 *.db-*
 *.sqlite
 *.sqlite3
+*.session
+*.session-journal
+
+# Generated release defaults (the committed module contains placeholders only)
+src/ytb_tg_backup/_official_defaults.py.tmp
 
 # Test and tool caches
 .coverage

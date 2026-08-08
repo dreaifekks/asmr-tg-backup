@@ -35,7 +35,7 @@ class FeedConfig:
 
 @dataclass(frozen=True)
 class RsshubConfig:
-    base_url: str = "https://rss.dreaife.tokyo"
+    base_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -79,16 +79,53 @@ class DownloadConfig:
 
 
 @dataclass(frozen=True)
+class MtprotoConfig:
+    api_id: int | None = None
+    api_hash: str = ""
+    session_path: Path = Path("telegram-mtproto.session")
+    max_upload_bytes: int = 1_990_000_000
+
+
+@dataclass(frozen=True)
+class BotApiConfig:
+    api_base: str = "https://api.telegram.org"
+    max_upload_bytes: int = 49_000_000
+    split_large_audio: bool = True
+    max_upload_parts: int = 10
+
+
+@dataclass(frozen=True)
 class TelegramConfig:
     enabled: bool = False
     bot_token: str = ""
     chat_id: str = ""
-    api_base: str = "https://api.telegram.org"
+    upload_transport: str = "mtproto"
     media_type: str = "audio"
     send_as_document: bool = False
-    max_upload_bytes: int = 52_428_800
     upload_timeout_seconds: int = 7_200
     caption_template: str = "{title}\n\n{url}\n\n#{tag}"
+    mtproto: MtprotoConfig = field(default_factory=MtprotoConfig)
+    bot_api: BotApiConfig = field(default_factory=BotApiConfig)
+
+    # Transitional read-only views for the control bot and delivery planner.
+    # New transport code should use ``telegram.mtproto`` or ``telegram.bot_api``.
+    @property
+    def api_base(self) -> str:
+        return self.bot_api.api_base
+
+    @property
+    def max_upload_bytes(self) -> int:
+        if self.upload_transport == "mtproto":
+            return self.mtproto.max_upload_bytes
+        return self.bot_api.max_upload_bytes
+
+    @property
+    def split_large_audio(self) -> bool:
+        return self.upload_transport == "bot_api" and self.bot_api.split_large_audio
+
+    @property
+    def max_upload_parts(self) -> int:
+        return self.bot_api.max_upload_parts
 
 
 @dataclass(frozen=True)
@@ -155,7 +192,11 @@ def load_config(path: str | Path) -> Config:
         raw = tomllib.load(fh)
 
     app_raw = raw.get("app", {})
-    data_dir = Path(app_raw.get("data_dir", "~/.local/share/asmr-tg-backup")).expanduser()
+    data_dir_env = str(app_raw.get("data_dir_env", "ASMR_TG_BACKUP_DATA_DIR"))
+    data_dir = Path(
+        os.environ.get(data_dir_env)
+        or app_raw.get("data_dir", "~/.local/share/asmr-tg-backup")
+    ).expanduser()
     app = AppConfig(
         data_dir=data_dir,
         poll_interval_seconds=int(app_raw.get("poll_interval_seconds", 1800)),
@@ -171,7 +212,7 @@ def load_config(path: str | Path) -> Config:
     )
 
     rsshub_raw = raw.get("rsshub", {})
-    rsshub = RsshubConfig(base_url=str(rsshub_raw.get("base_url", "https://rss.dreaife.tokyo")).rstrip("/"))
+    rsshub = RsshubConfig(base_url=str(rsshub_raw.get("base_url", "")).rstrip("/"))
 
     channels = [
         ChannelConfig(
@@ -219,21 +260,78 @@ def load_config(path: str | Path) -> Config:
     )
 
     telegram_raw = raw.get("telegram", {})
+    mtproto_raw = telegram_raw.get("mtproto", {})
+    bot_api_raw = telegram_raw.get("bot_api", {})
+    if not isinstance(mtproto_raw, dict):
+        raise ValueError("telegram.mtproto must be a table")
+    if not isinstance(bot_api_raw, dict):
+        raise ValueError("telegram.bot_api must be a table")
+
+    bot_token_env = str(telegram_raw.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
+    chat_id_env = str(telegram_raw.get("chat_id_env", "TELEGRAM_CHAT_ID"))
+    upload_transport = str(
+        os.environ.get("ASMR_TG_UPLOAD_TRANSPORT")
+        or telegram_raw.get("upload_transport", "mtproto")
+    ).lower().strip()
+    api_base_env = str(bot_api_raw.get("api_base_env", "TELEGRAM_API_BASE"))
+    max_upload_bytes_env = str(
+        bot_api_raw.get("max_upload_bytes_env", "TELEGRAM_MAX_UPLOAD_BYTES")
+    )
+    api_id, api_hash = resolve_mtproto_credentials(mtproto_raw)
+    session_value = str(mtproto_raw.get("session_path", "")).strip()
+    session_path = (
+        Path(session_value).expanduser()
+        if session_value
+        else Path("telegram-mtproto.session")
+    )
+    if not session_path.is_absolute():
+        session_path = app.data_dir / session_path
+
     telegram = TelegramConfig(
         enabled=bool(telegram_raw.get("enabled", False)),
-        bot_token=str(telegram_raw.get("bot_token", "")),
-        chat_id=str(telegram_raw.get("chat_id", "")),
-        api_base=str(telegram_raw.get("api_base", "https://api.telegram.org")),
+        bot_token=str(
+            os.environ.get(bot_token_env) or telegram_raw.get("bot_token", "")
+        ),
+        chat_id=str(os.environ.get(chat_id_env) or telegram_raw.get("chat_id", "")),
+        upload_transport=upload_transport,
         media_type=str(telegram_raw.get("media_type", "audio")),
         send_as_document=bool(telegram_raw.get("send_as_document", False)),
-        max_upload_bytes=int(telegram_raw.get("max_upload_bytes", 52_428_800)),
         upload_timeout_seconds=max(1, int(telegram_raw.get("upload_timeout_seconds", 7_200))),
         caption_template=str(telegram_raw.get("caption_template", TelegramConfig.caption_template)),
+        mtproto=MtprotoConfig(
+            api_id=api_id,
+            api_hash=api_hash,
+            session_path=session_path,
+            max_upload_bytes=int(
+                mtproto_raw.get("max_upload_bytes", MtprotoConfig.max_upload_bytes)
+            ),
+        ),
+        bot_api=BotApiConfig(
+            api_base=str(
+                os.environ.get(api_base_env)
+                or bot_api_raw.get("api_base", BotApiConfig.api_base)
+            ),
+            max_upload_bytes=int(
+                os.environ.get(max_upload_bytes_env)
+                or bot_api_raw.get("max_upload_bytes", BotApiConfig.max_upload_bytes)
+            ),
+            split_large_audio=_strict_bool(
+                bot_api_raw.get("split_large_audio", True),
+                label="telegram.bot_api.split_large_audio",
+            ),
+            max_upload_parts=int(bot_api_raw.get("max_upload_parts", 10)),
+        ),
     )
+    if telegram.upload_transport not in {"mtproto", "bot_api"}:
+        raise ValueError("telegram.upload_transport must be 'mtproto' or 'bot_api'")
     if telegram.media_type not in {"audio", "document", "video"}:
         raise ValueError("telegram.media_type must be 'audio', 'document', or 'video'")
-    if telegram.max_upload_bytes <= 0:
-        raise ValueError("telegram.max_upload_bytes must be positive")
+    if telegram.mtproto.max_upload_bytes <= 0:
+        raise ValueError("telegram.mtproto.max_upload_bytes must be positive")
+    if telegram.bot_api.max_upload_bytes <= 0:
+        raise ValueError("telegram.bot_api.max_upload_bytes must be positive")
+    if not 1 <= telegram.bot_api.max_upload_parts <= 10:
+        raise ValueError("telegram.bot_api.max_upload_parts must be between 1 and 10")
 
     twitch_raw = raw.get("twitch", {})
     client_id_env = str(twitch_raw.get("client_id_env", "TWITCH_CLIENT_ID"))
@@ -399,6 +497,68 @@ def _strict_bool(value: object, *, label: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{label} must be true or false")
     return value
+
+
+def official_mtproto_credentials() -> tuple[int | None, str]:
+    """Return the credential pair included only in official release artifacts."""
+    try:
+        from . import _official_defaults
+    except ImportError:
+        return None, ""
+    return _parse_mtproto_credential_pair(
+        getattr(_official_defaults, "MTPROTO_API_ID", None),
+        getattr(_official_defaults, "MTPROTO_API_HASH", None),
+        label="official MTProto defaults",
+    )
+
+
+def resolve_mtproto_credentials(raw: dict[str, Any]) -> tuple[int | None, str]:
+    env_id = os.environ.get("ASMR_TG_MTPROTO_API_ID")
+    env_hash = os.environ.get("ASMR_TG_MTPROTO_API_HASH")
+    if _credential_source_is_present(env_id, env_hash):
+        return _parse_mtproto_credential_pair(
+            env_id,
+            env_hash,
+            label="ASMR_TG_MTPROTO_API_ID/ASMR_TG_MTPROTO_API_HASH",
+        )
+
+    config_id = raw.get("api_id")
+    config_hash = raw.get("api_hash")
+    if _credential_source_is_present(config_id, config_hash):
+        return _parse_mtproto_credential_pair(
+            config_id,
+            config_hash,
+            label="telegram.mtproto.api_id/api_hash",
+        )
+
+    return official_mtproto_credentials()
+
+
+def _credential_source_is_present(api_id: object, api_hash: object) -> bool:
+    return bool(str(api_id).strip() if api_id is not None else "") or bool(
+        str(api_hash).strip() if api_hash is not None else ""
+    )
+
+
+def _parse_mtproto_credential_pair(
+    api_id: object,
+    api_hash: object,
+    *,
+    label: str,
+) -> tuple[int | None, str]:
+    id_value = str(api_id).strip() if api_id is not None else ""
+    hash_value = str(api_hash).strip() if api_hash is not None else ""
+    if bool(id_value) != bool(hash_value):
+        raise ValueError(f"{label} must provide both values together")
+    if not id_value:
+        return None, ""
+    if not id_value.isascii() or not id_value.isdecimal() or int(id_value) <= 0:
+        raise ValueError(f"{label} API ID must be a positive integer")
+    if len(hash_value) != 32 or not all(
+        character in "0123456789abcdefABCDEF" for character in hash_value
+    ):
+        raise ValueError(f"{label} API hash must be a 32-character hexadecimal value")
+    return int(id_value), hash_value
 
 
 def _load_download_profiles(raw_profiles: dict[str, Any]) -> dict[str, DownloadProfile]:

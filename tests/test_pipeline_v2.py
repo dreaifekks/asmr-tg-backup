@@ -337,7 +337,112 @@ class PipelineV2Test(unittest.TestCase):
             self.assertEqual(self._run_one(service, downloader, telegram, owner="delivery"), 1)
 
             downloader.shrink_audio_for_upload.assert_not_called()
+            downloader.split_audio_for_upload.assert_not_called()
             self.assertEqual(telegram.upload.call_args.args[0], master_path)
+            service.store.close()
+
+    def test_send_as_document_uses_single_audio_derivative_instead_of_album(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service, _ = self._service_with_media(Path(tmp), "audio-document")
+            service.config = replace(
+                service.config,
+                telegram=replace(
+                    service.config.telegram,
+                    send_as_document=True,
+                    bot_api=replace(
+                        service.config.telegram.bot_api,
+                        split_large_audio=True,
+                    ),
+                ),
+            )
+            master_path = Path(tmp) / "audio-document.m4a"
+            master_path.write_bytes(b"audio")
+            downloader = self._downloader(master_path)
+            telegram = mock.Mock()
+            telegram.upload.return_value = 900
+
+            self.assertEqual(self._run_one(service, downloader, telegram, owner="download"), 1)
+            self.assertEqual(self._run_one(service, downloader, telegram, owner="delivery"), 1)
+
+            downloader.split_audio_for_upload.assert_not_called()
+            downloader.shrink_audio_for_upload.assert_called_once_with(
+                master_path,
+                service.config.telegram.bot_api.max_upload_bytes,
+                force_audio=True,
+            )
+            self.assertEqual(telegram.upload.call_args.args[0], master_path)
+            service.store.close()
+
+    def test_mtproto_delivery_keeps_large_audio_whole(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            service, _ = self._service_with_media(
+                tmp_path,
+                "mtproto-audio",
+                upload_transport="mtproto",
+            )
+            master_path = tmp_path / "mtproto-audio.m4a"
+            master_path.write_bytes(b"whole audio")
+            downloader = self._downloader(master_path)
+            telegram = mock.Mock()
+
+            def upload(_path, **kwargs):
+                kwargs["before_commit"]()
+                return 903
+
+            telegram.upload.side_effect = upload
+
+            self.assertEqual(self._run_one(service, downloader, telegram, owner="download"), 1)
+            self.assertEqual(self._run_one(service, downloader, telegram, owner="delivery"), 1)
+
+            downloader.split_audio_for_upload.assert_not_called()
+            downloader.shrink_audio_for_upload.assert_not_called()
+            self.assertEqual(telegram.upload.call_args.args[0], master_path)
+            self.assertEqual(telegram.upload.call_args.kwargs["duration_seconds"], 123.0)
+            self.assertEqual(telegram.upload.call_args.kwargs["performer"], "ASMR")
+            service.store.close()
+
+    def test_split_audio_delivery_records_parts_and_all_remote_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            service, media_id = self._service_with_media(tmp_path, "long-audio")
+            master_path = tmp_path / "long-audio.m4a"
+            master_path.write_bytes(b"master")
+            first = tmp_path / "long-audio.part1.m4a"
+            second = tmp_path / "long-audio.part2.m4a"
+            first.write_bytes(b"part one")
+            second.write_bytes(b"part two")
+            downloader = self._downloader(master_path)
+            downloader.split_audio_for_upload.return_value = [
+                DownloadResult(first, first.stat().st_size),
+                DownloadResult(second, second.stat().st_size),
+            ]
+            telegram = mock.Mock()
+            telegram.upload.return_value = [901, 902]
+
+            self.assertEqual(self._run_one(service, downloader, telegram, owner="download"), 1)
+            self.assertEqual(self._run_one(service, downloader, telegram, owner="delivery"), 1)
+
+            self.assertEqual(telegram.upload.call_args.args[0], [first, second])
+            self.assertEqual(
+                service.store.conn.execute(
+                    "SELECT remote_id FROM deliveries WHERE media_id=?",
+                    (media_id,),
+                ).fetchone()["remote_id"],
+                "901,902",
+            )
+            artifacts = service.store.conn.execute(
+                """
+                SELECT part_no, path FROM artifacts
+                WHERE media_id=? AND role='telegram_upload'
+                ORDER BY part_no
+                """,
+                (media_id,),
+            ).fetchall()
+            self.assertEqual(
+                [(row["part_no"], row["path"]) for row in artifacts],
+                [(0, str(first)), (1, str(second))],
+            )
             service.store.close()
 
     def test_delivery_passes_media_published_at_to_telegram(self):
@@ -400,7 +505,13 @@ class PipelineV2Test(unittest.TestCase):
             self.assertEqual(tuple(row), ("succeeded", 0))
             service.store.close()
 
-    def _service_with_media(self, tmp_path: Path, external_id: str) -> tuple[BackupService, int]:
+    def _service_with_media(
+        self,
+        tmp_path: Path,
+        external_id: str,
+        *,
+        upload_transport: str = "bot_api",
+    ) -> tuple[BackupService, int]:
         config_path = tmp_path / "config.toml"
         config_path.write_text(
             f"""
@@ -418,6 +529,14 @@ write_thumbnail = false
 enabled = true
 bot_token = "token"
 chat_id = "@archive"
+upload_transport = "{upload_transport}"
+
+[telegram.mtproto]
+api_id = 12345
+api_hash = "0123456789abcdef0123456789abcdef"
+session_path = "{tmp_path / 'telegram.session'}"
+
+[telegram.bot_api]
 max_upload_bytes = 1000000
 
 [[origins]]
@@ -446,7 +565,14 @@ bootstrap = "all"
             file_path=artifact_path,
             file_size=artifact_path.stat().st_size,
         )
+        downloader.split_audio_for_upload.return_value = [
+            DownloadResult(
+                file_path=artifact_path,
+                file_size=artifact_path.stat().st_size,
+            )
+        ]
         downloader.prepare_thumbnail_for_upload.return_value = None
+        downloader.media_duration_seconds.return_value = 123.0
         return downloader
 
     @staticmethod

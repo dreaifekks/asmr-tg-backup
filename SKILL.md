@@ -75,8 +75,8 @@ databases instead of the user's real state.
 
 - `src/ytb_tg_backup/cli.py`: `init`, `run`, `poll`, `process`, `status`, and
   YouTube-compatible manual `enqueue` commands.
-- `src/ytb_tg_backup/config.py`: TOML dataclasses, legacy config translation,
-  worker/timeout settings, origins, and Twitch environment lookup.
+- `src/ytb_tg_backup/config.py`: TOML dataclasses, MTProto/Bot API transport
+  settings, worker/timeout settings, origins, and environment lookup.
 - `src/ytb_tg_backup/models.py`: provider-neutral origin, media candidate,
   discovery result, and claimed-job values.
 - `src/ytb_tg_backup/sources.py`: adapter registry plus YouTube, RSS, and Twitch
@@ -93,14 +93,19 @@ databases instead of the user's real state.
   bounded `yt-dlp`/`ffmpeg` subprocesses, per-provider formats, and independent
   archive files. Twitch defaults to an M4A audio master and does not retain the
   source video.
-- `src/ytb_tg_backup/telegram.py`: bounded Telegram upload via `curl`, with the
-  token supplied through stdin rather than the process command line.
+- `src/ytb_tg_backup/telegram.py`: transport factory and bounded Bot API upload
+  via `curl`, with the token supplied through stdin rather than the process
+  command line.
+- `src/ytb_tg_backup/telegram_mtproto.py`: direct MTProto media upload with one
+  persistent private session and a pre-upload/commit delivery boundary.
 - `src/ytb_tg_backup/control.py`: provider-neutral `/origin` management and a
   persistent single-message Telegram inline-keyboard panel for origins,
   filtering, and statistics. It reads the cached panel snapshot and receives
   updates through Telegram long polling. Legacy `/sub` remains a YouTube alias.
 - `scripts/`: one-off config/state repair utilities.
-- `deploy/`: hardened user systemd unit and optional local Telegram Bot API.
+- Root `Dockerfile`/`compose.yaml`: containerized app plus optional bundled
+  local Telegram Bot API. `deploy/` retains the hardened source-checkout
+  systemd unit and standalone shared Bot API.
 
 ## State and Job Flow
 
@@ -111,10 +116,10 @@ origin discovery -> download job -> master artifact -> telegram_delivery job -> 
 - Download and Telegram delivery have independent job rows, failure budgets,
   retry schedules, and lease ownership. An upload error must not re-download an
   existing master artifact.
-- `run` leaves source polling on the main thread, starts one control long-poll
-  thread, and starts `[app].worker_count` job threads. Each thread owns its
-  SQLite connection. Job workers atomically claim either job type and renew
-  leases in a heartbeat thread.
+- `run` starts source pollers, one control long-poll thread, download workers,
+  and one dedicated Telegram delivery worker. Each thread owns its SQLite
+  connection; the delivery worker alone owns the MTProto client/session. Jobs
+  are claimed atomically and leases are renewed in a heartbeat thread.
 - Live/not-ready media is deferred without consuming the failure budget. Probe,
   download, transcode, and definitive Telegram failures consume their own job's
   budget.
@@ -177,8 +182,10 @@ origin discovery -> download job -> master artifact -> telegram_delivery job -> 
   the repository and add it through the installed user-unit configuration.
 - The unit expects the repo at `~/dev/asmr-tg-backup` and config at
   `~/.config/asmr-tg-backup/config.toml`.
-- The local Telegram Bot API service is under `deploy/telegram-bot-api`; set
-  `telegram.api_base = "http://127.0.0.1:18081"` when using it.
+- For a full-stack container deployment, use the root Compose `local-api`
+  profile and `TELEGRAM_API_BASE=http://telegram-bot-api:8081`. The standalone
+  shared API remains under `deploy/telegram-bot-api`; native services normally
+  reach it at `http://127.0.0.1:18081`.
 - Do not commit `.venv/`, `__pycache__/`, `*.egg-info/`, real configs,
   environment files, SQLite/WAL files, downloads, archives, or migration
   backups.

@@ -9,10 +9,11 @@ import secrets
 import shlex
 from typing import Any
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from .config import Config
 from .models import Origin
+from .network import is_loopback_url
 from .source_filter import (
     DEFAULT_SOURCE_FILTER_PATTERN,
     SOURCE_FILTER_STATE_KEY,
@@ -1780,7 +1781,11 @@ class ControlBot:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=request_timeout_seconds) as response:
+            if is_loopback_url(self.config.telegram.api_base):
+                open_request = build_opener(ProxyHandler({})).open
+            else:
+                open_request = urlopen
+            with open_request(request, timeout=request_timeout_seconds) as response:
                 parsed = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")

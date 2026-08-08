@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import glob
+import importlib.util
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -34,6 +37,7 @@ MEDIA_EXTENSIONS = {
     ".ts",
 }
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".opus", ".ogg", ".aac", ".flac", ".wav"}
+TELEGRAM_AUDIO_EXTENSIONS = {".m4a", ".mp3"}
 THUMBNAIL_EXTENSIONS = {".jpg", ".jpeg", ".webp", ".png"}
 TELEGRAM_THUMBNAIL_MAX_BYTES = 200_000
 
@@ -83,7 +87,8 @@ class Downloader:
 
     def check_tools(self) -> list[str]:
         missing = []
-        if shutil.which(self.config.download.yt_dlp) is None:
+        yt_dlp_command = self._yt_dlp_command()
+        if len(yt_dlp_command) == 1 and shutil.which(yt_dlp_command[0]) is None:
             missing.append(self.config.download.yt_dlp)
         profile_needs_ffmpeg = any(
             profile.extract_audio is True or (
@@ -105,7 +110,7 @@ class Downloader:
         live: bool = False,
     ) -> ProbeResult:
         cmd = [
-            self.config.download.yt_dlp,
+            *self._yt_dlp_command(),
             "--no-warnings",
             "--skip-download",
         ]
@@ -178,7 +183,7 @@ class Downloader:
             else self.config.download.output_template
         )
         cmd = [
-            self.config.download.yt_dlp,
+            *self._yt_dlp_command(),
             "--no-playlist",
             "--paths",
             f"home:{provider_dir}",
@@ -457,6 +462,12 @@ class Downloader:
             os.replace(temp_path / f"final{output_suffix}", output)
         return DownloadResult(file_path=output, file_size=output.stat().st_size)
 
+    def _yt_dlp_command(self) -> list[str]:
+        configured = self.config.download.yt_dlp
+        if configured == "yt-dlp" and importlib.util.find_spec("yt_dlp") is not None:
+            return [sys.executable, "-m", "yt_dlp"]
+        return [configured]
+
     def shrink_audio_for_upload(
         self,
         file_path: Path,
@@ -464,7 +475,9 @@ class Downloader:
         *,
         force_audio: bool = False,
     ) -> DownloadResult:
-        needs_audio_derivative = force_audio and file_path.suffix.lower() not in AUDIO_EXTENSIONS
+        needs_audio_derivative = (
+            force_audio and file_path.suffix.lower() not in TELEGRAM_AUDIO_EXTENSIONS
+        )
         if not needs_audio_derivative and file_path.stat().st_size <= max_bytes:
             return DownloadResult(file_path=file_path, file_size=file_path.stat().st_size)
         ffmpeg = self.config.download.ffmpeg
@@ -515,6 +528,124 @@ class Downloader:
                     os.replace(temporary_output, output)
                     return DownloadResult(file_path=output, file_size=size)
         return DownloadResult(file_path=file_path, file_size=file_path.stat().st_size)
+
+    def split_audio_for_upload(
+        self,
+        file_path: Path,
+        max_bytes: int,
+        *,
+        max_parts: int = 10,
+    ) -> list[DownloadResult]:
+        """Prepare one or more independently playable Telegram audio files.
+
+        Telegram media groups accept at most ten items. Audio is first normalized
+        without reducing quality when it already fits within the aggregate album
+        budget, then segmented on media boundaries with ffmpeg stream copy.
+        """
+        aggregate_limit = max_bytes * max_parts
+        prepared = self.shrink_audio_for_upload(
+            file_path,
+            aggregate_limit,
+            force_audio=True,
+        )
+        if prepared.file_size <= max_bytes:
+            return [prepared]
+        ffmpeg = self.config.download.ffmpeg
+        if not ffmpeg or max_parts < 2:
+            return [prepared]
+
+        duration = self._duration_seconds(prepared.file_path)
+        if duration <= 0:
+            return [prepared]
+        target_bytes = max(1, int(max_bytes * 0.9))
+        target_parts = max(2, math.ceil(prepared.file_size / target_bytes))
+        if target_parts > max_parts:
+            return [prepared]
+
+        # AAC/MP4 durations commonly include a trailing encoder-delay packet.
+        # A small margin avoids producing an otherwise empty N+1 segment.
+        segment_seconds = max(0.25, duration / target_parts * 1.01)
+        suffix = prepared.file_path.suffix.lower()
+        if suffix not in TELEGRAM_AUDIO_EXTENSIONS:
+            suffix = ".m4a"
+
+        for _attempt in range(4):
+            with tempfile.TemporaryDirectory(
+                prefix=".tg-audio-split-",
+                dir=prepared.file_path.parent,
+            ) as temp_dir:
+                temp_path = Path(temp_dir)
+                output_pattern = temp_path / f"part-%03d{suffix}"
+                cmd = [
+                    ffmpeg,
+                    "-nostdin",
+                    "-y",
+                    "-i",
+                    str(prepared.file_path),
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-c:a",
+                    "copy",
+                    "-f",
+                    "segment",
+                    "-segment_time",
+                    f"{segment_seconds:.6f}",
+                    "-reset_timestamps",
+                    "1",
+                    str(output_pattern),
+                ]
+                self.logger.info(
+                    "splitting audio for Telegram path=%s segment_seconds=%.3f",
+                    prepared.file_path,
+                    segment_seconds,
+                )
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    timeout=self.config.download.ffmpeg_timeout_seconds,
+                )
+                parts = sorted(temp_path.glob(f"part-*{suffix}"))
+                parts = [part for part in parts if part.stat().st_size > 0]
+                if not parts:
+                    return [prepared]
+
+                largest = max(part.stat().st_size for part in parts)
+                if len(parts) <= max_parts and largest <= max_bytes:
+                    results: list[DownloadResult] = []
+                    total = len(parts)
+                    for index, part in enumerate(parts, start=1):
+                        output = prepared.file_path.with_name(
+                            f"{prepared.file_path.stem}.tgpart{index:02d}-of-{total:02d}{suffix}"
+                        )
+                        os.replace(part, output)
+                        results.append(
+                            DownloadResult(
+                                file_path=output,
+                                file_size=output.stat().st_size,
+                            )
+                        )
+                    return results
+                if (
+                    len(parts) == max_parts + 1
+                    and parts[-1].stat().st_size < max_bytes * 0.1
+                ):
+                    segment_seconds *= 1.02
+                    continue
+                if len(parts) >= max_parts:
+                    break
+                segment_seconds *= min(0.8, max_bytes / largest * 0.9)
+                segment_seconds = max(0.25, segment_seconds)
+
+        self.logger.warning(
+            "could not split audio within Telegram limits path=%s max_bytes=%s max_parts=%s",
+            prepared.file_path,
+            max_bytes,
+            max_parts,
+        )
+        return [prepared]
 
     def _copy_audio_for_upload(
         self,
@@ -667,6 +798,40 @@ class Downloader:
         if not candidates:
             return None
         return max(candidates, key=lambda item: item.stat().st_size if item.exists() else -1)
+
+    def media_duration_seconds(self, file_path: Path) -> float:
+        """Return container duration for Telegram media metadata."""
+        return self._duration_seconds(file_path)
+
+    def media_video_dimensions(self, file_path: Path) -> tuple[int, int]:
+        """Return the first video stream dimensions for Telegram metadata."""
+        ffprobe = _ffprobe_for(self.config.download.ffmpeg)
+        completed = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=s=x:p=0",
+                str(file_path),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=self.config.download.ffmpeg_timeout_seconds,
+        )
+        raw_width, separator, raw_height = completed.stdout.strip().partition("x")
+        if not separator:
+            raise ValueError("ffprobe did not return video dimensions")
+        width = int(raw_width)
+        height = int(raw_height)
+        if width <= 0 or height <= 0:
+            raise ValueError("ffprobe returned invalid video dimensions")
+        return width, height
 
     def _duration_seconds(self, file_path: Path) -> float:
         ffprobe = _ffprobe_for(self.config.download.ffmpeg)

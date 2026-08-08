@@ -39,7 +39,11 @@ from .sources import (
     validate_public_media_url,
 )
 from .store import Store, future_iso, now_iso
-from .telegram import TelegramUploader, TelegramUploadError
+from .telegram import (
+    TelegramTransport,
+    TelegramUploadError,
+    create_telegram_transport,
+)
 
 
 class BackupService:
@@ -49,7 +53,7 @@ class BackupService:
         self.logger = logging.getLogger("asmr_tg_backup")
         self.store = Store(config.db_path)
         self.downloader = Downloader(config, self.logger)
-        self.telegram = TelegramUploader(config.telegram)
+        self.telegram = create_telegram_transport(config.telegram)
         self.control_bot = ControlBot(config, self.store, self.logger)
         self.sources = self._new_source_registry()
         self._stop_event = threading.Event()
@@ -141,6 +145,14 @@ class BackupService:
                 ),
             )
         )
+        if self.config.telegram.enabled:
+            workers.append(
+                threading.Thread(
+                    target=self._delivery_worker_loop,
+                    name="telegram-delivery-worker",
+                    daemon=True,
+                )
+            )
         if self.config.control.enabled:
             workers.append(
                 threading.Thread(
@@ -161,9 +173,17 @@ class BackupService:
                 worker.join(timeout=max(0.0, drain_deadline - time.monotonic()))
                 if worker.is_alive():
                     self.logger.warning("worker did not drain before shutdown name=%s", worker.name)
+            self.close()
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    def close(self) -> None:
+        """Release the transport session and the primary database handle."""
+        try:
+            self.telegram.close()
+        finally:
+            self.store.close()
 
     def poll_once(self, *, process: bool) -> None:
         self.initialize()
@@ -429,20 +449,14 @@ class BackupService:
                 store = Store(self.config.db_path)
                 store.initialize()
                 downloader = Downloader(self.config, self.logger)
-                telegram = TelegramUploader(self.config.telegram)
                 while not self._stop_event.is_set():
-                    job_types = (
-                        ("download", "telegram_delivery")
-                        if download_lane == "standard"
-                        else ("download",)
-                    )
                     processed = self._process_available(
                         store,
                         downloader,
-                        telegram,
+                        self.telegram,
                         owner=owner,
                         limit=1,
-                        job_types=job_types,
+                        job_types=("download",),
                         download_lane=download_lane,
                     )
                     if processed == 0:
@@ -455,6 +469,44 @@ class BackupService:
                 )
                 self._stop_event.wait(min(10, self.config.app.worker_poll_interval_seconds))
             finally:
+                if store is not None:
+                    store.close()
+
+    def _delivery_worker_loop(self) -> None:
+        owner = (
+            f"worker:telegram:{socket.gethostname()}:{os.getpid()}:"
+            f"{uuid.uuid4().hex[:8]}"
+        )
+        while not self._stop_event.is_set():
+            store: Store | None = None
+            telegram: TelegramTransport | None = None
+            try:
+                store = Store(self.config.db_path)
+                store.initialize()
+                downloader = Downloader(self.config, self.logger)
+                # A single delivery worker owns the MTProto client and its
+                # SQLite session. Download workers never open that session.
+                telegram = create_telegram_transport(self.config.telegram)
+                while not self._stop_event.is_set():
+                    processed = self._process_available(
+                        store,
+                        downloader,
+                        telegram,
+                        owner=owner,
+                        limit=1,
+                        job_types=("telegram_delivery",),
+                    )
+                    if processed == 0:
+                        self._stop_event.wait(self.config.app.worker_poll_interval_seconds)
+            except Exception:
+                self.logger.exception("Telegram delivery worker crashed; reconnecting")
+                self._stop_event.wait(min(10, self.config.app.worker_poll_interval_seconds))
+            finally:
+                if telegram is not None:
+                    try:
+                        telegram.close()
+                    except Exception:
+                        self.logger.exception("could not close Telegram delivery transport")
                 if store is not None:
                     store.close()
 
@@ -488,7 +540,7 @@ class BackupService:
         self,
         store: Store,
         downloader: Downloader,
-        telegram: TelegramUploader,
+        telegram: TelegramTransport,
         *,
         owner: str,
         limit: int,
@@ -895,7 +947,7 @@ class BackupService:
         self,
         store: Store,
         downloader: Downloader,
-        telegram: TelegramUploader,
+        telegram: TelegramTransport,
         job: ClaimedJob,
     ) -> None:
         if not self.config.telegram.enabled:
@@ -944,24 +996,47 @@ class BackupService:
             return
 
         master_path = Path(str(artifact["path"]))
-        upload_path = master_path
+        upload_paths = [master_path]
         upload_artifact_id = int(artifact["id"])
         try:
-            if self.config.telegram.media_type == "audio":
-                prepared = downloader.shrink_audio_for_upload(
-                    master_path,
-                    self.config.telegram.max_upload_bytes,
-                    force_audio=True,
-                )
-                upload_path = prepared.file_path
-                if upload_path != master_path:
-                    upload_artifact_id = store.record_artifact(
+            if (
+                self.config.telegram.media_type == "audio"
+                and self.config.telegram.upload_transport == "bot_api"
+            ):
+                if (
+                    self.config.telegram.bot_api.split_large_audio
+                    and not self.config.telegram.send_as_document
+                ):
+                    prepared_parts = downloader.split_audio_for_upload(
+                        master_path,
+                        self.config.telegram.bot_api.max_upload_bytes,
+                        max_parts=self.config.telegram.bot_api.max_upload_parts,
+                    )
+                else:
+                    prepared_parts = [
+                        downloader.shrink_audio_for_upload(
+                            master_path,
+                            self.config.telegram.bot_api.max_upload_bytes,
+                            force_audio=True,
+                        )
+                    ]
+                upload_paths = [part.file_path for part in prepared_parts]
+                for part_no, prepared in enumerate(prepared_parts):
+                    if prepared.file_path == master_path:
+                        continue
+                    derived_id = store.record_artifact(
                         job.media_id,
                         role="telegram_upload",
-                        path=upload_path,
+                        part_no=part_no,
+                        path=prepared.file_path,
                         size_bytes=prepared.file_size,
-                        metadata={"derived_from": int(artifact["id"])},
+                        metadata={
+                            "derived_from": int(artifact["id"]),
+                            "part_count": len(prepared_parts),
+                        },
                     )
+                    if part_no == 0:
+                        upload_artifact_id = derived_id
             thumbnail_path = downloader.prepare_thumbnail_for_upload(
                 str(media["external_id"]),
                 provider=str(media["provider"]),
@@ -973,23 +1048,73 @@ class BackupService:
                     path=thumbnail_path,
                     size_bytes=thumbnail_path.stat().st_size,
                 )
-            store.mark_delivery_sending(job)
+            feed_name = store.primary_origin_name(job.media_id)
+            duration_seconds: float | None = None
+            video_width: int | None = None
+            video_height: int | None = None
+            if (
+                self.config.telegram.upload_transport == "mtproto"
+                and self.config.telegram.media_type in {"audio", "video"}
+            ):
+                try:
+                    duration_seconds = downloader.media_duration_seconds(master_path)
+                except (OSError, ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    self.logger.warning(
+                        "could not read Telegram media duration path=%s",
+                        master_path,
+                        exc_info=True,
+                    )
+            if (
+                self.config.telegram.upload_transport == "mtproto"
+                and self.config.telegram.media_type == "video"
+            ):
+                try:
+                    video_width, video_height = downloader.media_video_dimensions(master_path)
+                except (OSError, ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    self.logger.warning(
+                        "could not read Telegram video dimensions path=%s",
+                        master_path,
+                        exc_info=True,
+                    )
+            sending_marked = False
+
+            def before_commit() -> None:
+                nonlocal sending_marked
+                store.mark_delivery_sending(job)
+                sending_marked = True
+
             message_id = telegram.upload(
-                upload_path,
+                upload_paths if len(upload_paths) > 1 else upload_paths[0],
                 title=str(media["title"]),
                 url=str(media["canonical_url"]),
-                feed_name=store.primary_origin_name(job.media_id),
+                feed_name=feed_name,
                 video_id=str(media["external_id"]),
                 published_at=(
                     str(media["published_at"]) if media["published_at"] else None
                 ),
                 thumbnail_path=thumbnail_path,
+                performer=feed_name,
+                duration_seconds=duration_seconds,
+                video_width=video_width,
+                video_height=video_height,
+                before_commit=before_commit,
             )
+            # All built-in transports invoke before_commit. Keeping this guard
+            # makes test/future transports fail closed before local completion.
+            if not sending_marked:
+                store.mark_delivery_sending(job)
         except TelegramUploadError as exc:
             message = self._safe_error(exc)
             if exc.uncertain:
                 store.mark_job_uncertain(job, error=message)
-            elif "exceeds telegram.max_upload_bytes" in message:
+            elif exc.retry_after is not None:
+                store.defer_job(
+                    job,
+                    reason_code="telegram_rate_limited",
+                    error=message,
+                    retry_seconds=max(1, int(exc.retry_after)),
+                )
+            elif exc.code == "upload_too_large":
                 store.block_job(job, reason_code="upload_too_large", error=message)
             else:
                 store.fail_job(
@@ -1012,7 +1137,11 @@ class BackupService:
                 job,
                 artifact_id=upload_artifact_id,
                 destination_key=job.target_key,
-                remote_id=str(message_id),
+                remote_id=(
+                    ",".join(str(item) for item in message_id)
+                    if isinstance(message_id, list)
+                    else str(message_id)
+                ),
             )
         except Exception as exc:
             # The remote side effect already succeeded. Never turn a local
@@ -1231,6 +1360,7 @@ class BackupService:
             text = str(exc)
         for secret in (
             self.config.telegram.bot_token,
+            self.config.telegram.mtproto.api_hash,
             self.config.twitch.access_token,
             self.config.twitch.client_secret,
         ):
