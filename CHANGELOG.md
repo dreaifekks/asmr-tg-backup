@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-08-08
+
 - Split cloud-API audio uploads into independently playable parts and submit
   them as one Telegram media group. Each part now has a distinct `Part i/n`
   audio title and an independently attached cover, while preserving quality
