@@ -11,28 +11,8 @@ worker_poll_interval_seconds = 2
 job_lease_seconds = 900
 log_level = "INFO"
 
-[[origins]]
-id = "youtube-placeholder"
-provider = "youtube"
-kind = "uploads"
-name = "YouTube ASMR placeholder"
-external_id = "UC_CHANNEL_ID"
-bootstrap = "latest"
-enabled = false
-
-# Twitch VOD/live placeholder. Supply the credentials only through the
-# environment variables named in [twitch].
-[[origins]]
-id = "twitch-placeholder"
-provider = "twitch"
-kind = "vods"
-name = "Twitch ASMR placeholder"
-external_id = "twitch_login_or_numeric_broadcaster_id"
-bootstrap = "latest"
-enabled = false
-# Only twitch/vods supports this per-origin override. Panel-managed Twitch
-# channels store the same choice in SQLite.
-# recording_mode = "live"
+[sources]
+path = "/home/your-user/.config/asmr-tg-backup/sources.toml"
 
 [download]
 yt_dlp = "/home/your-user/dev/asmr-tg-backup/.venv/bin/yt-dlp"
@@ -92,8 +72,7 @@ access_token_env = "TWITCH_ACCESS_TOKEN"
 client_secret_env = "TWITCH_CLIENT_SECRET"
 request_timeout_seconds = 30
 max_pages_per_poll = 3
-# Fallback for Twitch vods origins without their own recording_mode. The panel
-# persists its live/vod selection per bot-managed channel in SQLite.
+# Fallback for Twitch vods origins without recording_mode in sources.toml.
 recording_mode = "vod"
 live_poll_interval_seconds = 30
 live_retry_seconds = 15
@@ -110,7 +89,6 @@ panel_idle_timeout_seconds = 3600
 # Browsing local resources is read-only unless this is explicitly enabled.
 allow_disk_delete = false
 delete_webhook_on_startup = true
-default_routes = ["live"]
 # Each /panel sends a fresh message; navigation edits that current message.
 # The panel state survives service restarts.
 # Authorization requires every configured dimension to match. Empty dimensions

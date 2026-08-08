@@ -2,7 +2,7 @@
 
 ## CLI workflow
 
-All commands accept `--config`. The option may appear before or after the
+Runtime commands accept `--config`. The option may appear before or after the
 subcommand.
 
 ```bash
@@ -27,25 +27,53 @@ asmr-tg-backup enqueue --config config.toml \
   https://www.youtube.com/watch?v=VIDEO_ID
 ```
 
+Install or remove the native background service with:
+
+```bash
+asmr-tg-backup service install
+asmr-tg-backup service uninstall
+```
+
+The uninstall command removes only the generated systemd unit. Runtime files
+remain in the configuration and data directories.
+
+Prefer `/panel` for source and filter changes. For a manual catalog edit,
+validate and apply it explicitly:
+
+```bash
+asmr-tg-backup sources path --config config.toml
+asmr-tg-backup sources validate --config config.toml
+asmr-tg-backup sources apply --config config.toml
+asmr-tg-backup sources list --config config.toml
+```
+
+`sources apply` reconciles the running database mirror; it does not rewrite
+`config.toml`. Global settings in `config.toml` still require a service restart.
+
 ## State and backups
 
 State lives under `[app].data_dir`, or the `ASMR_TG_BACKUP_DATA_DIR` environment
 override. It includes:
 
 - `state.db` and versioned migration backups;
-- provider-specific downloads and derived Telegram artifacts; and
+- provider-specific downloads and derived Telegram files;
 - yt-dlp archive files; and
 - the MTProto `.session` file when that transport has been used.
 
-Stop the application before taking a filesystem-level backup of the data
-directory. Back up the private configuration and env file separately, using a
-secret-safe destination. A session carries reusable bot authorization, so its
-backup needs the same access controls as the bot token. Do not assume the Bot
-API volume contains application archives; it is a separate service volume.
+`sources.toml` normally lives in the configuration directory rather than the
+data directory. A complete backup includes `config.toml`, `sources.toml`, the
+optional `env`, and the data-directory contents above. You can also make an
+independent catalog snapshot with
+`asmr-tg-backup sources export --output sources.backup.toml`. Stop the application
+before a filesystem-level data backup and use a secret-safe destination. A
+session carries reusable bot authorization, so its backup needs the same access
+controls as the bot token. The Bot API volume is a separate service volume, not
+an application archive.
 
 ## Update a Compose installation
 
-Back up data first, then pull and recreate the official application image:
+Back up `./settings/sources.toml` and the data volume first, then pull and
+recreate the official application image:
 
 ```bash
 docker compose pull asmr-tg-backup
@@ -64,14 +92,15 @@ volumes. For a deliberate source build, run
 Stop the user service, back up data, and upgrade the `pipx` installation:
 
 ```bash
+systemctl --user stop asmr-tg-backup.service
 pipx upgrade asmr-tg-backup
 asmr-tg-backup --version
-systemctl --user restart asmr-tg-backup.service
+asmr-tg-backup service install
 systemctl --user status asmr-tg-backup.service
 ```
 
 If a schema migration runs, retain its `state.db.bak-*` file until the service,
-job counts, and recent artifacts have been verified.
+job counts, and recent files have been verified.
 
 ## Graceful shutdown
 

@@ -1,6 +1,8 @@
 # Telegram Bot API Local Server
 
-Reusable Docker Compose service for a local Telegram Bot API endpoint.
+Reusable Docker Compose service for a local Telegram Bot API endpoint. This
+example uses the third-party, non-Telegram-maintained
+`aiogram/telegram-bot-api` image.
 
 For a new full-stack deployment, prefer the repository-root `compose.yaml`,
 which builds `asmr-tg-backup` and enables this API with the `local-api` profile.
@@ -17,10 +19,12 @@ Do not expose the stats port outside localhost; it can include bot details.
 
 ## Setup
 
+Run these commands from the `asmr-tg-backup` repository root:
+
 ```bash
 mkdir -p ~/services/telegram-bot-api
-cp compose.yaml ~/services/telegram-bot-api/
-cp .env.example ~/services/telegram-bot-api/.env
+cp deploy/telegram-bot-api/compose.yaml ~/services/telegram-bot-api/
+cp deploy/telegram-bot-api/.env.example ~/services/telegram-bot-api/.env
 chmod 600 ~/services/telegram-bot-api/.env
 ```
 
@@ -62,8 +66,11 @@ logging out from the cloud Bot API before the token can be used locally. If the
 local server returns a conflict/login error, call:
 
 ```bash
-curl -sS "https://api.telegram.org/bot$BOT_TOKEN/logOut"
+printf 'url = "https://api.telegram.org/bot%s/logOut"\n' "$BOT_TOKEN" \
+  | curl --silent --show-error --config -
 ```
 
-After a successful logout, the same bot token should use the local server, not
-the cloud API, for about 10 minutes.
+This passes the token to `curl` through standard input instead of exposing it in
+the `curl` process arguments. After a successful logout, the bot can use the
+local server, but it cannot log back in to Telegram's cloud Bot API for 10
+minutes.

@@ -20,6 +20,11 @@ from .source_filter import (
     compile_source_filter,
     format_source_filter,
 )
+from .source_catalog import (
+    SourceCatalogError,
+    SourceCatalogManager,
+    normalized_source_identity,
+)
 from .store import Store
 from .youtube import resolve_channel_id
 
@@ -38,6 +43,12 @@ class ControlBot:
         self.config = config
         self.store = store
         self.logger = logger
+        self.source_catalog = SourceCatalogManager(
+            config.sources.path,
+            store,
+            max_failures=config.app.max_attempts,
+        )
+        self._source_catalog_ready = False
 
     def process_once(self, timeout_seconds: int | None = None) -> None:
         if not self.config.control.enabled:
@@ -90,7 +101,6 @@ class ControlBot:
                     {"command": "start", "description": "Open control panel"},
                     {"command": "panel", "description": "Open control panel"},
                     {"command": "origin", "description": "Manage media origins"},
-                    {"command": "sub", "description": "YouTube compatibility commands"},
                     {"command": "source_filter", "description": "Filter sources by regex"},
                     {"command": "stats", "description": "Show backup counts"},
                     {"command": "help", "description": "Show command help"},
@@ -139,17 +149,9 @@ class ControlBot:
             return self._help()
         if command == "/origin":
             return self._origin(args, message)
-        if command == "/sub":
-            return self._sub(args, message)
-        if command in {"/sub_add", "/add"}:
-            return self._sub_add(args, message)
-        if command in {"/sub_del", "/del"}:
-            return self._sub_del(args)
-        if command in {"/sub_list", "/list"}:
-            return self._sub_list()
         if command in {"/source_filter", "/filter"}:
             return self._source_filter(args)
-        if command in {"/stats", "/count"}:
+        if command == "/stats":
             return self._stats()
         return self._help()
 
@@ -164,28 +166,61 @@ class ControlBot:
             if len(rest) != 1:
                 return f"usage: /origin {action} <origin_id>"
             enabled = action in {"enable", "on"}
+            self._ensure_source_catalog()
             row = next(
-                (item for item in self.store.list_origin_statuses() if item["id"] == rest[0]),
+                (
+                    item
+                    for item in self.store.list_origin_statuses()
+                    if item["id"] == rest[0] and item["managed_by"] == "catalog"
+                ),
                 None,
             )
             if enabled and row is not None and row["provider"] == "twitch" and not self._twitch_credentials_ready():
                 return "cannot enable Twitch origin until service credentials are configured"
-            if self.store.set_control_origin_enabled(rest[0], enabled):
+            try:
+                self.source_catalog.set_enabled(rest[0], enabled)
                 return f"{'enabled' if enabled else 'disabled'}: {rest[0]}"
-            return f"not found or config-managed: {rest[0]}"
+            except SourceCatalogError as exc:
+                return f"error: {exc}"
         if action in {"mode", "recording_mode"}:
             if len(rest) != 2 or rest[1].lower() not in {"vod", "live"}:
                 return "usage: /origin mode <origin_id> <vod|live>"
             mode = rest[1].lower()
-            if self.store.set_control_twitch_recording_mode(rest[0], mode):
+            try:
+                self._ensure_source_catalog()
+                self.source_catalog.set_recording_mode(rest[0], mode)
                 return f"recording mode={mode}: {rest[0]}"
-            return f"not found, config-managed, or not twitch/vods: {rest[0]}"
+            except SourceCatalogError as exc:
+                return f"error: {exc}"
+        if action in {"rename", "name"}:
+            if len(rest) < 2:
+                return "usage: /origin rename <origin_id> <name>"
+            origin_id = rest[0]
+            name = " ".join(rest[1:]).strip()
+            try:
+                self._ensure_source_catalog()
+                self.source_catalog.rename(origin_id, name)
+                return f"renamed: {origin_id} -> {name}"
+            except SourceCatalogError as exc:
+                return f"error: {exc}"
+        if action in {"history", "backfill", "import-history", "import_history"}:
+            if len(rest) != 1:
+                return "usage: /origin history <origin_id>"
+            try:
+                self._ensure_source_catalog()
+                self.source_catalog.request_backfill(rest[0])
+                return f"historical import requested: {rest[0]} (latest -> all)"
+            except SourceCatalogError as exc:
+                return f"error: {exc}"
         if action in {"del", "delete", "rm", "remove"}:
             if len(rest) != 1:
                 return "usage: /origin del <origin_id>"
-            if self.store.delete_control_origin(rest[0]):
+            try:
+                self._ensure_source_catalog()
+                self.source_catalog.delete(rest[0])
                 return f"deleted origin: {rest[0]}"
-            return f"not found or config-managed: {rest[0]}"
+            except SourceCatalogError as exc:
+                return f"error: {exc}"
         return self._origin_usage()
 
     def _origin_add(
@@ -195,6 +230,7 @@ class ControlBot:
         *,
         recording_mode: str | None = None,
     ) -> str:
+        self._ensure_source_catalog()
         if len(args) < 2:
             return self._origin_usage()
         provider = args[0].lower()
@@ -230,25 +266,28 @@ class ControlBot:
             raise ValueError("recording_mode is only supported for twitch/vods")
 
         name = " ".join(remaining[1:]).strip() or _default_name(source_ref)
+        source_identity = _panel_source_identity(provider, kind, external_id)
         existing = next(
             (
                 row
                 for row in self.store.list_origin_statuses()
-                if row["managed_by"] == "control"
-                and row["provider"] == provider
-                and row["kind"] == kind
-                and str(row["external_id"]).lower() == external_id.lower()
+                if row["managed_by"] == "catalog"
+                and _panel_source_identity(
+                    str(row["provider"]),
+                    str(row["kind"]),
+                    str(row["external_id"]),
+                )
+                == source_identity
             ),
             None,
         )
         if existing is not None:
             if recording_mode is not None and effective_recording_mode is not None:
-                if not self.store.set_control_twitch_recording_mode(
+                self.source_catalog.set_recording_mode(
                     str(existing["id"]),
                     effective_recording_mode,
-                ):
-                    raise ValueError("existing Twitch origin is no longer editable")
-            self.store.set_control_origin_enabled(str(existing["id"]), True)
+                )
+            self.source_catalog.set_enabled(str(existing["id"]), True)
             mode_suffix = (
                 f" mode={effective_recording_mode}"
                 if recording_mode is not None and effective_recording_mode is not None
@@ -271,13 +310,7 @@ class ControlBot:
             bootstrap="latest",
             options=options,
         )
-        created_by = str((message.get("from") or {}).get("id") or "")
-        created = self.store.upsert_control_origin(
-            origin,
-            created_by=created_by,
-            max_failures=self.config.app.max_attempts,
-        )
-        action = "added" if created else "updated"
+        self.source_catalog.add(origin)
         suffix = ""
         if provider == "twitch" and not credentials_ready:
             suffix = "; disabled until Twitch credentials are configured and it is enabled"
@@ -287,7 +320,7 @@ class ControlBot:
             else ""
         )
         return (
-            f"{action}: {origin.id} -> {provider}/{kind}:{external_id}"
+            f"added: {origin.id} -> {provider}/{kind}:{external_id}"
             f"{mode_suffix}{suffix}"
         )
 
@@ -314,16 +347,20 @@ class ControlBot:
         return mode if mode in {"vod", "live"} else self.config.twitch.recording_mode
 
     def _origin_list(self) -> str:
-        rows = self.store.list_origin_statuses()
+        self._ensure_source_catalog()
+        rows = [
+            row
+            for row in self.store.list_origin_statuses()
+            if row["managed_by"] == "catalog"
+        ]
         lines = [f"source_filter={format_source_filter(self._source_filter_pattern())}", "origins:"]
         for row in rows:
             state = "on" if row["enabled"] else "off"
-            owner = "bot" if row["managed_by"] == "control" else "config"
             error = f" error={row['last_error_code']}" if row["last_error_code"] else ""
             mode = self._effective_twitch_recording_mode(row)
             mode_text = f" mode={mode}" if mode else ""
             lines.append(
-                f"- {row['id']} [{owner}:{state}] {row['provider']}/{row['kind']} "
+                f"- {row['id']} [catalog:{state}] {row['provider']}/{row['kind']} "
                 f"{row['name']} -> {row['external_id']}{mode_text} "
                 f"items={row['item_count']}{error}"
             )
@@ -341,6 +378,8 @@ class ControlBot:
                 "/origin list",
                 "/origin enable|disable <origin_id>",
                 "/origin mode <origin_id> <vod|live>",
+                "/origin rename <origin_id> <name>",
+                "/origin history <origin_id>",
                 "/origin del <origin_id>",
             ]
         )
@@ -424,7 +463,14 @@ class ControlBot:
         state.pop("flash", None)
         state.pop("flash_error", None)
         if action == "home":
-            state.update({"view": "home", "awaiting": None, "twitch_mode": None})
+            state.update(
+                {
+                    "view": "home",
+                    "awaiting": None,
+                    "twitch_kind": None,
+                    "twitch_mode": None,
+                }
+            )
             return
         if action == "refresh":
             self._panel_snapshot(force=True)
@@ -575,8 +621,22 @@ class ControlBot:
         if action == "addtw":
             state.update(
                 {
-                    "view": "twitch_mode",
+                    "view": "twitch_kind",
                     "awaiting": None,
+                    "twitch_kind": None,
+                    "twitch_mode": None,
+                }
+            )
+            return
+        if action == "addtwkind":
+            if len(parts) != 3 or parts[2] not in TWITCH_KINDS:
+                raise ValueError("invalid Twitch source kind")
+            kind = parts[2]
+            state.update(
+                {
+                    "view": "twitch_mode" if kind == "vods" else "input",
+                    "awaiting": None if kind == "vods" else "add_twitch",
+                    "twitch_kind": kind,
                     "twitch_mode": None,
                 }
             )
@@ -584,6 +644,8 @@ class ControlBot:
         if action == "addtwmode":
             if len(parts) != 3 or parts[2] not in {"vod", "live"}:
                 raise ValueError("invalid Twitch recording mode")
+            if state.get("twitch_kind") != "vods":
+                raise ValueError("Twitch recording mode is only available for VOD sources")
             state.update(
                 {
                     "view": "input",
@@ -596,11 +658,13 @@ class ControlBot:
             state.update({"view": "input", "awaiting": "set_filter"})
             return
         if action == "filteroff":
-            self.store.set_bot_state(SOURCE_FILTER_STATE_KEY, "")
+            self._ensure_source_catalog()
+            self.source_catalog.set_filter("")
             state.update({"view": "filter", "awaiting": None, "flash": "过滤器已关闭"})
             return
         if action == "filterreset":
-            self.store.set_bot_state(SOURCE_FILTER_STATE_KEY, DEFAULT_SOURCE_FILTER_PATTERN)
+            self._ensure_source_catalog()
+            self.source_catalog.set_filter(DEFAULT_SOURCE_FILTER_PATTERN)
             state.update({"view": "filter", "awaiting": None, "flash": "过滤器已恢复默认"})
             return
         if action == "cancel":
@@ -613,6 +677,7 @@ class ControlBot:
                 {
                     "view": return_view,
                     "awaiting": None,
+                    "twitch_kind": None,
                     "twitch_mode": None,
                     "flash": "已取消输入",
                 }
@@ -621,13 +686,10 @@ class ControlBot:
         if action == "twmode":
             if len(parts) != 4 or parts[3] not in {"vod", "live"}:
                 raise ValueError("invalid Twitch mode action")
-            row = self._resolve_control_origin(parts[2])
+            row = self._resolve_catalog_origin(parts[2])
             mode = parts[3]
-            if not self.store.set_control_twitch_recording_mode(
-                str(row["id"]),
-                mode,
-            ):
-                raise ValueError("origin is no longer editable as twitch/vods")
+            self._ensure_source_catalog()
+            self.source_catalog.set_recording_mode(str(row["id"]), mode)
             self._panel_snapshot(force=True)
             state.update(
                 {
@@ -643,14 +705,14 @@ class ControlBot:
         if action in {"toggle", "delask", "delete"}:
             if len(parts) != 3:
                 raise ValueError("origin action is missing its token")
-            row = self._resolve_control_origin(parts[2])
+            row = self._resolve_catalog_origin(parts[2])
             origin_id = str(row["id"])
             if action == "toggle":
                 enabled = not bool(row["enabled"])
                 if enabled and row["provider"] == "twitch" and not self._twitch_credentials_ready():
                     raise ValueError("请先在服务环境中配置 Twitch 凭据")
-                if not self.store.set_control_origin_enabled(origin_id, enabled):
-                    raise ValueError("origin is no longer editable")
+                self._ensure_source_catalog()
+                self.source_catalog.set_enabled(origin_id, enabled)
                 state.update(
                     {
                         "view": "origins",
@@ -668,8 +730,8 @@ class ControlBot:
                     }
                 )
                 return
-            if not self.store.delete_control_origin(origin_id):
-                raise ValueError("origin is no longer editable")
+            self._ensure_source_catalog()
+            self.source_catalog.delete(origin_id)
             state.update(
                 {
                     "view": "origins",
@@ -705,6 +767,7 @@ class ControlBot:
                 {
                     "view": return_view,
                     "awaiting": None,
+                    "twitch_kind": None,
                     "twitch_mode": None,
                     "flash": "已取消输入",
                 }
@@ -718,18 +781,22 @@ class ControlBot:
                 state.update({"view": "origins", "awaiting": None, "flash": reply})
             elif awaiting == "add_twitch":
                 args = shlex.split(text)
+                kind = str(state.get("twitch_kind") or "")
+                if kind not in TWITCH_KINDS:
+                    raise ValueError("请先选择 Twitch 来源类型")
                 mode = str(state.get("twitch_mode") or "")
-                if mode not in {"vod", "live"}:
+                if kind == "vods" and mode not in {"vod", "live"}:
                     raise ValueError("请先选择 Twitch 录制模式")
                 reply = self._origin_add(
-                    ["twitch", *args],
+                    ["twitch", kind, *args],
                     message,
-                    recording_mode=mode,
+                    recording_mode=mode if kind == "vods" else None,
                 )
                 state.update(
                     {
                         "view": "origins",
                         "awaiting": None,
+                        "twitch_kind": None,
                         "twitch_mode": None,
                         "flash": reply,
                     }
@@ -785,6 +852,7 @@ class ControlBot:
             {
                 "view": return_view,
                 "awaiting": None,
+                "twitch_kind": None,
                 "twitch_mode": None,
                 "flash": "已取消输入",
             }
@@ -794,7 +862,12 @@ class ControlBot:
 
     def _open_panel(self, message: dict[str, Any]) -> None:
         previous_state = self._load_panel_state(message)
-        state = {"view": "home", "awaiting": None, "twitch_mode": None}
+        state = {
+            "view": "home",
+            "awaiting": None,
+            "twitch_kind": None,
+            "twitch_mode": None,
+        }
         self._render_panel_message(message, state)
         self._retire_replaced_panel_message(message, previous_state, state)
 
@@ -886,8 +959,13 @@ class ControlBot:
                 "add_twitch": (
                     "添加 Twitch 来源\n\n"
                     "请发送：主播登录名 [显示名称]\n"
-                    "本频道模式："
-                    f"{'直播中录制' if state.get('twitch_mode') == 'live' else '直播结束后下载'}。"
+                    f"来源类型：{_twitch_kind_label(str(state.get('twitch_kind') or ''))}。"
+                    + (
+                        "\n本频道模式："
+                        f"{'直播中录制' if state.get('twitch_mode') == 'live' else '直播结束后下载'}。"
+                        if state.get("twitch_kind") == "vods"
+                        else ""
+                    )
                 ),
                 "set_filter": (
                     "设置全局来源过滤器\n\n"
@@ -915,6 +993,8 @@ class ControlBot:
             text, keyboard = self._render_resource_detail_panel(state)
         elif view == "resource_delete_confirm":
             text, keyboard = self._render_resource_delete_confirm_panel(state)
+        elif view == "twitch_kind":
+            text, keyboard = self._render_twitch_kind_panel()
         elif view == "twitch_mode":
             text, keyboard = self._render_twitch_mode_panel()
         elif view == "stats":
@@ -933,7 +1013,11 @@ class ControlBot:
 
     def _render_home_panel(self) -> tuple[str, list[list[dict[str, str]]]]:
         snapshot = self._panel_snapshot()
-        origins = snapshot["origins"]
+        origins = [
+            row
+            for row in snapshot["origins"]
+            if row["managed_by"] == "catalog"
+        ]
         enabled = sum(bool(row["enabled"]) for row in origins)
         summary = snapshot["summary"]
         providers = snapshot["providers"]
@@ -986,11 +1070,38 @@ class ControlBot:
             [_button("🏠 返回", "p:home")],
         ]
 
+    def _render_twitch_kind_panel(
+        self,
+    ) -> tuple[str, list[list[dict[str, str]]]]:
+        text = "\n".join(
+            [
+                "➕ 添加 Twitch 来源",
+                "",
+                "请选择需要归档的内容类型：",
+                "",
+                "📼 VOD：完整直播回放，可选择直播中录制或结束后下载。",
+                "✨ Highlights：主播发布的精选片段。",
+                "⬆️ Uploads：主播单独上传的视频。",
+            ]
+        )
+        return text, [
+            [_button("📼 VOD", "p:addtwkind:vods")],
+            [
+                _button("✨ Highlights", "p:addtwkind:highlights"),
+                _button("⬆️ Uploads", "p:addtwkind:uploads"),
+            ],
+            [_button("🏠 返回", "p:home")],
+        ]
+
     def _render_origins_panel(
         self,
         state: dict[str, Any],
     ) -> tuple[str, list[list[dict[str, str]]]]:
-        rows = self._panel_snapshot()["origins"]
+        rows = [
+            row
+            for row in self._panel_snapshot()["origins"]
+            if row["managed_by"] == "catalog"
+        ]
         page_count = max(1, (len(rows) + PANEL_PAGE_SIZE - 1) // PANEL_PAGE_SIZE)
         page = min(max(0, int(state.get("page") or 0)), page_count - 1)
         state["page"] = page
@@ -999,7 +1110,6 @@ class ControlBot:
         keyboard: list[list[dict[str, str]]] = []
         for index, row in enumerate(selected, start=page * PANEL_PAGE_SIZE + 1):
             icon = "✅" if row["enabled"] else "⏸"
-            owner = "bot" if row["managed_by"] == "control" else "config"
             error = f" · ⚠️{row['last_error_code']}" if row["last_error_code"] else ""
             mode = self._effective_twitch_recording_mode(row)
             mode_text = (
@@ -1009,26 +1119,25 @@ class ControlBot:
             )
             lines.append(
                 f"{index}. {icon} {row['name']}\n"
-                f"   {row['provider']}/{row['kind']} · {owner}{mode_text} "
+                f"   {row['provider']}/{row['kind']} · catalog{mode_text} "
                 f"· items={row['item_count']}{error}"
             )
-            if row["managed_by"] == "control":
-                token = _origin_token(str(row["id"]))
-                toggle = "停用" if row["enabled"] else "启用"
-                label = _compact_button_label(str(row["name"]))
-                buttons = [
-                    _button(f"{toggle} {label}", f"p:toggle:{token}"),
-                ]
-                if mode:
-                    target_mode = "vod" if mode == "live" else "live"
-                    buttons.append(
-                        _button(
-                            "切换为 VOD" if target_mode == "vod" else "切换为 LIVE",
-                            f"p:twmode:{token}:{target_mode}",
-                        )
+            token = _origin_token(str(row["id"]))
+            toggle = "停用" if row["enabled"] else "启用"
+            label = _compact_button_label(str(row["name"]))
+            buttons = [
+                _button(f"{toggle} {label}", f"p:toggle:{token}"),
+            ]
+            if mode:
+                target_mode = "vod" if mode == "live" else "live"
+                buttons.append(
+                    _button(
+                        "切换为 VOD" if target_mode == "vod" else "切换为 LIVE",
+                        f"p:twmode:{token}:{target_mode}",
                     )
-                buttons.append(_button("删除", f"p:delask:{token}"))
-                keyboard.append(buttons)
+                )
+            buttons.append(_button("删除", f"p:delask:{token}"))
+            keyboard.append(buttons)
         if not selected:
             lines.append("(暂无来源)")
         navigation: list[dict[str, str]] = []
@@ -1346,7 +1455,7 @@ class ControlBot:
         state: dict[str, Any],
     ) -> tuple[str, list[list[dict[str, str]]]]:
         token = str(state.get("target_token") or "")
-        row = self._resolve_control_origin(token)
+        row = self._resolve_catalog_origin(token)
         text = "\n".join(
             [
                 "⚠️ 删除来源？",
@@ -1362,11 +1471,12 @@ class ControlBot:
             [_button("取消", "p:origins:0")],
         ]
 
-    def _resolve_control_origin(self, token: str) -> Any:
+    def _resolve_catalog_origin(self, token: str) -> Any:
+        self._ensure_source_catalog()
         matches = [
             row
             for row in self.store.list_origin_statuses()
-            if row["managed_by"] == "control" and _origin_token(str(row["id"])) == token
+            if row["managed_by"] == "catalog" and _origin_token(str(row["id"])) == token
         ]
         if len(matches) != 1:
             raise ValueError("origin no longer exists")
@@ -1464,6 +1574,7 @@ class ControlBot:
                 "active": False,
                 "view": "closed",
                 "awaiting": None,
+                "twitch_kind": None,
                 "twitch_mode": None,
                 "closed_at": closed_at.isoformat(),
             }
@@ -1546,106 +1657,6 @@ class ControlBot:
         thread_id = str(message.get("message_thread_id") or "")
         return f"{PANEL_STATE_PREFIX}:{chat_id}:{thread_id}:{user_id}"
 
-    def _sub(self, args: list[str], message: dict[str, Any]) -> str:
-        if not args:
-            return self._help()
-        action = args[0].lower()
-        rest = args[1:]
-        if action == "add":
-            return self._sub_add_short(rest, message)
-        if action in {"del", "delete", "rm", "remove"}:
-            return self._sub_del(rest)
-        if action in {"list", "ls"}:
-            return self._sub_list()
-        if action in {"filter", "source_filter"}:
-            return self._source_filter(rest)
-        return self._help()
-
-    def _sub_add_short(self, args: list[str], message: dict[str, Any]) -> str:
-        if not args:
-            return "usage: /sub add [live|channel] <@handle|channel_id> [name]"
-        route = "live"
-        if args[0] in {"live", "channel"}:
-            route = args[0]
-            args = args[1:]
-        if not args:
-            return "usage: /sub add [live|channel] <@handle|channel_id> [name]"
-
-        channel_ref = args[0]
-        channel_id = resolve_channel_id(channel_ref, self.config.download.yt_dlp)
-        sub_id = _subscription_id(route, channel_ref)
-        name = " ".join(args[1:]) if len(args) > 1 else _default_name(channel_ref)
-        return self._save_subscription(
-            sub_id=sub_id,
-            name=name,
-            channel_id=channel_id,
-            routes=[route],
-            message=message,
-        )
-
-    def _sub_add(self, args: list[str], message: dict[str, Any]) -> str:
-        if len(args) < 2:
-            return "usage: /sub_add <id> <channel_id|@handle> [routes=live,channel] [name]"
-        sub_id = _validate_id(args[0])
-        channel_id = resolve_channel_id(args[1], self.config.download.yt_dlp)
-        routes = list(self.config.control.default_routes)
-        name_parts: list[str] = []
-        for arg in args[2:]:
-            if arg.startswith("routes="):
-                routes = [item.strip() for item in arg.split("=", 1)[1].split(",") if item.strip()]
-            else:
-                name_parts.append(arg)
-        name = " ".join(name_parts) if name_parts else sub_id
-        return self._save_subscription(
-            sub_id=sub_id,
-            name=name,
-            channel_id=channel_id,
-            routes=routes,
-            message=message,
-        )
-
-    def _save_subscription(
-        self,
-        *,
-        sub_id: str,
-        name: str,
-        channel_id: str,
-        routes: list[str],
-        message: dict[str, Any],
-    ) -> str:
-        created_by = str((message.get("from") or {}).get("id") or "")
-        created = self.store.upsert_subscription(
-            sub_id=sub_id,
-            name=name,
-            channel_id=channel_id,
-            routes=routes,
-            created_by=created_by,
-        )
-        action = "added" if created else "updated"
-        return f"{action}: {sub_id} -> {channel_id} routes={','.join(routes)}"
-
-    def _sub_del(self, args: list[str]) -> str:
-        if len(args) != 1:
-            return "usage: /sub_del <id>"
-        sub_id = args[0]
-        if self.store.delete_subscription(sub_id):
-            return f"deleted: {sub_id}"
-        return f"not found: {sub_id}"
-
-    def _sub_list(self) -> str:
-        lines = [f"source_filter={format_source_filter(self._source_filter_pattern())}", "subscriptions:"]
-        static_channels = [channel for channel in self.config.channels if channel.enabled]
-        for channel in static_channels:
-            lines.append(
-                f"- {channel.id} [config] {channel.name} {channel.channel_id} routes={','.join(channel.routes)}"
-            )
-        for sub in self.store.list_subscriptions():
-            state = "on" if sub.enabled else "off"
-            lines.append(f"- {sub.id} [db:{state}] {sub.name} {sub.channel_id} routes={','.join(sub.routes)}")
-        if len(lines) == 2:
-            lines.append("(none)")
-        return "\n".join(lines)
-
     def _source_filter(self, args: list[str]) -> str:
         if not args or args[0].lower() in {"status", "show"}:
             return "\n".join(
@@ -1658,10 +1669,12 @@ class ControlBot:
 
         action = args[0].lower()
         if action in {"off", "disable", "disabled", "none", "all", "clear"}:
-            self.store.set_bot_state(SOURCE_FILTER_STATE_KEY, "")
+            self._ensure_source_catalog()
+            self.source_catalog.set_filter("")
             return "source_filter=off; all sources enabled"
         if action in {"reset", "default"}:
-            self.store.set_bot_state(SOURCE_FILTER_STATE_KEY, DEFAULT_SOURCE_FILTER_PATTERN)
+            self._ensure_source_catalog()
+            self.source_catalog.set_filter(DEFAULT_SOURCE_FILTER_PATTERN)
             return f"source_filter={format_source_filter(DEFAULT_SOURCE_FILTER_PATTERN)}"
         if action == "set":
             args = args[1:]
@@ -1673,8 +1686,24 @@ class ControlBot:
             compile_source_filter(pattern)
         except ValueError as exc:
             return f"error: {exc}"
-        self.store.set_bot_state(SOURCE_FILTER_STATE_KEY, pattern)
+        self._ensure_source_catalog()
+        self.source_catalog.set_filter(pattern)
         return f"source_filter={format_source_filter(pattern)}"
+
+    def _ensure_source_catalog(self) -> None:
+        if self._source_catalog_ready:
+            return
+        catalog_existed = self.source_catalog.path.exists()
+        self.source_catalog.ensure(
+            legacy_origins=self.config.origins,
+            legacy_declared=self.config.legacy_sources_declared,
+        )
+        if catalog_existed and self.config.legacy_sources_declared:
+            self.logger.warning(
+                "legacy source declarations in config.toml are ignored because "
+                "sources.toml already exists"
+            )
+        self._source_catalog_ready = True
 
     def _source_filter_pattern(self) -> str | None:
         pattern = self.store.get_bot_state(SOURCE_FILTER_STATE_KEY)
@@ -1683,6 +1712,7 @@ class ControlBot:
         return pattern or None
 
     def _panel_snapshot(self, *, force: bool = False) -> dict[str, Any]:
+        self._ensure_source_catalog()
         return self.store.get_panel_snapshot(
             self._source_filter_pattern(),
             max_age_seconds=PANEL_SNAPSHOT_MAX_AGE_SECONDS,
@@ -1724,14 +1754,9 @@ class ControlBot:
                 "/origin list",
                 "/origin enable|disable <origin_id>",
                 "/origin mode <origin_id> <vod|live>",
+                "/origin rename <origin_id> <name>",
+                "/origin history <origin_id>",
                 "/origin del <origin_id>",
-                "",
-                "YouTube compatibility:",
-                "/sub add @handle",
-                "/sub add live @handle",
-                "/sub add channel @handle",
-                "/sub del <id>",
-                "/sub list",
                 "",
                 "Other commands:",
                 "/source_filter <regex|off|reset>",
@@ -1816,12 +1841,6 @@ def _default_name(channel_id: str) -> str:
     return channel_id[1:] if channel_id.startswith("@") else channel_id
 
 
-def _subscription_id(route: str, channel_id: str) -> str:
-    normalized = _default_name(channel_id).strip()
-    safe = "".join(char if char.isalnum() or char in {"_", "-", "@"} else "_" for char in normalized)
-    return _validate_id(f"{route}@{safe}")
-
-
 def _normalize_twitch_source(value: str) -> str:
     candidate = value.strip().removeprefix("@").lower()
     if candidate.isdigit():
@@ -1831,10 +1850,40 @@ def _normalize_twitch_source(value: str) -> str:
     return candidate
 
 
+def _twitch_kind_label(kind: str) -> str:
+    return {
+        "vods": "VOD",
+        "highlights": "Highlights",
+        "uploads": "Uploads",
+    }.get(kind, kind or "未选择")
+
+
 def _dynamic_origin_id(provider: str, kind: str, external_id: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", external_id).strip("-").lower()[:32] or "origin"
     digest = hashlib.sha256(f"{provider}\0{kind}\0{external_id}".encode("utf-8")).hexdigest()[:10]
-    return _validate_id(f"db:{provider}:{kind}:{slug}-{digest}")
+    return _validate_id(f"source:{provider}:{kind}:{slug}-{digest}")
+
+
+def _panel_source_identity(
+    provider: str,
+    kind: str,
+    external_id: str,
+) -> tuple[str, str, str]:
+    """Compare Panel sources using the catalog's provider-specific rules.
+
+    Twitch VOD recording mode is intentionally excluded: selecting a new mode
+    in the Panel updates the existing source instead of adding a parallel row.
+    """
+
+    return normalized_source_identity(
+        Origin(
+            id="panel-identity",
+            provider=provider,
+            kind=kind,
+            name="panel-identity",
+            external_id=external_id,
+        )
+    )[:3]
 
 
 def _origin_token(origin_id: str) -> str:

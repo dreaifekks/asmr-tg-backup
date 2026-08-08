@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://squidfunk.github.io/mkdocs-material/schema.json
 
 site_name: asmr-tg-backup
-site_description: Archive public media and optionally deliver it to Telegram.
+site_description: Discover and archive YouTube and Twitch media, with optional Telegram delivery.
 site_url: https://dreaifekks.github.io/asmr-tg-backup/
 repo_url: https://github.com/dreaifekks/asmr-tg-backup
 repo_name: dreaifekks/asmr-tg-backup
@@ -34,7 +34,7 @@ plugins:
         - locale: zh
           name: 简体中文
           build: true
-          site_description: 发现并归档公开媒体，并可选择将文件发送到 Telegram。
+          site_description: 发现并归档 YouTube 与 Twitch 媒体，并可选择发送到 Telegram。
           nav_translations:
             Home: 首页
             Get started: 开始使用
@@ -48,6 +48,8 @@ plugins:
             Operate: 运行与维护
             Troubleshoot: 故障排查
             Reference: 参考
+            Architecture and development: 架构与开发
+            Contributing: 参与贡献
 
 markdown_extensions:
   - admonition
@@ -65,12 +67,14 @@ nav:
   - Home: index.md
   - Get started:
       - Choose a deployment: getting-started/index.md
-      - Docker Compose: getting-started/docker-compose.md
       - PyPI and native Linux: getting-started/pypi.md
+      - Docker Compose: getting-started/docker-compose.md
   - Configure:
+      - Control panel: configuration/control-panel.md
       - Sources and downloads: configuration/sources.md
       - Telegram delivery: configuration/telegram.md
-      - Control panel: configuration/control-panel.md
   - Operate: operations.md
   - Troubleshoot: troubleshooting.md
   - Reference: reference.md
+  - Architecture and development: development.md
+  - Contributing: contributing.md

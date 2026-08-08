@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -534,6 +535,7 @@ class Store:
         managed_by: str = "config",
         created_by: str | None = None,
         max_failures: int = 5,
+        commit: bool = True,
     ) -> None:
         now = now_iso()
         existing = self.conn.execute(
@@ -543,8 +545,16 @@ class Store:
         control_retarget = False
         activate_backfill = False
         if existing is not None:
-            old_identity = (str(existing["provider"]), str(existing["kind"]), str(existing["external_id"]))
-            new_identity = (origin.provider, origin.kind, origin.external_id)
+            # Provider-specific normalization is part of source identity.
+            # Twitch logins are case-insensitive, while YouTube channel ids
+            # remain case-sensitive. Recording mode is deliberately excluded:
+            # changing VOD/live behavior does not retarget the source itself.
+            old_identity = _normalized_origin_identity_values(
+                str(existing["provider"]),
+                str(existing["kind"]),
+                str(existing["external_id"]),
+            )[:3]
+            new_identity = _normalized_origin_identity(origin)[:3]
             if old_identity != new_identity:
                 old_manager = str(existing["managed_by"])
                 control_retarget = old_manager == "control" and managed_by == "control"
@@ -617,7 +627,97 @@ class Store:
             self.conn.execute("DELETE FROM origin_poll_state WHERE origin_id=?", (origin.id,))
             for media_id in media_ids:
                 self._ensure_job(media_id, "download", "", max_failures=max_failures)
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
+
+    def reconcile_source_catalog(
+        self,
+        origins: Sequence[Origin],
+        source_filter: str,
+        *,
+        max_failures: int = 5,
+    ) -> None:
+        """Replace mutable source state with one catalog snapshot.
+
+        ``sources.toml`` is the authority. SQLite keeps the runtime projection,
+        discovery state, and media relationships. Legacy origins are retained
+        because old media rows can still refer to them, while every other
+        origin missing from the catalog is removed.
+        """
+
+        from .source_filter import SOURCE_FILTER_STATE_KEY, compile_source_filter
+
+        catalog_origins = list(origins)
+        if max_failures <= 0:
+            raise ValueError("max_failures must be positive")
+        if not isinstance(source_filter, str):
+            raise ValueError("source_filter must be a string")
+        compile_source_filter(source_filter)
+
+        ids: set[str] = set()
+        identities: dict[tuple[str, str, str, str], str] = {}
+        for origin in catalog_origins:
+            if origin.id in ids:
+                raise ValueError(f"duplicate origin id: {origin.id}")
+            ids.add(origin.id)
+            identity = _normalized_origin_identity(origin)
+            other_id = identities.get(identity)
+            if other_id is not None and other_id != origin.id:
+                raise ValueError(
+                    f"origins {other_id!r} and {origin.id!r} have the same source identity"
+                )
+            identities[identity] = origin.id
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Refuse silent id changes for a source that already has durable
+            # discovery state under another id. This comparison is normalized
+            # for provider-specific case rules.
+            for row in self.conn.execute(
+                "SELECT id, provider, kind, external_id, options_json FROM origins"
+            ).fetchall():
+                existing_identity = _normalized_origin_identity_values(
+                    str(row["provider"]),
+                    str(row["kind"]),
+                    str(row["external_id"]),
+                    options_json=row["options_json"],
+                )
+                catalog_id = identities.get(existing_identity)
+                if catalog_id is not None and catalog_id != str(row["id"]):
+                    raise ValueError(
+                        f"source identity already belongs to origin {row['id']!r}; "
+                        f"cannot assign it to {catalog_id!r}"
+                    )
+
+            for origin in catalog_origins:
+                self.upsert_origin(
+                    origin,
+                    managed_by="catalog",
+                    max_failures=max_failures,
+                    commit=False,
+                )
+
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                self.conn.execute(
+                    f"DELETE FROM origins WHERE managed_by!='legacy' "
+                    f"AND id NOT IN ({placeholders})",
+                    tuple(sorted(ids)),
+                )
+            else:
+                self.conn.execute("DELETE FROM origins WHERE managed_by!='legacy'")
+
+            self.conn.execute(
+                """
+                INSERT INTO bot_state(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (SOURCE_FILTER_STATE_KEY, source_filter),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def list_origins(self, *, managed_by: str | None = None) -> list[Origin]:
         sql = "SELECT * FROM origins"
@@ -3712,3 +3812,34 @@ def _origin_recording_mode_override(options_json: object) -> str | None:
         return None
     mode = str(options.get("recording_mode") or "").lower().strip()
     return mode if mode in {"vod", "live"} else None
+
+
+def _normalized_origin_identity(origin: Origin) -> tuple[str, str, str, str]:
+    return _normalized_origin_identity_values(
+        origin.provider,
+        origin.kind,
+        origin.external_id,
+        options_json=origin.options,
+    )
+
+
+def _normalized_origin_identity_values(
+    provider: str,
+    kind: str,
+    external_id: str,
+    *,
+    options_json: object = None,
+) -> tuple[str, str, str, str]:
+    normalized_provider = provider.strip().casefold()
+    normalized_kind = kind.strip().casefold()
+    normalized_external_id = external_id.strip()
+    if normalized_provider == "twitch":
+        normalized_external_id = normalized_external_id.casefold()
+    variant = ""
+    if normalized_provider == "twitch" and normalized_kind == "vods":
+        if isinstance(options_json, dict):
+            options = options_json
+        else:
+            options = _json_object(options_json)
+        variant = str(options.get("recording_mode") or "vod").strip().casefold()
+    return normalized_provider, normalized_kind, normalized_external_id, variant

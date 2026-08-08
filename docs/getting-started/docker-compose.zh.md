@@ -1,32 +1,70 @@
 # Docker Compose
 
-Compose 运行一个应用容器，持久状态位于 `/data`。MTProto 是默认媒体 transport；
-`local-api` profile 只是高级 Bot API 部署的可选项。
+Compose 通过 `asmr-data` 卷保存应用数据，默认使用 MTProto 上传。如需同时运行本地
+Bot API，可启用 `local-api` profile。
 
-## 准备私密文件
+## 1. 获取部署文件
 
 ```bash
+git clone https://github.com/dreaifekks/asmr-tg-backup.git
+cd asmr-tg-backup
 cp .env.example .env
 cp config.example.toml config.toml
-chmod 600 .env config.toml
+mkdir -p settings
+cp sources.example.toml settings/sources.toml
+chmod 700 settings
+chmod 600 .env config.toml settings/sources.toml
 ```
 
-至少修改 `.env` 中这些值：
+## 2. 填写配置
+
+先查看当前账户的 UID 和 GID：
+
+```bash
+id -u
+id -g
+```
+
+把结果和 Telegram 配置写入 `.env`：
 
 ```dotenv
+PUID=1000
+PGID=1000
 ASMR_TG_BACKUP_IMAGE=ghcr.io/dreaifekks/asmr-tg-backup:latest
 TELEGRAM_BOT_TOKEN=replace-with-the-bot-token
 TELEGRAM_CHAT_ID=-1001234567890
 ASMR_TG_UPLOAD_TRANSPORT=mtproto
 ```
 
-请把 `PUID`、`PGID` 设置为 `id -u`、`id -g` 的输出。容器会先把运行账户匹配到
-这两个值，以便读取 mode-`0600` 的配置，然后降权运行；只有 `/data` 数据卷归属不匹配
-时才会修正其权限。
+创建 bot 和查看控制面板用户 ID，可以直接使用
+[Telegram 快捷入口](index.md#telegram-shortcuts)。
 
-只有准备开始投递时，才在 `config.toml` 中设置 `telegram.enabled = true`。
+准备添加 Twitch 来源时，还需要把 Twitch 应用凭据写入 `.env`：
 
-## 运行官方镜像
+```dotenv
+TWITCH_CLIENT_ID=replace-with-client-id
+TWITCH_CLIENT_SECRET=replace-with-client-secret
+```
+
+[Twitch 配置说明](../configuration/sources.md#twitch-credentials)提供开发者控制台入口，
+也说明了已有 access token 的用法。
+
+在 `config.toml` 已有的 `[telegram]` 和 `[control]` 区块中修改：
+
+```toml
+[telegram]
+enabled = true
+
+[control]
+enabled = true
+allowed_user_ids = ["123456789"]
+```
+
+模板中的 YouTube 和 Twitch 来源默认关闭。容器启动后，从 `/panel` 添加第一个来源。
+Panel 会更新宿主机的 `./settings/sources.toml`；`/data/state.db` 只保存同步镜像和运行
+状态。Compose 挂载整个可写的 `./settings` 目录，使 Panel 可以原子替换目录文件。
+
+## 3. 启动
 
 ```bash
 docker compose pull asmr-tg-backup
@@ -35,39 +73,12 @@ docker compose ps
 docker compose logs --tail=100 asmr-tg-backup
 ```
 
-提供 bot token 与目标地址后，官方 GHCR 镜像可以使用 MTProto。session 会在
-`/data` 下创建，并通过 `asmr-data` 卷在容器替换后继续保留。
+向 bot 发送 `/panel`，添加一个 YouTube 或 Twitch 来源。首次通过 MTProto 投递时会在
+`/data` 下创建 bot session；更新容器时，`asmr-data` 卷会继续保留它。
 
-需要使用自己的 Telegram application identity 时，请成对设置：
+## 使用其他 Bot API 地址
 
-```dotenv
-ASMR_TG_MTPROTO_API_ID=123456
-ASMR_TG_MTPROTO_API_HASH=0123456789abcdef0123456789abcdef
-```
-
-不要把 session 复制进镜像，也不要公开 `/data` 卷。
-
-## 构建源码 checkout
-
-Compose 构建会明确选择 Dockerfile 的 `source-runtime` target：
-
-```dotenv
-ASMR_TG_BACKUP_IMAGE=asmr-tg-backup:local
-ASMR_TG_MTPROTO_API_ID=123456
-ASMR_TG_MTPROTO_API_HASH=0123456789abcdef0123456789abcdef
-```
-
-```bash
-docker compose build asmr-tg-backup
-docker compose up -d asmr-tg-backup
-```
-
-源码镜像使用 MTProto 时需要完整的 application 凭据对。官方发布流则使用已经验证的
-wheel 构建 GHCR 镜像，因此官方 PyPI 与容器发行包运行的是同一个 Python 制品。
-
-## 使用已有 Bot API
-
-选择 Bot API transport，并填写容器内可路由的 URL：
+在 `.env` 中切换 transport 并填写地址：
 
 ```dotenv
 ASMR_TG_UPLOAD_TRANSPORT=bot_api
@@ -75,17 +86,13 @@ TELEGRAM_API_BASE=https://api.telegram.org
 TELEGRAM_MAX_UPLOAD_BYTES=49000000
 ```
 
-官方端点按照 `[telegram.bot_api]` 使用可播放分块。使用已有可信服务器时，请替换
-URL 与限制。
+`[telegram.bot_api]` 中的设置控制可播放音频分块。连接其他 Bot API 服务时，替换 URL
+和单文件大小即可。
 
-!!! warning "容器回环地址"
+## 启动本地 Bot API profile
 
-    应用容器中的 `127.0.0.1` 指向应用容器自身，不是 Docker 主机。请使用服务网络
-    地址；如果主机服务只绑定回环地址，则应选择原生部署。
-
-## 可选的 Compose 本地 Bot API
-
-设置服务端凭据与服务网络 URL：
+先在 [Telegram API development tools](https://my.telegram.org/apps){ target="_blank" rel="noopener noreferrer" }
+创建 API ID/hash，再把下面的值写入 `.env`：
 
 ```dotenv
 ASMR_TG_UPLOAD_TRANSPORT=bot_api
@@ -93,29 +100,47 @@ TELEGRAM_API_BASE=http://telegram-bot-api:8081
 TELEGRAM_MAX_UPLOAD_BYTES=1990000000
 TELEGRAM_API_ID=123456
 TELEGRAM_API_HASH=0123456789abcdef0123456789abcdef
+TELEGRAM_BOT_API_IMAGE=aiogram/telegram-bot-api:latest
 ```
 
-然后启动 profile：
+启动两个服务：
 
 ```bash
 docker compose --profile local-api up -d
 docker compose logs --tail=100 asmr-tg-backup telegram-bot-api
 ```
 
-`TELEGRAM_API_ID/HASH` 用于配置 Bot API 服务端，与应用自身的
-`ASMR_TG_MTPROTO_API_ID/HASH` 是两套独立变量。
+这个 profile 默认使用 `aiogram/telegram-bot-api` 镜像；如需更换镜像，修改
+`TELEGRAM_BOT_API_IMAGE`。在 Compose 网络内，应用通过
+`http://telegram-bot-api:8081` 连接它。
 
-把已经在 Telegram 云端 Bot API 使用的 token 迁到本地前，请执行
-[本地服务迁移流程](https://github.com/tdlib/telegram-bot-api#moving-a-bot-to-a-local-server)。
+## 从源码构建镜像
 
-## 更新与验证
+在 `.env` 中设置 `ASMR_TG_BACKUP_IMAGE=asmr-tg-backup:local`，并分别填写
+`ASMR_TG_MTPROTO_API_ID` 和 `ASMR_TG_MTPROTO_API_HASH`，然后运行：
+
+```bash
+docker compose build --pull asmr-tg-backup
+docker compose up -d asmr-tg-backup
+```
+
+源码开发流程见[架构与开发](../development.md)。
+
+## 更新
+
+使用官方镜像：
 
 ```bash
 docker compose pull asmr-tg-backup
 docker compose up -d asmr-tg-backup
-docker compose ps
-docker compose logs --tail=200 asmr-tg-backup
 ```
 
-涉及存储变更的升级前，请备份两个命名卷。不要横向扩容应用服务：SQLite 轮询和
-Telegram updates 都按单一进程设计。
+使用源码构建：
+
+```bash
+docker compose build --pull asmr-tg-backup
+docker compose up -d asmr-tg-backup
+```
+
+更新前备份 `./settings/sources.toml` 和 `asmr-data`。启用了 `local-api` profile 时，
+再备份 `telegram-bot-api-data`。

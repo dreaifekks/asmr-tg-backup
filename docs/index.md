@@ -1,59 +1,39 @@
 # asmr-tg-backup
 
-`asmr-tg-backup` discovers public YouTube, Twitch, and RSS media, archives it
-with `yt-dlp`, and can deliver the resulting media to Telegram. It runs as one
-long-lived process with SQLite-backed discovery, download, delivery, and
+`asmr-tg-backup` discovers YouTube channel uploads and Twitch VOD/live media,
+archives it with `yt-dlp`, and can optionally deliver the files to Telegram.
+The Telegram panel and source CLI manage an editable `sources.toml` catalog;
+SQLite records its runtime mirror plus discovery, download, delivery, and
 control-panel state.
 
-The application uses the Telegram API. Telegram delivery always uses your bot
-token and destination; the token is never part of a package or image.
+[View the Telegram showcase](https://t.me/+9-Cy-yue1PJiMWY9){ target="_blank" rel="noopener noreferrer" }
 
-## Choose an installation
+## Start here
 
-| Goal | Start here |
-| --- | --- |
-| Small native Linux service with guided setup | [PyPI and native Linux](getting-started/pypi.md) |
-| Reproducible container with persistent `/data` | [Docker Compose](getting-started/docker-compose.md) |
-| Understand all configuration fields | [Reference](reference.md) |
+- Use [PyPI and native Linux](getting-started/pypi.md) for a lightweight service
+  with guided setup.
+- Use [Docker Compose](getting-started/docker-compose.md) for a reproducible
+  container with persistent `/data`.
+- Read [Choose a deployment](getting-started/index.md) to compare both paths and
+  prepare the bot, destination, and administrator ID.
 
-Official PyPI and GHCR releases are ready to use the default MTProto media
-transport after you supply the bot token and destination. A source checkout can
-use MTProto with its own Telegram application ID/hash, supplied as one complete
-pair.
+Official PyPI and GHCR releases use direct MTProto upload after you provide the
+bot token and destination, so no separate Bot API server is required. You can
+instead connect an existing, local, or Telegram-hosted Bot API endpoint.
 
-## Telegram delivery choices
+## What is covered
 
-Installation and upload transport are separate decisions:
-
-- **MTProto direct upload** is the default. It sends the media without running
-  a separate Bot API server and keeps a reusable session in the private data
-  directory.
-- **Existing Bot API URL** is available for users who already operate a trusted
-  endpoint.
-- **Local Bot API** is an advanced native-systemd or Compose option.
-- **Official Bot API splitting** is the final fallback. Audio above the 49 MB
-  safety threshold is converted into independently playable parts with a title
-  and cover for every part.
-
-See [Telegram delivery](configuration/telegram.md) before changing transport or
-upload-size settings.
-
-## Runtime requirements
-
-- Python 3.11 or newer for a native installation;
-- `ffmpeg` and `ffprobe` for audio extraction, thumbnails, splitting, and live
-  recording;
-- `curl` for the Bot API transport and Telegram control panel;
-- a Telegram bot token and destination when delivery is enabled;
-- Twitch credentials only when Twitch discovery is enabled.
-
-The Compose image includes the operating-system media tools and `cryptg`
-acceleration. Native installs must install system tools separately and can add
-`cryptg` through the optional `performance` extra for faster MTProto encryption.
-
-## Start safely
-
-Keep sources and Telegram delivery disabled until configuration and database
-initialization succeed. Then enable one source, verify one archive, and only
-then enable delivery. Keep configuration, environment files, the SQLite
-database, and the MTProto session private.
+- [Control panel](configuration/control-panel.md): the recommended source and
+  filter workflow, status, and tracked-file deletion.
+- [Sources and downloads](configuration/sources.md): complete catalog fields,
+  manual tuning, YouTube, Twitch, and download profiles.
+- [Telegram delivery](configuration/telegram.md): transports, sessions, size
+  limits, and security boundaries.
+- [Operate](operations.md): commands, backups, updates, and shutdown.
+- [Troubleshoot](troubleshooting.md): common setup and runtime failures.
+- [Reference](reference.md): CLI, paths, configuration sections, and environment
+  overrides.
+- [Architecture and development](development.md): runtime boundaries and the
+  external contribution workflow.
+- [Contributing](contributing.md): local environment, tests, documentation, and
+  the pre-change checklist.

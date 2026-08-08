@@ -6,11 +6,52 @@ from unittest import mock
 
 from ytb_tg_backup.config import load_config
 from ytb_tg_backup.feed import FeedEntry
+from ytb_tg_backup.models import Origin
 from ytb_tg_backup.service import BackupService
 from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
 
 
 class BackupServiceTest(unittest.TestCase):
+    def test_stale_poll_detection_covers_disabled_deleted_and_retargeted_origins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f'[app]\ndata_dir = "{root}"',
+                encoding="utf-8",
+            )
+            service = BackupService(load_config(config_path))
+            service.store.initialize()
+            polled = Origin("yt", "youtube", "uploads", "YT", "UCabc")
+            service.store.upsert_origin(polled, managed_by="catalog")
+
+            self.assertTrue(
+                service._origin_poll_configuration_is_current(service.store, polled)
+            )
+
+            service.store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UCabc", enabled=False),
+                managed_by="catalog",
+            )
+            self.assertFalse(
+                service._origin_poll_configuration_is_current(service.store, polled)
+            )
+
+            service.store.conn.execute("DELETE FROM origins WHERE id='yt'")
+            service.store.conn.commit()
+            self.assertFalse(
+                service._origin_poll_configuration_is_current(service.store, polled)
+            )
+
+            service.store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UCABC"),
+                managed_by="catalog",
+            )
+            self.assertFalse(
+                service._origin_poll_configuration_is_current(service.store, polled)
+            )
+            service.store.close()
+
     def test_initialize_hardens_all_provider_archive_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

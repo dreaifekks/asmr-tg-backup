@@ -32,6 +32,7 @@ from .source_filter import (
     format_source_filter,
     text_matches_source_filter,
 )
+from .source_catalog import SourceCatalogManager, normalized_source_identity
 from .sources import (
     SourceError,
     SourceRegistry,
@@ -52,6 +53,11 @@ class BackupService:
         self.config = config
         self.logger = logging.getLogger("asmr_tg_backup")
         self.store = Store(config.db_path)
+        self.source_catalog = SourceCatalogManager(
+            config.sources.path,
+            self.store,
+            config.app.max_attempts,
+        )
         self.downloader = Downloader(config, self.logger)
         self.telegram = create_telegram_transport(config.telegram)
         self.control_bot = ControlBot(config, self.store, self.logger)
@@ -70,10 +76,22 @@ class BackupService:
                 path.chmod(0o700)
             except OSError:
                 pass
+        self.store.initialize()
+        catalog_existed = self.source_catalog.path.exists()
+        catalog = self.source_catalog.ensure(
+            legacy_origins=self.config.origins,
+            legacy_declared=self.config.legacy_sources_declared,
+        )
+        if catalog_existed and self.config.legacy_sources_declared:
+            self.logger.warning(
+                "legacy source declarations in config.toml are ignored because "
+                "sources.toml already exists; remove [[origins]], [[channels]], "
+                "and [[feeds]] after reviewing the catalog"
+            )
         providers = {
             "youtube",
             *self.config.download.provider_profiles,
-            *(origin.provider for origin in self.config.origins),
+            *(origin.provider for origin in catalog.origins),
         }
         for archive_file in {
             self.downloader.archive_file_for_provider(provider)
@@ -85,14 +103,6 @@ class BackupService:
                 archive_file.chmod(0o600)
             except OSError:
                 pass
-        self.store.initialize()
-        for origin in self.config.origins:
-            self.store.upsert_origin(
-                origin,
-                managed_by="config",
-                max_failures=self.config.app.max_attempts,
-            )
-        self.store.disable_missing_config_origins({origin.id for origin in self.config.origins})
         self.store.recover_stale_jobs()
         if self.config.telegram.enabled:
             self.store.adopt_legacy_delivery_destination(self.telegram_destination_key)
@@ -1202,8 +1212,6 @@ class BackupService:
         store: Store,
         polled_origin: Origin,
     ) -> bool:
-        if polled_origin.provider != "twitch" or polled_origin.kind != "vods":
-            return True
         current = next(
             (
                 origin
@@ -1214,6 +1222,12 @@ class BackupService:
         )
         if current is None or not current.enabled:
             return False
+        if normalized_source_identity(current)[:3] != normalized_source_identity(
+            polled_origin
+        )[:3]:
+            return False
+        if polled_origin.provider != "twitch" or polled_origin.kind != "vods":
+            return True
         try:
             return twitch_recording_mode(
                 current,

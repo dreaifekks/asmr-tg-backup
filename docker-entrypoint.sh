@@ -2,7 +2,7 @@
 set -eu
 
 case "${1:-}" in
-  ""|--*|-*|run|poll|process|status|enqueue|init|init-config|setup)
+  ""|--*|-*|run|poll|process|status|enqueue|init|init-config|setup|sources)
     set -- asmr-tg-backup "$@"
     ;;
 esac
@@ -31,6 +31,11 @@ if [ "$puid" -eq 0 ] || [ "$pgid" -eq 0 ]; then
   exit 64
 fi
 
+if [ ! -d /settings ]; then
+  echo "/settings must be a mounted directory" >&2
+  exit 66
+fi
+
 if [ "$(id -g app)" -ne "$pgid" ]; then
   groupmod --non-unique --gid "$pgid" app
 fi
@@ -39,6 +44,8 @@ if [ "$(id -u app)" -ne "$puid" ]; then
 fi
 
 chown app:app /config
+chown -R app:app /settings
+chmod 700 /settings
 if [ "$(stat -c '%u:%g' /data)" != "$puid:$pgid" ]; then
   chown -R app:app /data
 fi

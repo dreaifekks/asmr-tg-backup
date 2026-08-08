@@ -5,11 +5,13 @@ import getpass
 import json
 import os
 from pathlib import Path
+import pwd
 import shutil
 import socket
 import string
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import urlsplit
 
@@ -34,6 +36,8 @@ LOCAL_API_REQUIRED_FLAGS = (
     "--dir",
     "--temp-dir",
 )
+APPLICATION_UNIT = "asmr-tg-backup.service"
+APPLICATION_UNIT_MARKER = "# Managed by `asmr-tg-backup service install`."
 
 
 class SetupError(RuntimeError):
@@ -79,9 +83,18 @@ class SetupAnswers:
 @dataclass(frozen=True)
 class SetupResult:
     config_path: Path
+    sources_path: Path
     db_path: Path
     profile: str
     local_service_unit: str | None
+
+
+@dataclass(frozen=True)
+class ApplicationServiceResult:
+    unit_path: Path
+    config_path: Path
+    environment_path: Path
+    user_name: str
 
 
 @dataclass(frozen=True)
@@ -107,6 +120,176 @@ def local_api_paths() -> LocalApiPaths:
     )
 
 
+def application_service_path() -> Path:
+    return _config_home() / "systemd" / "user" / APPLICATION_UNIT
+
+
+def install_application_service(
+    config_path: Path,
+    *,
+    python_executable: Path | None = None,
+) -> ApplicationServiceResult:
+    config_path = _validated_application_config_path(config_path)
+    executable = _validated_python_executable(python_executable or Path(sys.executable))
+    environment_path = config_path.parent / "env"
+    unit_path = application_service_path()
+    content = _render_application_unit(
+        executable=executable,
+        config_path=config_path,
+        environment_path=environment_path,
+    ).encode("utf-8")
+
+    existing = _existing_application_unit(unit_path)
+    if existing is not None and not existing.startswith(
+        (APPLICATION_UNIT_MARKER + "\n").encode("utf-8")
+    ):
+        raise SetupTargetExistsError(
+            f"refusing to replace a user service not created by this command: {unit_path}"
+        )
+
+    systemctl = _find_systemctl()
+    loginctl = _find_loginctl()
+    user_name = _current_user_name()
+    _require_managed_application_fragment(systemctl, unit_path)
+    was_active = False
+    was_enabled = False
+    if existing is not None:
+        was_active = (
+            _run_systemctl_user(
+                systemctl,
+                "is-active",
+                "--quiet",
+                APPLICATION_UNIT,
+                check=False,
+            ).returncode
+            == 0
+        )
+        was_enabled = (
+            _run_systemctl_user(
+                systemctl,
+                "is-enabled",
+                "--quiet",
+                APPLICATION_UNIT,
+                check=False,
+            ).returncode
+            == 0
+        )
+    _run_loginctl(loginctl, "enable-linger", user_name)
+
+    unit_changed = existing != content
+    reload_attempted = False
+    enable_attempted = False
+    restart_attempted = False
+    try:
+        if unit_changed:
+            if existing is None:
+                _write_private_file(unit_path, content)
+            else:
+                _replace_private_file(unit_path, content)
+        reload_attempted = True
+        _run_systemctl_user(systemctl, "daemon-reload")
+        enable_attempted = True
+        _run_systemctl_user(systemctl, "enable", APPLICATION_UNIT)
+        restart_attempted = True
+        _run_systemctl_user(systemctl, "restart", APPLICATION_UNIT)
+        _run_systemctl_user(systemctl, "is-active", "--quiet", APPLICATION_UNIT)
+    except BaseException as exc:
+        cleanup_issues: list[str] = []
+        if existing is None and enable_attempted:
+            result = _run_systemctl_user(
+                systemctl,
+                "disable",
+                "--now",
+                APPLICATION_UNIT,
+                check=False,
+            )
+            cleanup_issues.extend(_systemctl_cleanup_issue("disable --now", result))
+        if unit_changed:
+            if existing is None:
+                cleanup_issues.extend(
+                    _remove_created_file(unit_path, label="application user unit")
+                )
+            else:
+                try:
+                    _replace_private_file(unit_path, existing)
+                except (OSError, SetupError) as restore_exc:
+                    cleanup_issues.append(
+                        f"could not restore previous application user unit {unit_path}: "
+                        f"{restore_exc}"
+                    )
+        if unit_changed and reload_attempted:
+            result = _run_systemctl_user(systemctl, "daemon-reload", check=False)
+            cleanup_issues.extend(_systemctl_cleanup_issue("daemon-reload", result))
+        if existing is not None and restart_attempted:
+            if was_active:
+                result = _run_systemctl_user(
+                    systemctl,
+                    "restart",
+                    APPLICATION_UNIT,
+                    check=False,
+                )
+                cleanup_issues.extend(
+                    _systemctl_cleanup_issue("restore previous service", result)
+                )
+            else:
+                result = _run_systemctl_user(
+                    systemctl,
+                    "stop",
+                    APPLICATION_UNIT,
+                    check=False,
+                )
+                cleanup_issues.extend(
+                    _systemctl_cleanup_issue("restore inactive service", result)
+                )
+        if existing is not None and enable_attempted and not was_enabled:
+            result = _run_systemctl_user(
+                systemctl,
+                "disable",
+                APPLICATION_UNIT,
+                check=False,
+            )
+            cleanup_issues.extend(
+                _systemctl_cleanup_issue("restore disabled service", result)
+            )
+        if cleanup_issues:
+            raise SetupError(
+                f"could not install application user service: {exc}; "
+                "rollback incomplete; manual cleanup required: "
+                + "; ".join(cleanup_issues)
+            ) from exc
+        if isinstance(exc, SetupError):
+            raise
+        raise SetupError(f"could not install application user service: {exc}") from exc
+
+    return ApplicationServiceResult(
+        unit_path=unit_path,
+        config_path=config_path,
+        environment_path=environment_path,
+        user_name=user_name,
+    )
+
+
+def uninstall_application_service() -> Path | None:
+    unit_path = application_service_path()
+    existing = _existing_application_unit(unit_path)
+    if existing is None:
+        return None
+    if not existing.startswith((APPLICATION_UNIT_MARKER + "\n").encode("utf-8")):
+        raise SetupTargetExistsError(
+            f"refusing to remove a user service not created by this command: {unit_path}"
+        )
+
+    systemctl = _find_systemctl()
+    _require_managed_application_fragment(systemctl, unit_path)
+    _run_systemctl_user(systemctl, "disable", "--now", APPLICATION_UNIT)
+    try:
+        unit_path.unlink()
+    except OSError as exc:
+        raise SetupError(f"could not remove application user service {unit_path}: {exc}") from exc
+    _run_systemctl_user(systemctl, "daemon-reload")
+    return unit_path
+
+
 def run_interactive_setup(output_path: Path) -> SetupResult:
     output_path = output_path.expanduser()
     _require_unused_target(output_path, "application config")
@@ -114,6 +297,8 @@ def run_interactive_setup(output_path: Path) -> SetupResult:
 
     installed: _InstalledLocalApi | None = None
     config_created = False
+    source_catalog_path: Path | None = None
+    source_catalog_existed = False
     try:
         if answers.local_api is not None:
             installed = _install_local_api(answers.local_api)
@@ -121,6 +306,8 @@ def run_interactive_setup(output_path: Path) -> SetupResult:
         _write_setup_config(output_path, answers)
         config_created = True
         config = load_config(output_path)
+        source_catalog_path = config.sources.path
+        source_catalog_existed = source_catalog_path.exists()
         service = BackupService(config)
         try:
             service.initialize()
@@ -137,6 +324,10 @@ def run_interactive_setup(output_path: Path) -> SetupResult:
             service.store.close()
     except BaseException as exc:
         cleanup_issues: list[str] = []
+        if source_catalog_path is not None and not source_catalog_existed:
+            cleanup_issues.extend(
+                _remove_created_file(source_catalog_path, label="source catalog")
+            )
         if config_created:
             cleanup_issues.extend(
                 _remove_created_file(output_path, label="application config")
@@ -154,6 +345,7 @@ def run_interactive_setup(output_path: Path) -> SetupResult:
 
     return SetupResult(
         config_path=output_path,
+        sources_path=config.sources.path,
         db_path=config.db_path,
         profile=answers.profile,
         local_service_unit=LOCAL_API_UNIT if installed is not None else None,
@@ -375,6 +567,82 @@ def _find_systemctl() -> Path:
     if not path.is_file() or not os.access(path, os.X_OK):
         raise SetupError(f"systemctl is not executable: {path}")
     return path
+
+
+def _find_loginctl() -> Path:
+    candidate = shutil.which("loginctl")
+    if not candidate:
+        raise SetupError("loginctl is required to enable boot-time user services")
+    path = Path(candidate).resolve()
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise SetupError(f"loginctl is not executable: {path}")
+    return path
+
+
+def _current_user_name() -> str:
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, OSError) as exc:
+        raise SetupError("could not determine the current operating-system user") from exc
+
+
+def _run_loginctl(
+    loginctl: Path,
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            [str(loginctl), *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SetupError(f"loginctl {' '.join(arguments)} failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[:1000]
+        suffix = f": {detail}" if detail else ""
+        raise SetupError(
+            f"loginctl {' '.join(arguments)} failed with code {result.returncode}{suffix}"
+        )
+    return result
+
+
+def _validated_application_config_path(path: Path) -> Path:
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    candidate = candidate.absolute()
+    if not candidate.is_file():
+        raise SetupError(f"application config not found: {candidate}")
+    try:
+        load_config(candidate)
+    except (OSError, ValueError, TypeError) as exc:
+        raise SetupError(f"could not load application config {candidate}: {exc}") from exc
+    return candidate
+
+
+def _validated_python_executable(path: Path) -> Path:
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = (Path.cwd() / candidate).absolute()
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        raise SetupError(f"Python executable is not usable: {candidate}")
+    return candidate
+
+
+def _existing_application_unit(path: Path) -> bytes | None:
+    if path.is_symlink():
+        raise SetupTargetExistsError(f"refusing symlink for application user service: {path}")
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SetupError(f"could not read application user service {path}: {exc}") from exc
 
 
 def _find_local_bot_api_executable() -> Path:
@@ -608,6 +876,72 @@ def _run_systemctl_user(
     return result
 
 
+def _require_managed_application_fragment(systemctl: Path, unit_path: Path) -> None:
+    """Refuse to operate when systemd resolves the name to another unit file."""
+    unit_found = False
+    for arguments in (
+        (
+            "list-units",
+            "--all",
+            "--full",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+            APPLICATION_UNIT,
+        ),
+        (
+            "list-unit-files",
+            "--full",
+            "--no-legend",
+            "--no-pager",
+            APPLICATION_UNIT,
+        ),
+    ):
+        result = _run_systemctl_user(systemctl, *arguments, check=False)
+        if result.returncode != 0:
+            no_match = (
+                result.returncode == 1
+                and not result.stdout.strip()
+                and not result.stderr.strip()
+            )
+            if no_match:
+                continue
+            detail = (result.stderr or result.stdout).strip()[:1000]
+            suffix = f": {detail}" if detail else ""
+            raise SetupError(
+                f"systemctl --user {' '.join(arguments)} failed with code "
+                f"{result.returncode}{suffix}"
+            )
+        unit_found = unit_found or bool(result.stdout.strip())
+
+    if not unit_found:
+        return
+
+    result = _run_systemctl_user(
+        systemctl,
+        "show",
+        "--property=FragmentPath",
+        "--value",
+        "--no-pager",
+        APPLICATION_UNIT,
+    )
+    fragment_value = result.stdout.strip()
+    if not fragment_value:
+        raise SetupTargetExistsError(
+            f"refusing to operate on loaded {APPLICATION_UNIT} without a file path"
+        )
+    fragment = Path(fragment_value)
+    if not fragment.is_absolute():
+        raise SetupError(
+            f"systemd reported a non-absolute path for {APPLICATION_UNIT}: {fragment}"
+        )
+    if fragment.resolve() != unit_path.resolve():
+        raise SetupTargetExistsError(
+            f"refusing to operate on {APPLICATION_UNIT} loaded from another path: "
+            f"{fragment}"
+        )
+
+
 def _render_local_api_credentials(setup: LocalApiSetup) -> str:
     return (
         "# Private credentials for the official telegram-bot-api server.\n"
@@ -645,6 +979,48 @@ def _render_local_api_unit(setup: LocalApiSetup) -> str:
     )
 
 
+def _render_application_unit(
+    *,
+    executable: Path,
+    config_path: Path,
+    environment_path: Path,
+) -> str:
+    exec_arguments = (
+        _unit_exec_quote(str(executable)),
+        "-m",
+        "ytb_tg_backup",
+        "run",
+        "--config",
+        _unit_exec_quote(str(config_path)),
+    )
+    return (
+        f"{APPLICATION_UNIT_MARKER}\n"
+        "[Unit]\n"
+        "Description=ASMR archive and Telegram delivery worker\n"
+        "Wants=network-online.target\n"
+        "After=network-online.target\n\n"
+        "[Service]\n"
+        "Type=exec\n"
+        "Environment=PYTHONUNBUFFERED=1\n"
+        f"EnvironmentFile=-{_unit_environment_file_path(environment_path)}\n"
+        f"ExecStart={' '.join(exec_arguments)}\n"
+        "Restart=always\n"
+        "RestartSec=10s\n"
+        "KillMode=mixed\n"
+        "KillSignal=SIGTERM\n"
+        "TimeoutStopSec=30s\n"
+        "NoNewPrivileges=true\n"
+        "PrivateTmp=true\n"
+        "ProtectSystem=full\n"
+        "ProtectKernelTunables=true\n"
+        "ProtectControlGroups=true\n"
+        "RestrictSUIDSGID=true\n"
+        "UMask=0077\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
 def _write_setup_config(output_path: Path, setup: SetupAnswers) -> None:
     split_enabled = "true" if setup.bot_api_split_large_audio else "false"
     private_pair = ""
@@ -658,6 +1034,8 @@ def _write_setup_config(output_path: Path, setup: SetupAnswers) -> None:
         f"# Setup profile: {setup.profile}\n\n"
         "[app]\n"
         f"data_dir = {_toml_string(str(default_data_path()))}\n\n"
+        "[sources]\n"
+        'path = "sources.toml"\n\n'
         "[telegram]\n"
         "enabled = true\n"
         f"bot_token = {_toml_string(setup.bot_token)}\n"
@@ -716,6 +1094,37 @@ def _write_private_file(path: Path, content: bytes) -> None:
                 "rollback incomplete; manual cleanup required: "
                 + "; ".join(cleanup_issues)
             ) from exc
+        raise
+
+
+def _replace_private_file(path: Path, content: bytes) -> None:
+    if path.is_symlink():
+        raise SetupTargetExistsError(f"refusing symlink for private file: {path}")
+    _ensure_directory(path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = -1
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+        path.chmod(0o600)
+    except BaseException:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
         raise
 
 

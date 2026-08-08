@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asmr-tg-backup"
-version = "0.4.0"
-description = "Discover public media from provider-backed origins, archive it with yt-dlp, and optionally deliver it to Telegram."
+version = "0.4.1"
+description = "Archive YouTube and Twitch media with yt-dlp and optionally deliver it to Telegram."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -53,4 +53,4 @@ asmr-tg-backup = "ytb_tg_backup.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ytb_tg_backup = ["config.example.toml"]
+ytb_tg_backup = ["config.example.toml", "sources.example.toml"]

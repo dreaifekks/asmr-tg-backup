@@ -17,6 +17,8 @@ site/
 .env.*
 !.env.example
 config.toml
+sources.toml
+settings/
 *.local.toml
 outputs/
 work/

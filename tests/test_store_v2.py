@@ -1863,6 +1863,53 @@ class StoreV2Test(unittest.TestCase):
             ).fetchone()
             self.assertEqual(tuple(row), ("twitch", "vods", "100"))
 
+    def test_twitch_identity_allows_case_normalization_and_mode_switch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin(
+                    "origin",
+                    "twitch",
+                    "vods",
+                    "A",
+                    "ExampleStreamer",
+                    options={"recording_mode": "vod"},
+                )
+            )
+
+            store.upsert_origin(
+                Origin(
+                    "origin",
+                    "TWITCH",
+                    "VODS",
+                    "A",
+                    "examplestreamer",
+                    options={"recording_mode": "live"},
+                )
+            )
+
+            row = store.conn.execute(
+                "SELECT provider, kind, external_id, options_json "
+                "FROM origins WHERE id='origin'"
+            ).fetchone()
+            self.assertEqual(
+                (row["provider"], row["kind"], row["external_id"]),
+                ("TWITCH", "VODS", "examplestreamer"),
+            )
+            self.assertEqual(json.loads(row["options_json"])["recording_mode"], "live")
+
+    def test_youtube_external_id_remains_case_sensitive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(Origin("origin", "youtube", "uploads", "A", "UCabc"))
+
+            with self.assertRaisesRegex(ValueError, "source identity is immutable"):
+                store.upsert_origin(
+                    Origin("origin", "youtube", "uploads", "A", "UCABC")
+                )
+
     def test_v1_initial_seed_ignored_rows_remain_ignored_after_rediscovery(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "state.db"

@@ -535,6 +535,399 @@ class SetupTest(unittest.TestCase):
             secret_prompt.assert_not_called()
             self.assertEqual(credentials.read_text(encoding="utf-8"), "keep")
 
+    def test_application_service_install_enables_linger_and_starts_unit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_home = root / "config home"
+            config_path = config_home / "asmr-tg-backup" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                f'[app]\ndata_dir = "{root / "data"}"\n',
+                encoding="utf-8",
+            )
+            events: list[tuple[str, tuple[str, ...]]] = []
+
+            def run_loginctl(_path, *arguments):
+                events.append(("loginctl", arguments))
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            def run_systemctl(_path, *arguments, check=True):
+                events.append(("systemctl", arguments))
+                if arguments[0] == "list-unit-files":
+                    return subprocess.CompletedProcess([], 1, "", "")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with (
+                mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": str(config_home)}),
+                mock.patch("ytb_tg_backup.setup._find_systemctl", return_value=Path("/usr/bin/systemctl")),
+                mock.patch("ytb_tg_backup.setup._find_loginctl", return_value=Path("/usr/bin/loginctl")),
+                mock.patch("ytb_tg_backup.setup._current_user_name", return_value="test-user"),
+                mock.patch("ytb_tg_backup.setup._run_loginctl", side_effect=run_loginctl),
+                mock.patch("ytb_tg_backup.setup._run_systemctl_user", side_effect=run_systemctl),
+            ):
+                result = setup.install_application_service(
+                    config_path,
+                    python_executable=Path("/bin/true"),
+                )
+
+            unit = config_home / "systemd" / "user" / setup.APPLICATION_UNIT
+            self.assertEqual(result.unit_path, unit)
+            self.assertEqual(result.environment_path, config_path.parent / "env")
+            self.assertEqual(unit.stat().st_mode & 0o777, 0o600)
+            unit_text = unit.read_text(encoding="utf-8")
+            self.assertTrue(unit_text.startswith(setup.APPLICATION_UNIT_MARKER))
+            self.assertIn('ExecStart="/bin/true" -m ytb_tg_backup run --config ', unit_text)
+            self.assertIn("EnvironmentFile=-", unit_text)
+            self.assertIn("Restart=always", unit_text)
+            self.assertEqual(
+                events,
+                [
+                    (
+                        "systemctl",
+                        (
+                            "list-units",
+                            "--all",
+                            "--full",
+                            "--plain",
+                            "--no-legend",
+                            "--no-pager",
+                            setup.APPLICATION_UNIT,
+                        ),
+                    ),
+                    (
+                        "systemctl",
+                        (
+                            "list-unit-files",
+                            "--full",
+                            "--no-legend",
+                            "--no-pager",
+                            setup.APPLICATION_UNIT,
+                        ),
+                    ),
+                    ("loginctl", ("enable-linger", "test-user")),
+                    ("systemctl", ("daemon-reload",)),
+                    ("systemctl", ("enable", setup.APPLICATION_UNIT)),
+                    ("systemctl", ("restart", setup.APPLICATION_UNIT)),
+                    ("systemctl", ("is-active", "--quiet", setup.APPLICATION_UNIT)),
+                ],
+            )
+
+    def test_application_service_login_failure_does_not_write_or_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_home = root / "config"
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f'[app]\ndata_dir = "{root / "data"}"\n',
+                encoding="utf-8",
+            )
+            unit = config_home / "systemd" / "user" / setup.APPLICATION_UNIT
+            with (
+                mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": str(config_home)}),
+                mock.patch("ytb_tg_backup.setup._find_systemctl", return_value=Path("/usr/bin/systemctl")),
+                mock.patch("ytb_tg_backup.setup._find_loginctl", return_value=Path("/usr/bin/loginctl")),
+                mock.patch("ytb_tg_backup.setup._current_user_name", return_value="test-user"),
+                mock.patch(
+                    "ytb_tg_backup.setup._run_loginctl",
+                    side_effect=setup.SetupError("linger unavailable"),
+                ),
+                mock.patch(
+                    "ytb_tg_backup.setup._run_systemctl_user",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ) as systemctl,
+                self.assertRaisesRegex(setup.SetupError, "linger unavailable"),
+            ):
+                setup.install_application_service(
+                    config_path,
+                    python_executable=Path("/bin/true"),
+                )
+
+            self.assertFalse(unit.exists())
+            self.assertEqual(systemctl.call_count, 2)
+            self.assertEqual(systemctl.call_args_list[0].args[1], "list-units")
+            self.assertEqual(systemctl.call_args_list[1].args[1], "list-unit-files")
+
+    def test_application_service_install_updates_its_managed_unit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_home = root / "config"
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f'[app]\ndata_dir = "{root / "data"}"\n',
+                encoding="utf-8",
+            )
+            unit = config_home / "systemd" / "user" / setup.APPLICATION_UNIT
+            unit.parent.mkdir(parents=True)
+            unit.write_text(
+                f"{setup.APPLICATION_UNIT_MARKER}\n[Service]\nExecStart=/old/path\n",
+                encoding="utf-8",
+            )
+            events: list[tuple[str, ...]] = []
+
+            def run_systemctl(_path, *arguments, check=True):
+                events.append(arguments)
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with (
+                mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": str(config_home)}),
+                mock.patch("ytb_tg_backup.setup._find_systemctl", return_value=Path("/usr/bin/systemctl")),
+                mock.patch("ytb_tg_backup.setup._find_loginctl", return_value=Path("/usr/bin/loginctl")),
+                mock.patch("ytb_tg_backup.setup._current_user_name", return_value="test-user"),
+                mock.patch("ytb_tg_backup.setup._run_loginctl"),
+                mock.patch("ytb_tg_backup.setup._run_systemctl_user", side_effect=run_systemctl),
+            ):
+                setup.install_application_service(
+                    config_path,
+                    python_executable=Path("/bin/true"),
+                )
+
+            unit_text = unit.read_text(encoding="utf-8")
+            self.assertNotIn("/old/path", unit_text)
+            self.assertIn('ExecStart="/bin/true"', unit_text)
+            self.assertEqual(unit.stat().st_mode & 0o777, 0o600)
+            self.assertIn(("restart", setup.APPLICATION_UNIT), events)
+
+    def test_application_service_restart_failure_rolls_back_new_unit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_home = root / "config"
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f'[app]\ndata_dir = "{root / "data"}"\n',
+                encoding="utf-8",
+            )
+            calls: list[tuple[str, ...]] = []
+
+            def run_systemctl(_path, *arguments, check=True):
+                calls.append(arguments)
+                if arguments[:1] == ("restart",):
+                    raise setup.SetupError("simulated worker start failure")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with (
+                mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": str(config_home)}),
+                mock.patch("ytb_tg_backup.setup._find_systemctl", return_value=Path("/usr/bin/systemctl")),
+                mock.patch("ytb_tg_backup.setup._find_loginctl", return_value=Path("/usr/bin/loginctl")),
+                mock.patch("ytb_tg_backup.setup._current_user_name", return_value="test-user"),
+                mock.patch("ytb_tg_backup.setup._run_loginctl"),
+                mock.patch("ytb_tg_backup.setup._run_systemctl_user", side_effect=run_systemctl),
+                self.assertRaisesRegex(setup.SetupError, "simulated worker start failure"),
+            ):
+                setup.install_application_service(
+                    config_path,
+                    python_executable=Path("/bin/true"),
+                )
+
+            unit = config_home / "systemd" / "user" / setup.APPLICATION_UNIT
+            self.assertFalse(unit.exists())
+            self.assertIn(("disable", "--now", setup.APPLICATION_UNIT), calls)
+            self.assertEqual(calls[-1], ("daemon-reload",))
+
+    def test_application_service_update_failure_restores_previous_unit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_home = root / "config"
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f'[app]\ndata_dir = "{root / "data"}"\n',
+                encoding="utf-8",
+            )
+            unit = config_home / "systemd" / "user" / setup.APPLICATION_UNIT
+            unit.parent.mkdir(parents=True)
+            previous = (
+                f"{setup.APPLICATION_UNIT_MARKER}\n"
+                "[Service]\nExecStart=/previous/path\n"
+            )
+            unit.write_text(previous, encoding="utf-8")
+            calls: list[tuple[tuple[str, ...], bool]] = []
+
+            def run_systemctl(_path, *arguments, check=True):
+                calls.append((arguments, check))
+                if arguments[:1] == ("restart",) and check:
+                    raise setup.SetupError("simulated update failure")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with (
+                mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": str(config_home)}),
+                mock.patch("ytb_tg_backup.setup._find_systemctl", return_value=Path("/usr/bin/systemctl")),
+                mock.patch("ytb_tg_backup.setup._find_loginctl", return_value=Path("/usr/bin/loginctl")),
+                mock.patch("ytb_tg_backup.setup._current_user_name", return_value="test-user"),
+                mock.patch("ytb_tg_backup.setup._run_loginctl"),
+                mock.patch("ytb_tg_backup.setup._run_systemctl_user", side_effect=run_systemctl),
+                self.assertRaisesRegex(setup.SetupError, "simulated update failure"),
+            ):
+                setup.install_application_service(
+                    config_path,
+                    python_executable=Path("/bin/true"),
+                )
+
+            self.assertEqual(unit.read_text(encoding="utf-8"), previous)
+            self.assertEqual(
+                calls[-2:],
+                [
+                    (("daemon-reload",), False),
+                    (("restart", setup.APPLICATION_UNIT), False),
+                ],
+            )
+
+    def test_application_service_uninstall_keeps_runtime_files_and_linger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_home = root / "config"
+            unit = config_home / "systemd" / "user" / setup.APPLICATION_UNIT
+            config = config_home / "asmr-tg-backup" / "config.toml"
+            environment = config.parent / "env"
+            database = root / "data" / "state.db"
+            unit.parent.mkdir(parents=True)
+            config.parent.mkdir(parents=True)
+            database.parent.mkdir(parents=True)
+            config.write_text("keep config", encoding="utf-8")
+            environment.write_text("keep env", encoding="utf-8")
+            database.write_text("keep db", encoding="utf-8")
+            unit.write_text(
+                setup._render_application_unit(
+                    executable=Path("/bin/true"),
+                    config_path=config,
+                    environment_path=environment,
+                ),
+                encoding="utf-8",
+            )
+            calls: list[tuple[str, ...]] = []
+
+            def run_systemctl(_path, *arguments, check=True):
+                calls.append(arguments)
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with (
+                mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": str(config_home)}),
+                mock.patch("ytb_tg_backup.setup._find_systemctl", return_value=Path("/usr/bin/systemctl")),
+                mock.patch("ytb_tg_backup.setup._run_systemctl_user", side_effect=run_systemctl),
+                mock.patch("ytb_tg_backup.setup._run_loginctl") as loginctl,
+            ):
+                removed = setup.uninstall_application_service()
+
+            self.assertEqual(removed, unit)
+            self.assertFalse(unit.exists())
+            self.assertTrue(config.exists())
+            self.assertTrue(environment.exists())
+            self.assertTrue(database.exists())
+            loginctl.assert_not_called()
+            self.assertEqual(
+                calls,
+                [
+                    (
+                        "list-units",
+                        "--all",
+                        "--full",
+                        "--plain",
+                        "--no-legend",
+                        "--no-pager",
+                        setup.APPLICATION_UNIT,
+                    ),
+                    (
+                        "list-unit-files",
+                        "--full",
+                        "--no-legend",
+                        "--no-pager",
+                        setup.APPLICATION_UNIT,
+                    ),
+                    ("disable", "--now", setup.APPLICATION_UNIT),
+                    ("daemon-reload",),
+                ],
+            )
+
+    def test_application_service_refuses_foreign_unit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_home = root / "config"
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f'[app]\ndata_dir = "{root / "data"}"\n',
+                encoding="utf-8",
+            )
+            unit = config_home / "systemd" / "user" / setup.APPLICATION_UNIT
+            unit.parent.mkdir(parents=True)
+            unit.write_text("[Service]\nExecStart=/bin/false\n", encoding="utf-8")
+            with (
+                mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": str(config_home)}),
+                mock.patch("ytb_tg_backup.setup._run_loginctl") as loginctl,
+                self.assertRaisesRegex(setup.SetupTargetExistsError, "not created by this command"),
+            ):
+                setup.install_application_service(
+                    config_path,
+                    python_executable=Path("/bin/true"),
+                )
+
+            loginctl.assert_not_called()
+            self.assertIn("/bin/false", unit.read_text(encoding="utf-8"))
+
+    def test_application_service_refuses_unit_loaded_from_another_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_home = root / "config"
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f'[app]\ndata_dir = "{root / "data"}"\n',
+                encoding="utf-8",
+            )
+            foreign_unit = Path("/etc/systemd/user") / setup.APPLICATION_UNIT
+
+            def run_systemctl(_path, *arguments, check=True):
+                if arguments[0] == "list-units":
+                    return subprocess.CompletedProcess(
+                        [],
+                        0,
+                        f"{setup.APPLICATION_UNIT} loaded inactive dead test\n",
+                        "",
+                    )
+                if arguments[0] == "show":
+                    return subprocess.CompletedProcess([], 0, f"{foreign_unit}\n", "")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with (
+                mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": str(config_home)}),
+                mock.patch("ytb_tg_backup.setup._find_systemctl", return_value=Path("/usr/bin/systemctl")),
+                mock.patch("ytb_tg_backup.setup._find_loginctl", return_value=Path("/usr/bin/loginctl")),
+                mock.patch("ytb_tg_backup.setup._current_user_name", return_value="test-user"),
+                mock.patch("ytb_tg_backup.setup._run_systemctl_user", side_effect=run_systemctl),
+                mock.patch("ytb_tg_backup.setup._run_loginctl") as loginctl,
+                self.assertRaisesRegex(setup.SetupTargetExistsError, "another path"),
+            ):
+                setup.install_application_service(
+                    config_path,
+                    python_executable=Path("/bin/true"),
+                )
+
+            loginctl.assert_not_called()
+            self.assertFalse(
+                (config_home / "systemd" / "user" / setup.APPLICATION_UNIT).exists()
+            )
+
+    @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze is unavailable")
+    def test_rendered_application_unit_passes_systemd_parser(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "path with spaces"
+            root.mkdir(parents=True)
+            unit = root / setup.APPLICATION_UNIT
+            unit.write_text(
+                setup._render_application_unit(
+                    executable=Path("/bin/true"),
+                    config_path=root / "config $value%.toml",
+                    environment_path=root / "env $value%",
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                ["systemd-analyze", "--user", "verify", str(unit)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+
 
 if __name__ == "__main__":
     unittest.main()

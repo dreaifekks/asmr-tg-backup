@@ -12,55 +12,10 @@ worker_poll_interval_seconds = 2
 job_lease_seconds = 900
 log_level = "INFO"
 
-# Origins are provider-backed remote sources. IDs must be unique within this
-# config. bootstrap="latest" makes only the newest matching first-seen item
-# eligible; use bootstrap="all" only when an intentional backfill is wanted.
-[[origins]]
-id = "youtube-example"
-provider = "youtube"
-kind = "uploads"
-name = "Example YouTube ASMR channel"
-external_id = "UC_CHANNEL_ID"
-bootstrap = "latest"
-enabled = false
-
-# Twitch archived broadcasts or active live streams discovered through Helix.
-# The broadcaster may be a numeric user ID, login, or @login. Credentials are
-# read from the environment variables named in [twitch], never from this example.
-[[origins]]
-id = "twitch-example"
-provider = "twitch"
-kind = "vods"
-name = "Example Twitch ASMR broadcaster"
-external_id = "twitch_login_or_numeric_broadcaster_id"
-bootstrap = "latest"
-enabled = false
-# Optional per-origin override. "vod" discovers the archived broadcast after
-# the stream; "live" checks /helix/streams and records while the channel is live.
-# recording_mode = "live"
-
-# Legacy [[channels]] and [[feeds]] remain supported and are translated into
-# origins at load time. Prefer [[origins]] for new configuration.
-#
-# [[channels]]
-# id = "legacy-youtube-example"
-# name = "Legacy YouTube channel"
-# channel_id = "UC_CHANNEL_ID"
-# routes = ["live"]
-# enabled = false
-
-# Generic RSS is an escape hatch. Entry media URLs are restricted to public
-# HTTP(S) addresses. allowed_media_hosts is optional but recommended; wildcard
-# entries such as "*.cdn.example" match subdomains only.
-# [[origins]]
-# id = "rss-example"
-# provider = "rss"
-# kind = "feed"
-# name = "Example media feed"
-# external_id = "https://feeds.example/media.xml"
-# allowed_media_hosts = ["media.example", "*.cdn.example"]
-# allow_private_media = false
-# enabled = false
+# The Telegram panel is the easiest way to manage sources. It writes this
+# catalog atomically; advanced users can edit the file and run `sources apply`.
+[sources]
+path = "sources.toml"
 
 [download]
 yt_dlp = "yt-dlp"
@@ -103,8 +58,8 @@ upload_timeout_seconds = 7200
 caption_template = "{title}\n\n{url}\n\n#{tag}"
 
 [telegram.mtproto]
-# Official PyPI/GHCR releases can leave application credentials unset. Source
-# builds and custom credentials must provide both values here or through
+# Official PyPI/GHCR installations can leave application credentials unset.
+# Source builds and custom credentials must provide both values here or through
 # ASMR_TG_MTPROTO_API_ID/HASH. Never configure only one half of the pair.
 # api_id = 123456
 # api_hash = "0123456789abcdef0123456789abcdef"
@@ -132,8 +87,7 @@ request_timeout_seconds = 30
 max_pages_per_poll = 3
 # "vod" waits for an archived broadcast. "live" detects an active stream with
 # Helix Get Streams and starts yt-dlp immediately. An origin-level
-# recording_mode overrides this fallback default. Telegram-panel origins store
-# their selected per-channel mode in SQLite instead of changing this file.
+# recording_mode overrides this fallback default in sources.toml.
 recording_mode = "vod"
 live_poll_interval_seconds = 30
 live_retry_seconds = 15
@@ -153,7 +107,6 @@ panel_idle_timeout_seconds = 3600
 # disabled until the authorized panel operator explicitly needs it.
 allow_disk_delete = false
 delete_webhook_on_startup = true
-default_routes = ["live"]
 # Every /panel command sends a fresh panel below the command; navigation edits
 # that current message. Its state is persisted and scoped to user + chat + thread.
 # Every non-empty allowlist below must match. Empty dimensions are ignored; if

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.4.1 - 2026-08-08
+
+- Add `asmr-tg-backup service install` and `service uninstall` for generated
+  systemd user-service registration, immediate startup, user linger, and
+  data-preserving removal.
+- Make `sources.toml` the single user-editable source catalog. Telegram panel
+  and source CLI changes now update it atomically before reconciling the SQLite
+  runtime mirror; guided setup creates it, and Compose exposes it through the
+  writable `./settings` directory.
+- Add `asmr-tg-backup sources path`, `list`, `validate`, `apply`, `export`, and
+  `migrate` for inspecting, manually tuning, snapshotting, and upgrading source
+  configuration without editing runtime database tables.
+- Refocus the README and bilingual documentation on YouTube/Twitch users and
+  external contributors, add the public Telegram showcase and Telegram setup
+  shortcuts, explain the panel-first source workflow and Twitch application
+  credentials, add a bilingual contribution guide, document the current
+  MTProto-first architecture, and retire outdated source-checkout setup guides.
+
 ## 0.4.0 - 2026-08-08
 
 - Split cloud-API audio uploads into independently playable parts and submit

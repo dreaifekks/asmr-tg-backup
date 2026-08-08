@@ -2,17 +2,31 @@ from __future__ import annotations
 
 import argparse
 from importlib import resources
+import json
 import logging
 import os
 from pathlib import Path
 import shlex
 import signal
+import sqlite3
 import sys
 
 from . import __version__
 from .config import load_config
 from .service import BackupService
-from .setup import SetupError, default_config_path, run_interactive_setup
+from .setup import (
+    APPLICATION_UNIT,
+    SetupError,
+    default_config_path,
+    install_application_service,
+    run_interactive_setup,
+    uninstall_application_service,
+)
+from .source_catalog import (
+    SourceCatalogManager,
+    load_source_catalog,
+    write_source_catalog,
+)
 from .store import Store
 
 
@@ -38,6 +52,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_late_config(setup_parser)
 
+    service_parser = subparsers.add_parser(
+        "service",
+        help="Install or uninstall the systemd user service",
+    )
+    service_subparsers = service_parser.add_subparsers(
+        dest="service_action",
+        required=True,
+    )
+    service_install_parser = service_subparsers.add_parser(
+        "install",
+        help="Install, enable, and start the user service",
+    )
+    _add_late_config(service_install_parser)
+    service_subparsers.add_parser(
+        "uninstall",
+        help="Stop and remove the user service without deleting application data",
+    )
+
     init_parser = subparsers.add_parser("init", help="Create data directories and initialize SQLite")
     _add_late_config(init_parser)
 
@@ -48,9 +80,9 @@ def main(argv: list[str] | None = None) -> int:
     poll_parser = subparsers.add_parser("poll", help="Run one poll cycle")
     _add_late_config(poll_parser)
     poll_parser.add_argument("--once", action="store_true", help="Accepted for readability; poll already runs once")
-    poll_parser.add_argument("--no-process", action="store_true", help="Only fetch feeds and enqueue items")
+    poll_parser.add_argument("--no-process", action="store_true", help="Only fetch sources and enqueue items")
 
-    process_parser = subparsers.add_parser("process", help="Process queued/downloaded items without fetching feeds")
+    process_parser = subparsers.add_parser("process", help="Process queued/downloaded items without fetching sources")
     _add_late_config(process_parser)
     process_parser.set_defaults(command="process")
 
@@ -61,9 +93,58 @@ def main(argv: list[str] | None = None) -> int:
     enqueue_parser = subparsers.add_parser("enqueue", help="Manually enqueue one YouTube URL")
     _add_late_config(enqueue_parser)
     enqueue_parser.add_argument("url")
-    enqueue_parser.add_argument("--feed-id", default="manual")
-    enqueue_parser.add_argument("--feed-name", default="Manual")
+    enqueue_parser.add_argument("--origin-id", dest="feed_id", default="manual")
+    enqueue_parser.add_argument("--origin-name", dest="feed_name", default="Manual")
     enqueue_parser.add_argument("--title")
+
+    sources_parser = subparsers.add_parser(
+        "sources",
+        help="Inspect, validate, and apply the editable source catalog",
+    )
+    _add_late_config(sources_parser)
+    sources_subparsers = sources_parser.add_subparsers(
+        dest="sources_action",
+        required=True,
+    )
+
+    sources_path_parser = sources_subparsers.add_parser(
+        "path",
+        help="Print the canonical source catalog path",
+    )
+    _add_late_config(sources_path_parser)
+
+    sources_list_parser = sources_subparsers.add_parser(
+        "list",
+        help="List the source filter and every configured source field",
+    )
+    _add_late_config(sources_list_parser)
+
+    sources_validate_parser = sources_subparsers.add_parser(
+        "validate",
+        help="Validate the canonical catalog or another catalog file",
+    )
+    _add_late_config(sources_validate_parser)
+    sources_validate_parser.add_argument("--file", help="Catalog file to validate")
+
+    sources_apply_parser = sources_subparsers.add_parser(
+        "apply",
+        help="Apply the canonical catalog or atomically replace it from a file",
+    )
+    _add_late_config(sources_apply_parser)
+    sources_apply_parser.add_argument("--file", help="Validated catalog to make canonical")
+
+    sources_export_parser = sources_subparsers.add_parser(
+        "export",
+        help="Export a private snapshot of the canonical catalog",
+    )
+    _add_late_config(sources_export_parser)
+    sources_export_parser.add_argument("--output", required=True, help="Snapshot path")
+
+    sources_migrate_parser = sources_subparsers.add_parser(
+        "migrate",
+        help="Create the catalog from existing database or legacy TOML sources",
+    )
+    _add_late_config(sources_migrate_parser)
 
     args = parser.parse_args(argv)
     if args.command == "init-config":
@@ -89,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"created private config {result.config_path}")
         print(f"initialized {result.db_path}")
+        print(f"initialized source catalog {result.sources_path}")
         if result.local_service_unit:
             print(f"enabled user service {result.local_service_unit}")
             print(
@@ -97,11 +179,88 @@ def main(argv: list[str] | None = None) -> int:
                 "https://github.com/tdlib/telegram-bot-api#moving-a-bot-to-a-local-server"
             )
         print(
-            "next: asmr-tg-backup run --config "
+            "next: asmr-tg-backup service install --config "
+            f"{shlex.quote(str(result.config_path))}"
+        )
+        print(
+            "foreground: asmr-tg-backup run --config "
             f"{shlex.quote(str(result.config_path))}"
         )
         print("then send /panel to the bot to add a YouTube or Twitch source")
         return 0
+
+    if args.command == "service":
+        try:
+            if args.service_action == "install":
+                result = install_application_service(
+                    Path(args.config or default_config_path()),
+                )
+                print(f"installed and started {APPLICATION_UNIT}")
+                print(f"unit: {result.unit_path}")
+                print(f"config: {result.config_path}")
+                print(f"optional environment file: {result.environment_path}")
+                print(f"enabled boot-time user services for {result.user_name}")
+                print("uninstall: asmr-tg-backup service uninstall")
+                return 0
+            if args.service_action == "uninstall":
+                removed = uninstall_application_service()
+                if removed is None:
+                    print(f"{APPLICATION_UNIT} is not installed")
+                else:
+                    print(f"stopped and removed {APPLICATION_UNIT}")
+                    print("configuration, environment, database, and downloads were kept")
+                return 0
+        except SetupError as exc:
+            parser.error(str(exc))
+
+    if args.command == "sources":
+        try:
+            config = load_config(args.config or "config.toml")
+            _configure_logging(config.app.log_level)
+
+            if args.sources_action == "path":
+                print(config.sources.path)
+                return 0
+            if args.sources_action == "validate":
+                source_path = (
+                    Path(args.file).expanduser()
+                    if args.file
+                    else config.sources.path
+                )
+                catalog = load_source_catalog(source_path)
+                print(
+                    f"valid source catalog: {source_path} "
+                    f"({len(catalog.origins)} sources)"
+                )
+                return 0
+            if args.sources_action == "list":
+                catalog = load_source_catalog(config.sources.path)
+                _print_sources(
+                    catalog.version,
+                    catalog.source_filter,
+                    catalog.origins,
+                )
+                return 0
+            if args.sources_action == "export":
+                catalog = load_source_catalog(config.sources.path)
+                output_path = Path(args.output).expanduser()
+                write_source_catalog(output_path, catalog)
+                print(f"exported source catalog to {output_path}")
+                return 0
+
+            store = Store(config.db_path)
+            try:
+                store.initialize()
+                manager = SourceCatalogManager(
+                    config.sources.path,
+                    store,
+                    config.app.max_attempts,
+                )
+                return _run_sources_command(args, config, manager)
+            finally:
+                store.close()
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            parser.error(str(exc))
 
     config = load_config(args.config or "config.toml")
     _configure_logging(config.app.log_level)
@@ -200,6 +359,54 @@ def _write_private_file(output_path: Path, content: bytes) -> None:
         except OSError:
             pass
         raise
+
+
+def _run_sources_command(args, config, manager: SourceCatalogManager) -> int:
+    if args.sources_action == "apply":
+        if args.file:
+            source_path = Path(args.file).expanduser()
+            catalog = load_source_catalog(source_path)
+            catalog = manager.replace(catalog)
+        else:
+            catalog = manager.apply()
+        print(f"applied {len(catalog.origins)} sources from {manager.path}")
+        return 0
+
+    if args.sources_action == "migrate":
+        catalog_existed = manager.path.exists()
+        catalog = manager.ensure(
+            legacy_origins=config.origins,
+            legacy_declared=config.legacy_sources_declared,
+        )
+        if catalog_existed and config.legacy_sources_declared:
+            print(
+                "warning: legacy source declarations in config.toml were ignored "
+                "because sources.toml already exists",
+                file=sys.stderr,
+            )
+        print(f"source catalog ready at {manager.path} ({len(catalog.origins)} sources)")
+        return 0
+
+    raise ValueError(f"unknown sources command: {args.sources_action}")
+
+
+def _print_sources(version: int, source_filter: str, origins) -> None:
+    print(f"version: {version}")
+    print(f"source_filter: {source_filter or '<off>'}")
+    print(f"sources: {len(origins)}")
+    for origin in origins:
+        print(f"- id: {origin.id}")
+        print(f"  provider: {origin.provider}")
+        print(f"  kind: {origin.kind}")
+        print(f"  name: {origin.name}")
+        print(f"  external_id: {origin.external_id}")
+        print(f"  enabled: {str(origin.enabled).lower()}")
+        print(f"  bootstrap: {origin.bootstrap}")
+        print(f"  credential_ref: {origin.credential_ref or '<none>'}")
+        print(
+            "  options: "
+            + json.dumps(origin.options, ensure_ascii=False, sort_keys=True)
+        )
 
 
 def _configure_logging(level: str) -> None:

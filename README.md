@@ -1,544 +1,231 @@
 # asmr-tg-backup
 
-ASMR-focused background service for discovering public media from
-provider-backed origins, archiving it with `yt-dlp`, and optionally delivering
-the archived files to Telegram. The built-in providers are YouTube official
-channel feeds, generic RSS feeds, and Twitch VOD/live discovery through the
-Helix API.
+[English documentation](https://dreaifekks.github.io/asmr-tg-backup/) ·
+[简体中文文档](https://dreaifekks.github.io/asmr-tg-backup/zh/) ·
+<a href="https://t.me/+9-Cy-yue1PJiMWY9" target="_blank" rel="noopener noreferrer">Telegram showcase</a>
 
-YouTube members-only discovery and authentication are outside the main worker's
-public-origin path.
+`asmr-tg-backup` is a background service for discovering ASMR media on YouTube
+and Twitch, archiving it with `yt-dlp`, and optionally delivering the archived
+files to Telegram. It supports YouTube channel uploads plus Twitch VOD and live
+recording.
 
-## Installation paths
+## Highlights
 
-- **PyPI** is the lightest native path: `pipx install asmr-tg-backup`, then run
-  `asmr-tg-backup setup`. Official releases default to direct MTProto media
-  uploads after the bot token and destination are configured.
-- **Docker Compose** runs the same application with persistent state under
-  `/data`. The official GHCR image also defaults to MTProto; source builds can
-  provide their own Telegram application ID/hash as a complete environment
-  pair.
-- **Bot API** is an advanced transport. It can use an existing trusted URL, a
-  preinstalled native service, the optional Compose `local-api` profile, or the
-  official API with playable audio splitting as a final fallback.
+- One long-running process with SQLite-backed discovery, download, delivery,
+  and Telegram control-panel state.
+- Direct MTProto media upload is the default for official PyPI and GHCR
+  releases; no separate Telegram Bot API server is required.
+- Twitch channels can download published VODs or begin recording while a stream
+  is live.
+- Downloads and Telegram delivery are independent jobs, so an upload failure
+  does not discard or repeat a completed download.
+- The optional Telegram panel manages sources, filters, status, and tracked
+  local resources, with source changes persisted in an editable TOML catalog.
 
-This application uses the Telegram API. It always needs the user's own bot
-token, and keeps its MTProto session in the private application data directory.
-Source checkouts can provide their own application credentials with
-`ASMR_TG_MTPROTO_API_ID` and `ASMR_TG_MTPROTO_API_HASH`; set both or neither.
+## Quick start with PyPI
 
-The PyPI wheel does not contain or download Telegram's C++
-`telegram-bot-api` executable. For the optional native local-API path, follow
-the official
-[source build instructions](https://github.com/tdlib/telegram-bot-api#installation).
-`setup` only validates the existing executable and registers this project's
-user unit. Telegram upstream does not publish a prebuilt binary, Docker image,
-or systemd unit for this server.
+Native installations require Python 3.11 or newer. Install `ffmpeg` and
+`ffprobe` for the default audio workflow and Twitch live recording. `curl`
+is required only when the media transport is Bot API.
 
-The bilingual English/Simplified Chinese Material documentation source lives
-in [`docs/`](docs/index.md) and is configured for
-<https://dreaifekks.github.io/asmr-tg-backup/>.
-
-Preview it locally with English at `/` and Chinese at `/zh/`:
+The recommended install includes `cryptg` for faster large-file encryption:
 
 ```bash
-python3 -m pip install -e ".[docs]"
-mkdocs serve --dev-addr 127.0.0.1:8000
+pipx install "asmr-tg-backup[performance]"
+asmr-tg-backup --version
+asmr-tg-backup setup
+asmr-tg-backup service install
 ```
 
-## Agent quick start
+The guided setup defaults to MTProto and asks for:
 
-Give an agent this command to fetch a self-contained local service setup guide:
+1. a BotFather token;
+2. the destination chat ID or `@channel`;
+3. the Telegram user ID allowed to open the control panel.
+
+Quick links:
+<a href="https://t.me/BotFather" target="_blank" rel="noopener noreferrer">create the bot with BotFather</a>
+·
+<a href="https://t.me/userinfobot" target="_blank" rel="noopener noreferrer">find your numeric user ID</a>
+
+This is a bot login, not a personal Telegram user login. The first actual
+MTProto delivery signs the bot in non-interactively with its token and creates
+a reusable local session.
+
+The service command generates a unit for the current pipx/virtualenv path,
+starts it, and enables boot-time user services. Remove only that unit later
+with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dreaifekks/asmr-tg-backup/master/AGENT_QUICK_START.md
+asmr-tg-backup service uninstall
 ```
 
-The guide takes the agent from prerequisites and a private minimal config
-through user-systemd installation and runtime verification, with real origins
-and Telegram delivery kept disabled until the user confirms them.
+Send `/panel` to the bot after the service starts. The panel is the recommended
+way to add the first YouTube or Twitch source and change the source filter.
 
-## Providers and origins
+For a persistent native service, continue with the
+[systemd user-service guide](https://dreaifekks.github.io/asmr-tg-backup/getting-started/pypi/#run-as-a-user-service).
 
-A provider is the implementation that knows how to discover remote media. An
-origin is one configured channel, broadcaster, or feed handled by that
-provider. Media identity is namespaced by provider, content kind, and external
-ID, while `origin_items` records every origin that discovered it. This prevents
-same-looking YouTube and Twitch IDs from colliding and prevents one origin from
-overwriting another origin's association.
+## Quick start with Docker Compose
 
-Use `[[origins]]` for new configuration:
+Clone or download the repository, then use its Compose files with the official
+GHCR image and persistent `asmr-data` volume:
+
+```bash
+git clone https://github.com/dreaifekks/asmr-tg-backup.git
+cd asmr-tg-backup
+cp .env.example .env
+cp config.example.toml config.toml
+mkdir -p settings
+cp sources.example.toml settings/sources.toml
+chmod 700 settings
+chmod 600 .env config.toml settings/sources.toml
+id -u
+id -g
+```
+
+Set `PUID` and `PGID` in `.env` to the two printed values, then set the bot token
+and destination. Enable Telegram delivery in `config.toml` and start the
+application:
+
+```bash
+docker compose pull asmr-tg-backup
+docker compose up -d asmr-tg-backup
+docker compose logs --tail=100 asmr-tg-backup
+```
+
+The example sources are disabled. Send `/panel` to add or enable a source after
+the service starts.
+
+See the
+[Docker Compose guide](https://dreaifekks.github.io/asmr-tg-backup/getting-started/docker-compose/)
+for UID/GID handling, source builds, upgrades, and the optional local Bot API
+profile.
+
+## Sources: panel first, file when needed
+
+| Provider | Supported origin | Notes |
+| --- | --- | --- |
+| YouTube | Channel uploads | Uses a real `UC...` channel ID |
+| Twitch | VODs, highlights, uploads, or live recording | Uses Twitch application settings |
+
+Send `/panel` to add, enable, disable, or remove a source, switch Twitch mode,
+and change the global source filter. The same bot accepts `/origin rename` and
+`/origin history` for renaming and backfill requests. These changes are written
+atomically to `sources.toml`; SQLite holds only the synchronized runtime mirror
+plus cursors, jobs, and history. `config.toml` is reserved for global runtime
+settings.
+
+For batch changes or complete field control, edit the same catalog:
 
 ```toml
+version = 1
+source_filter = "ASMR"
+
 [[origins]]
 id = "youtube-example"
 provider = "youtube"
 kind = "uploads"
-name = "Example YouTube channel"
+name = "Example channel"
 external_id = "UC_CHANNEL_ID"
 bootstrap = "latest"
-enabled = false
-
-[[origins]]
-id = "twitch-example"
-provider = "twitch"
-kind = "vods"
-name = "Example Twitch ASMR"
-external_id = "twitch_login_or_numeric_broadcaster_id"
-bootstrap = "latest"
-enabled = false
-# recording_mode = "live"
-```
-
-Supported built-in shapes are:
-
-- `provider = "youtube"`, `kind = "uploads"`: `external_id` is a real
-  `UC...` channel ID.
-- `provider = "twitch"`, `kind = "vods"`: Twitch broadcasts;
-  `external_id` may be a numeric broadcaster ID, login, or `@login`.
-  `recording_mode = "vod"` discovers the archived broadcast after it ends,
-  while `recording_mode = "live"` detects and records the active channel.
-- `provider = "twitch"` also understands `highlights` and `uploads` kinds.
-- `provider = "rss"`, `kind = "feed"`: `external_id` is the feed URL.
-
-RSS media URLs must use HTTP(S) and resolve only to public addresses. Set an
-origin's `allowed_media_hosts` array when the expected media hosts are known.
-`allow_private_media = true` is an explicit opt-in for trusted local feeds and
-should not be used for untrusted input.
-
-`bootstrap = "latest"` keeps only the newest matching item eligible when an
-origin is first seen. `bootstrap = "all"` allows backfill; Twitch bounds each
-poll with `[twitch].max_pages_per_poll` and refuses to advance its checkpoint if
-that bound is reached before a safe stopping point. Changing an existing origin
-from `latest` to `all` is treated as an explicit backfill request: persisted seed
-items are reactivated and that origin's discovery checkpoint is reset once.
-
-The legacy `[[channels]]` and `[[feeds]]` config forms remain accepted and are
-translated to origins at load time. The Telegram control panel manages dynamic
-YouTube and Twitch origins; the old `/sub` commands remain as YouTube-compatible
-aliases.
-
-## Twitch API credentials
-
-Keep Twitch credentials out of TOML. The config contains environment variable
-names only:
-
-```toml
-[twitch]
-client_id_env = "TWITCH_CLIENT_ID"
-access_token_env = "TWITCH_ACCESS_TOKEN"
-client_secret_env = "TWITCH_CLIENT_SECRET"
-request_timeout_seconds = 30
-max_pages_per_poll = 3
-recording_mode = "vod"
-live_poll_interval_seconds = 30
-live_retry_seconds = 15
-live_worker_count = 1
-live_download_timeout_seconds = 0
-```
-
-Set `TWITCH_CLIENT_ID` and either:
-
-- `TWITCH_ACCESS_TOKEN` for an existing token, or
-- `TWITCH_CLIENT_SECRET` so the service can obtain and refresh an app access
-  token with the client-credentials flow.
-
-For an interactive shell:
-
-```bash
-export TWITCH_CLIENT_ID='<client-id>'
-export TWITCH_CLIENT_SECRET='<client-secret>'
-```
-
-For systemd, put the assignments in the mode-`0600` file
-`~/.config/asmr-tg-backup/env`. The shipped user unit loads this optional file.
-Do not commit it.
-
-## Twitch VOD versus live recording
-
-Twitch VODs can become subscriber-only as soon as a stream ends. Choose the
-recording behavior globally under `[twitch]`, or override it on one Twitch
-`kind = "vods"` `[[origins]]` entry:
-
-- `recording_mode = "vod"` keeps the previous behavior: poll Helix Get Videos
-  and download the archived broadcast after Twitch publishes it. Public VODs
-  work without a Twitch login. Subscriber-only VODs still require a Twitch
-  account that is entitled to view them; this service does not bypass that
-  restriction.
-- `recording_mode = "live"` polls Helix Get Streams on the separate
-  `live_poll_interval_seconds` schedule. When Twitch returns a new stream ID,
-  a dedicated live worker runs `yt-dlp` against the channel URL from the
-  current position until the broadcast ends.
-
-The effective priority is the channel-specific mode stored by the panel or
-static origin, then `[twitch].recording_mode` as the fallback default. Twitch
-`highlights` and `uploads` origins always use post-publication downloads and do
-not expose this switch.
-
-The default 30-second live poll uses the same app access token as VOD discovery,
-so it does not depend on email delivery or require a public webhook. Twitch
-also offers the near-real-time EventSub `stream.online` event, but WebSocket
-subscriptions require a user access token and still need a Get Streams
-reconciliation after disconnects; EventSub is not required for this polling
-mode. Origins configured with a Twitch login persist the resolved numeric
-broadcaster ID in their SQLite checkpoint and refresh that lookup on the first
-successful poll at or after 12:00 Asia/Tokyo each day; the faster Get Streams
-schedule reuses the cached ID.
-
-Live jobs skip `[app].download_delay_seconds` and do not occupy the normal
-download/Telegram worker lane. `live_download_timeout_seconds = 0` allows a
-long stream to finish without the normal six-hour download timeout. Stopping
-the service or losing the SQLite job lease terminates the `yt-dlp` process
-group and leaves the job retryable, so it will not continue as an orphan.
-The process is interrupted with `SIGINT` first so ffmpeg can finalize its
-current container. Each interrupted attempt is retained as a separate segment;
-after reconnecting, the service concatenates all usable segments before
-delivery. A restart can only reconnect at the channel's then-current live
-position, so it preserves material recorded before the restart but cannot
-recover the interval while the service itself was stopped.
-
-Twitch live HLS uses yt-dlp's ffmpeg downloader, so `ffmpeg` is required for
-live mode. The worker adds bounded ffmpeg network reconnects; if a classified
-transient network/ffmpeg failure occurs and a new probe confirms that the same
-stream ID remains online, the job retries without consuming its failure budget.
-Other fixed failures use the normal bounded retry budget. One live worker
-records one channel at a time; increase `live_worker_count` when multiple
-configured channels may overlap. TOML configuration is loaded at process
-start, so restart the service after changing the global/static mode or worker
-count. A bot-managed channel changed from the panel is stored in SQLite and
-takes effect on the next relevant poll without a restart. If that channel is
-already recording, the current attempt is allowed to finish safely; the new
-mode controls subsequent discovery.
-
-The existing Twitch download profile controls whether either mode keeps audio
-or video. The shipped example extracts audio. To retain video, replace that
-profile with:
-
-```toml
-[download.provider_profiles.twitch]
-format = "bestvideo+bestaudio/best"
-merge_output_format = "mp4"
-extract_audio = false
-
-[telegram]
-media_type = "audio"
-```
-
-With this combination, the local Twitch master remains video while Telegram
-gets a separate audio derivative; preparing the upload does not replace the
-master artifact.
-
-Live recording explicitly uses yt-dlp's default current-position behavior.
-`--live-from-start` is experimental for Twitch and may depend on the associated
-VOD, so it is not used for subscriber-locked archival.
-
-## Source checkout setup
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .
-cp config.example.toml config.toml
-chmod 600 config.toml
-# Source builds using MTProto must export both application values.
-export ASMR_TG_MTPROTO_API_ID=123456
-export ASMR_TG_MTPROTO_API_HASH=0123456789abcdef0123456789abcdef
-asmr-tg-backup init --config config.toml
-asmr-tg-backup poll --config config.toml --once
-```
-
-Required host tools:
-
-- `python3 >= 3.11`
-- `curl` when the Bot API transport or Telegram control panel is enabled
-
-`ffmpeg` and `ffprobe` are recommended for audio extraction, media merging,
-playable upload segmentation, and thumbnail conversion. `ffmpeg` is required when
-Twitch `recording_mode = "live"` is enabled.
-
-## State and automatic migration
-
-State lives below `[app].data_dir` in `state.db`, `downloads/`, the yt-dlp
-archive file, and the private MTProto session when that transport is used.
-Schema v2 stores `origins`, `media_items`, `origin_items`, `jobs`, `artifacts`,
-and `deliveries` separately.
-
-Opening an existing v1 database automatically:
-
-1. creates `state.db.bak-v1-<UTC timestamp>` before changing the schema;
-2. migrates existing videos, subscriptions, files, retries, and Telegram
-   message IDs into the v2 tables;
-3. retains the old tables as `videos_v1` and `subscriptions_v1`; and
-4. creates compatibility views named `videos` and `subscriptions`.
-
-The migration is versioned and idempotent. The backup is created with mode
-`0600`; keep it until the migrated service has been verified.
-
-## Download and delivery jobs
-
-Discovery only creates or updates media and queues work. Downloading and
-Telegram delivery are separate leased jobs with independent failure counts:
-
-```text
-origin discovery -> download job -> master artifact -> telegram_delivery job -> delivery record
-```
-
-An upload failure does not discard the master artifact or restart the download.
-`run` keeps normal source polling and fast Twitch live polling on separate
-threads, runs Telegram control long polling on its own thread, starts
-`[app].worker_count` background workers, and starts
-`[twitch].live_worker_count` isolated live-recording workers.
-Workers atomically claim jobs and renew their leases while long subprocesses
-run. Expired download leases return to retry; an expired Telegram delivery
-lease becomes `uncertain` because Telegram has no idempotency key and the
-remote message may already exist.
-
-`uncertain` is deliberately not retried automatically. Inspect the destination
-and logs before changing or requeueing that job, otherwise a duplicate Telegram
-message may be sent. It is visible in `asmr-tg-backup status` and the job table.
-
-Live, upcoming, and post-live media in VOD mode are deferred without consuming
-the failure budget until a VOD is ready. Twitch live-recording jobs proceed
-only while yt-dlp confirms `live_status=is_live`. Probe and download failures
-consume the configured failure budget.
-
-Important worker and timeout settings are:
-
-```toml
-[app]
-worker_count = 1
-worker_poll_interval_seconds = 2
-job_lease_seconds = 900
-
-[download]
-probe_timeout_seconds = 180
-download_timeout_seconds = 21600
-ffmpeg_timeout_seconds = 7200
-
-[telegram]
-upload_timeout_seconds = 7200
-
-[twitch]
-request_timeout_seconds = 30
-live_poll_interval_seconds = 30
-live_retry_seconds = 15
-live_worker_count = 1
-live_download_timeout_seconds = 0
-```
-
-The lease heartbeat renews a running job periodically. Keep
-`job_lease_seconds >= 30`; external-command timeouts bound hung work independently
-of the lease.
-
-## Telegram control panel
-
-Use `/panel` (or `/start`) for the normal workflow. Every explicit command
-creates a fresh panel message below that command. The bot then edits that new
-message in place while navigating:
-
-- view provider-neutral origins and their polling errors;
-- add YouTube uploads;
-- add a Twitch channel after choosing `直播中录制` or `直播结束后下载`;
-- see each Twitch channel's current `LIVE`/`VOD` mode and switch it in place;
-- enable, disable, or confirm deletion of bot-managed origins;
-- browse tracked local ASMR resources, search by title/source/provider/external
-  ID, inspect their managed files, and optionally purge local copies;
-- view media/job statistics; and
-- inspect, set, disable, or reset the global source filter.
-
-Adding a source or entering a filter requires one user text message. For Twitch,
-the mode is selected with an inline button before entering the login/name. The
-bot stores the pending action and then returns to the current panel message;
-it does not create a new bot response for every navigation action. Opening a
-new panel disables the previous panel's buttons. Panel state is scoped by user,
-chat, and message thread and survives service restarts.
-
-By default, the panel automatically closes after one hour without a valid
-button press or accepted text input. Closing edits the same Telegram message,
-removes its inline keyboard, and rejects delayed callbacks from that expired
-message. Every redraw also invalidates buttons from the previous keyboard
-revision. Send `/panel` to open a fresh panel below the new command. This only
-closes the control UI;
-discovery, live recording, downloading, and Telegram delivery continue in the
-background. The idle deadline survives service restarts and is checked within
-one control long-poll window. Set `panel_idle_timeout_seconds = 0` to disable
-expiry.
-
-Panel data is read from the materialized `panel_snapshots` row instead of
-re-running all status queries for every button press. SQLite triggers mark that
-row dirty whenever origins, discovery state, media, jobs, artifacts, deliveries,
-or the source filter change. It is rebuilt on the next panel read and maintained
-at least every 30 seconds by the control loop. The control bot uses Telegram
-long polling, so `poll_interval_seconds = 10` is the server-side long-poll
-window, not an added 0-10 second delay before handling an update.
-
-Equivalent command interfaces remain available:
-
-```text
-/panel
-/origin add youtube <@handle|channel_id> [name]
-/origin add twitch [vods|highlights|uploads] <login|user_id> [name]
-/origin list
-/origin enable|disable <origin_id>
-/origin mode <origin_id> <vod|live>
-/origin del <origin_id>
-/sub add [live|channel] <@handle|channel_id> [name]
-/sub del <id>
-/sub list
-/source_filter [regex|off|reset]
-/stats
-/start
-/help
-```
-
-The `/origin add twitch ...` command stores the current global fallback on the
-new channel. Use `/origin mode ...` to change that bot-managed channel later;
-the normal `/panel` flow asks for the mode before the channel name.
-
-Twitch credentials are never accepted from a Telegram message. A Twitch origin
-added without service credentials is saved disabled; configure the environment,
-restart the service, and enable it from the panel. Config-managed origins are
-visible with their effective mode but remain read-only in the panel; change
-their TOML entry instead. Deleting a bot-managed origin retains its historical
-media, artifacts, and delivery records.
-
-### Local resource library
-
-`💾 本地资源` opens a paginated library built from SQLite artifacts. A completed
-resource is anchored by its `master`; an interrupted live recording that has
-only `live_segment` files is also listed and clearly marked as unmerged. Each
-resource shows its provider, source, archive date, tracked size, local file
-health, and Telegram delivery state. Search matches the title, source name,
-provider, content kind, or external ID. The detail view also lists the number
-and roles of all tracked files for that media item, including live segments,
-Telegram upload derivatives, and registered thumbnails.
-
-The panel deliberately manages only exact paths recorded in `artifacts`. It
-does not recursively scan `downloads/`, infer ownership from filenames, or
-delete untracked `.info.json`, source thumbnails, partial downloads, or other
-orphan files. This prevents a short or overlapping media ID from deleting a
-different resource. The detail page reports missing or unsafe tracked paths
-instead of treating them as healthy local files.
-
-Local deletion is read-only by default. To enable the destructive action:
-
-```toml
-[control]
-allow_disk_delete = true
-```
-
-This option is loaded from TOML when the service starts. Restart the service
-after changing it; refreshing the Telegram panel does not reload the config.
-
-Deletion requires the normal authorized, current, unexpired panel plus a
-resource-specific confirmation page. It removes every exact tracked regular
-file for that media item only when the path resolves below
-`[app].data_dir/downloads`; symlinks, directories, paths outside that root, and
-files shared by another media item are rejected. A resource with a running
-download or delivery is also rejected. Queued/retry/blocked work is cancelled
-so intentional cleanup does not trigger an automatic redownload. Each exact
-path is reserved in SQLite before unlinking; artifact writers cannot register
-the same path during deletion. Successful removals retain a path tombstone so a
-writer that was waiting on the deletion transaction cannot later register a
-missing file; an interrupted purge becomes retryable after service recovery.
-
-The media item, source relationship, job audit, artifact tombstones, yt-dlp
-archive, and Telegram delivery records remain in SQLite. Existing Telegram
-messages are never deleted. Twitch live recordings are explicitly marked in
-the confirmation page because they usually cannot be recreated after local
-deletion. A partial filesystem failure stays visible as `purge_failed` and can
-be retried from the same resource.
-
-Authorization is an AND across every configured dimension. An empty dimension
-is ignored, but each non-empty allowlist must match the incoming message. If all
-three allowlists are empty, all commands are denied. For example, configuring a
-user and chat requires both that user and that chat; adding a topic also requires
-the matching topic.
-
-```toml
-[control]
 enabled = true
-# Telegram getUpdates long-poll window; accepted range is 1-30 seconds.
-poll_interval_seconds = 10
-# Close /panel after one idle hour; use 0 to keep it active indefinitely.
-panel_idle_timeout_seconds = 3600
-# Browsing local resources is always available; permanent file deletion is not.
-allow_disk_delete = false
-delete_webhook_on_startup = true
-default_routes = ["live"]
-allowed_user_ids = ["123456789"]
-allowed_chat_ids = ["-1001234567890"]
-allowed_message_thread_ids = ["42"]
 ```
 
-Prefer at least `allowed_user_ids`; a chat-only allowlist intentionally permits
-every member of that allowed chat. The default source filter is `/ASMR/i`. Use
-`/source_filter off` to allow every source or `/source_filter reset` to restore
-the default.
+`bootstrap = "latest"` starts with the newest matching item. Use `"all"` for a
+history backfill. Validate and apply manual edits with:
+
+```bash
+asmr-tg-backup sources validate
+asmr-tg-backup sources apply
+```
+
+On an upgrade, legacy `[[origins]]`, `[[channels]]`, or `[[feeds]]` declarations
+are used only to create a missing `sources.toml`. Once the catalog exists they
+are ignored with a startup warning, so review the migrated catalog and remove
+the old declarations instead of maintaining two copies.
+
+Twitch sources require a Client ID plus a Client Secret or app access token.
+See [Sources and downloads](https://dreaifekks.github.io/asmr-tg-backup/configuration/sources/)
+for the Twitch developer-console link, `vod`/`live` behavior, credentials, and
+download profiles.
 
 ## Telegram delivery
 
-Uploads remain disabled until `[telegram].enabled = true` and a bot token and
-destination are configured. New setups select `upload_transport = "mtproto"`:
-the bot signs in through MTProto, uploads one media file directly, preserves its
-title and cover, and stores its reusable session below the application data
-directory. Official PyPI and GHCR releases are ready for this path; source
-builds must provide both `ASMR_TG_MTPROTO_API_ID` and
-`ASMR_TG_MTPROTO_API_HASH`, or set the corresponding private TOML values.
+Official packages and images can use the default MTProto path after the local
+bot token and destination are configured. Source builds need their own complete
+Telegram application ID/hash pair. In every installation, the bot token and
+MTProto session stay in the local runtime directories.
 
-Set `upload_transport = "bot_api"` for an existing, native, or Compose-managed
-Bot API. The official cloud Bot API uses a 49 MB safety limit; oversized audio
-can be split with ffmpeg into 2-10 independently playable items in one media
-group. Each item has a distinct `Part i/n` title and its own cover attachment.
-Custom or local Bot API endpoints can instead use a larger single-file limit.
+Source-build application settings are created from
+<a href="https://my.telegram.org/apps" target="_blank" rel="noopener noreferrer">Telegram API development tools</a>.
 
-On native Linux, the advanced local-service setup branch can register an
-already installed official-source `telegram-bot-api` executable at
-`127.0.0.1:18081`. Its service data is separate from the MTProto session.
+Bot API can be used with:
 
-`setup` never calls Telegram's cloud `logOut` method. If a bot token is already
-in use at `api.telegram.org`, perform Telegram's official
-[local-server migration procedure](https://github.com/tdlib/telegram-bot-api#moving-a-bot-to-a-local-server)
-as a separate, explicit operation before using that token locally.
+- an existing Bot API URL;
+- a preinstalled native `telegram-bot-api` service;
+- the optional Compose `local-api` profile; or
+- `api.telegram.org` with playable audio splitting for its smaller file limit.
 
-Caption templates may use `{title}`, `{url}`, `{feed_name}`, `{video_id}`, and
-`{tag}`. Downloaded files are stored below provider-specific directories such as
-`downloads/youtube/` and `downloads/twitch/`, with separate yt-dlp archive files
-per provider. The default Twitch profile selects the best audio stream and
-extracts it to M4A; the source video is not retained. Telegram therefore sends
-the audio master directly unless it must derive a smaller audio artifact to fit
-the configured upload limit. If the Twitch profile is changed to retain video
-while `[telegram].media_type = "audio"`, Telegram instead creates and sends a
-separate audio derivative and leaves the local video master intact.
+Cloud Bot API audio above the configured 49 MB limit can be split into 2–10
+independently playable parts. Each part receives a distinct `Part i/n` title
+and its own cover. MTProto sends the file directly without splitting.
 
-## Permissions and user service
+See [Telegram delivery](https://dreaifekks.github.io/asmr-tg-backup/configuration/telegram/)
+for complete transport configuration.
 
-The service enforces mode `0700` on its data/download directories and `0600` on
-SQLite state and migration backups. Keep the real TOML config and environment
-file at `0600`. The shipped systemd unit also uses `UMask=0077` and several
-hardening options.
+## Telegram control panel
 
-```bash
-mkdir -p ~/.config/systemd/user ~/.config/asmr-tg-backup
-chmod 700 ~/.config/asmr-tg-backup
-cp deploy/asmr-tg-backup.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now asmr-tg-backup.service
-journalctl --user -u asmr-tg-backup.service -f
+Send `/panel` or `/start` to manage sources, inspect status, change the source
+filter, and browse tracked local resources. Access is configured with allowed
+user, chat, and topic IDs.
+
+Disk deletion is optional. When enabled, the panel manages downloaded files
+tracked in SQLite while retaining database history and Telegram messages.
+
+See [Control panel](https://dreaifekks.github.io/asmr-tg-backup/configuration/control-panel/)
+for configuration and file-management behavior.
+
+## State and files
+
+Native setup stores runtime configuration below
+`~/.config/asmr-tg-backup/` and application state below
+`~/.local/share/asmr-tg-backup/`. Docker stores application state in
+`/data` and its editable source catalog in `./settings/sources.toml`.
+
+Back up `config.toml`, `sources.toml`, the environment file, SQLite database,
+downloads, and MTProto session before upgrades. Run only one application
+process against a given database/session pair.
+
+Keep runtime configuration, bot tokens, Twitch settings, SQLite/WAL files,
+downloads, and MTProto sessions in the local runtime directories rather than
+source control.
+
+## Architecture and development
+
+The runtime flow is:
+
+```text
+Panel / CLI -> sources.toml -> SQLite source runtime mirror
+YouTube / Twitch -> provider discovery -> SQLite media and jobs
+  -> yt-dlp / ffmpeg artifacts
+  -> MTProto or Bot API delivery
+  -> Telegram message records
 ```
 
-The unit expects the repo at `~/dev/asmr-tg-backup` and config at
-`~/.config/asmr-tg-backup/config.toml`. SIGTERM stops new claims and gives worker
-threads up to 25 seconds to drain. `KillMode=mixed` lets the main process first
-interrupt live ffmpeg children cleanly; systemd then bounds the whole control
-group with `TimeoutStopSec=30s`.
-
-## Development
+External contributors should start with the bilingual
+[contribution guide](https://dreaifekks.github.io/asmr-tg-backup/contributing/)
+and [architecture and development guide](https://dreaifekks.github.io/asmr-tg-backup/development/).
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests
+python3 -m venv .venv
+.venv/bin/python -m pip install -e ".[docs]"
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
+  .venv/bin/python -m unittest discover -s tests
+.venv/bin/mkdocs build --strict
 ```
 
-Tests should mock provider APIs, Telegram calls, and media subprocesses. Keep
-real `config.toml`, secrets, state databases, downloads, and migration backups
-out of git.
+## License
+
+Apache License 2.0. See
+[LICENSE](https://github.com/dreaifekks/asmr-tg-backup/blob/master/LICENSE).

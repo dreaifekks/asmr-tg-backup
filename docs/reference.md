@@ -4,7 +4,9 @@
 
 | Command | Purpose |
 | --- | --- |
-| `asmr-tg-backup setup` | Choose MTProto or an advanced Bot API path, create private configuration, and initialize SQLite |
+| `asmr-tg-backup setup` | Choose MTProto or an advanced Bot API path, create private configuration and the source catalog, and initialize SQLite |
+| `asmr-tg-backup service install [--config PATH]` | Generate, enable, and start the systemd user service; enable user linger for boot startup |
+| `asmr-tg-backup service uninstall` | Stop and remove the generated unit while keeping all application data |
 | `asmr-tg-backup init-config --output PATH` | Copy the packaged safe example without overwriting an existing file |
 | `asmr-tg-backup init --config PATH` | Initialize directories and SQLite |
 | `asmr-tg-backup run --config PATH` | Run continuous polling, workers, delivery, and control |
@@ -13,16 +15,21 @@
 | `asmr-tg-backup process --config PATH` | Process queued work without discovery |
 | `asmr-tg-backup status --config PATH` | Print queue and recent-item status |
 | `asmr-tg-backup enqueue URL --config PATH` | Queue one YouTube URL manually |
+| `asmr-tg-backup sources path --config PATH` | Show the canonical catalog path |
+| `asmr-tg-backup sources list --config PATH` | Show the filter and every configured source field |
+| `asmr-tg-backup sources validate [--file PATH] --config PATH` | Validate the canonical catalog or another file without applying it |
+| `asmr-tg-backup sources apply [--file PATH] --config PATH` | Reconcile the canonical catalog, or atomically replace it from another valid file |
+| `asmr-tg-backup sources export --output PATH [--config PATH]` | Export a private catalog snapshot |
+| `asmr-tg-backup sources migrate --config PATH` | Create the unified catalog from legacy TOML/SQLite sources |
 
-### Setup profiles
+### Guided setup choices
 
-| Profile | Result |
+| Choice shown by setup | Result |
 | --- | --- |
-| `mtproto-official` | Default official-release MTProto configuration |
-| `mtproto-own` | MTProto with a private application ID/hash entered during source-build setup |
-| `custom-api-single` | Existing trusted Bot API URL with a large single-file profile |
-| `local-api-single` | Preinstalled local Bot API registered at `127.0.0.1:18081` |
-| `official-api-split` | `api.telegram.org`, 49 MB safety limit, playable audio splitting |
+| MTProto direct upload | Ready to use in an official installation; source setup asks for your own application ID/hash |
+| Existing trusted API URL | Assumes a large-file endpoint and generates a 1.99 GB single-file limit with splitting disabled; edit the generated limit for other endpoints |
+| Local `telegram-bot-api` user service | Registers a preinstalled executable at `127.0.0.1:18081` |
+| `api.telegram.org` with audio parts | Uses a 49 MB safety limit and playable audio splitting |
 
 ## Native paths
 
@@ -31,6 +38,9 @@ XDG variables replace the corresponding default roots.
 | Resource | XDG path | Default |
 | --- | --- | --- |
 | Setup config | `$XDG_CONFIG_HOME/asmr-tg-backup/config.toml` | `~/.config/asmr-tg-backup/config.toml` |
+| Source catalog | beside the setup config by default | `~/.config/asmr-tg-backup/sources.toml` |
+| Worker environment | next to the setup config as `env` | `~/.config/asmr-tg-backup/env` |
+| Worker unit | `$XDG_CONFIG_HOME/systemd/user/asmr-tg-backup.service` | `~/.config/systemd/user/asmr-tg-backup.service` |
 | Application data | `$XDG_DATA_HOME/asmr-tg-backup` | `~/.local/share/asmr-tg-backup` |
 | Database | below application data | `~/.local/share/asmr-tg-backup/state.db` |
 | Downloads | below application data | `~/.local/share/asmr-tg-backup/downloads` |
@@ -39,15 +49,18 @@ XDG variables replace the corresponding default roots.
 | Local API unit | `$XDG_CONFIG_HOME/systemd/user/asmr-tg-backup-telegram-bot-api.service` | `~/.config/systemd/user/asmr-tg-backup-telegram-bot-api.service` |
 | Local API data | `$XDG_DATA_HOME/asmr-tg-backup/telegram-bot-api` | `~/.local/share/asmr-tg-backup/telegram-bot-api` |
 
-Docker sets `ASMR_TG_BACKUP_DATA_DIR=/data`; the named `asmr-data` volume holds
-the database, downloads, and MTProto session.
+Docker sets `ASMR_TG_BACKUP_DATA_DIR=/data`, mounts the writable host directory
+`./settings` at `/settings`, and uses `/settings/sources.toml` as the catalog.
+Mount the directory rather than only the file so atomic catalog replacement can
+succeed. The named `asmr-data` volume holds the database, downloads, and
+MTProto session.
 
 ## Configuration sections
 
 | Section | Purpose |
 | --- | --- |
 | `[app]` | Data path, polling, retry, leases, worker count, logging |
-| `[[origins]]` | Provider-backed YouTube, Twitch, or RSS origins |
+| `[sources]` | Points to the unified `sources.toml` catalog used by both panel and CLI |
 | `[download]` | yt-dlp, ffmpeg, formats, paths, timeout, sidecars |
 | `[download.provider_profiles.*]` | Per-provider download overrides |
 | `[telegram]` | Enablement, token, destination, transport, media, caption |
@@ -56,11 +69,17 @@ the database, downloads, and MTProto session.
 | `[control]` | Telegram panel permissions and polling |
 | `[twitch]` | Helix credentials and VOD/live behavior |
 
+`config.toml` is process configuration. Source rows and the global source
+filter live in `sources.toml`; Panel changes therefore do not rewrite
+`config.toml`. Edit global settings and restart the process, or edit the source
+catalog and run `sources validate` followed by `sources apply`.
+
 ## Environment variables
 
 | Variable | Overrides or controls |
 | --- | --- |
 | `ASMR_TG_BACKUP_DATA_DIR` | `[app].data_dir` |
+| `ASMR_TG_BACKUP_SOURCES_PATH` | `[sources].path` |
 | `TELEGRAM_BOT_TOKEN` | `telegram.bot_token` |
 | `TELEGRAM_CHAT_ID` | `telegram.chat_id` |
 | `ASMR_TG_UPLOAD_TRANSPORT` | `telegram.upload_transport` |
@@ -72,16 +91,16 @@ the database, downloads, and MTProto session.
 | `TWITCH_ACCESS_TOKEN` | Existing Twitch app access token |
 | `TWITCH_CLIENT_SECRET` | Twitch app-token creation and refresh |
 
-The two MTProto variables must be present together. For an official release,
-their complete runtime pair overrides the release defaults. A source build has
-no such defaults and needs its own pair whenever MTProto is selected.
+The two MTProto variables must be present together. Official-package users can
+normally leave both unset. A source build needs its own complete pair whenever
+MTProto is selected; a runtime pair overrides a pair in private TOML.
 
 ## Delivery flow
 
 ```text
 discover -> queue -> download -> prepare media
   -> selected transport prepares/uploads
-  -> send commit
+  -> Telegram accepts the message or media group
   -> store Telegram message IDs
 ```
 
@@ -90,15 +109,16 @@ splitting runs only when that transport is selected and its configured byte
 limit is exceeded. Ambiguous send results become `uncertain`; they are not sent
 again through a different transport.
 
-The control panel remains a Bot API consumer independently of the media
-transport.
+The control panel continues to use Bot API independently of the media transport.
 
 ## Security boundaries
 
-- Keep configuration, environment files, SQLite, and `.session` files private.
+- Keep configuration, the source catalog, environment files, SQLite, and
+  `.session` files private.
 - Never put the bot token or session into a package, image, issue, or log.
 - Use a complete MTProto application pair from one source; never mix halves.
-- Use HTTPS for non-loopback Bot API endpoints.
+- Use HTTPS for remote Bot API endpoints reached over an untrusted network;
+  loopback and controlled private Compose networks may use HTTP.
 - Bind local Bot API and statistics endpoints only to trusted interfaces.
 - Keep media-egress proxies separate from loopback Telegram API traffic.
 - Back up a session only into storage with the same protection as credentials.

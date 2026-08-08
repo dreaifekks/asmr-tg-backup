@@ -1,47 +1,79 @@
 # Choose a deployment
 
-Both supported installations run the same Python application and use the same
-TOML model. Choose based on how you want to update and supervise the process;
-the Telegram upload transport can be changed independently.
+PyPI and Docker Compose run the same application and use the same TOML
+configuration. Pick the installation style you prefer; the Telegram upload
+method can be changed independently.
 
-| Concern | PyPI / native Linux | Docker Compose |
+| | PyPI / native Linux | Docker Compose |
 | --- | --- | --- |
-| Installation | `pipx` or a virtual environment | Official GHCR image or local source build |
-| Process supervision | `systemd --user` or another native supervisor | Compose restart policy |
-| Persistent state | XDG data directory | Named `/data` volume |
-| Default media upload | MTProto | MTProto |
-| Local Bot API | Optional preinstalled executable and generated user unit | Optional `local-api` profile |
-| OS tools | Install `ffmpeg` and `curl` yourself | Included in the image |
+| Best for | A lightweight service on one Linux host | A container-managed stack |
+| Process manager | `systemd --user` | Compose restart policy |
+| Source configuration | `~/.config/asmr-tg-backup/sources.toml` | `./settings/sources.toml` |
+| Runtime state | XDG data directory | `asmr-data` volume mounted at `/data` |
+| Default upload | MTProto | MTProto |
+| Media tools | Install `ffmpeg`/`ffprobe` | Included in the image |
 
-## Recommended path
+## Telegram shortcuts {#telegram-shortcuts}
 
-Use [PyPI and native Linux](pypi.md) for the fewest moving pieces. The official
-package can use MTProto directly, so `asmr-tg-backup setup` normally needs only
-the bot token, destination, and control-panel user ID.
+<div class="grid cards" markdown>
 
-Use [Docker Compose](docker-compose.md) when you prefer a containerized service,
-named-volume backups, or want the optional Bot API server in the same stack.
+-   **Create a bot**
 
-## Official releases and source builds
+    [Open BotFather](https://t.me/BotFather){ target="_blank" rel="noopener noreferrer" }
 
-Official PyPI and GHCR releases provide the application identity needed by the
-default MTProto path. Environment variables can override it with your own pair:
+    Create the bot, copy its token, then add it to the destination channel with
+    permission to post.
 
-```dotenv
-ASMR_TG_MTPROTO_API_ID=123456
-ASMR_TG_MTPROTO_API_HASH=0123456789abcdef0123456789abcdef
-```
+-   **Find your user ID**
 
-Set both values together. Source builds have no release defaults and therefore
-need this pair (or private `[telegram.mtproto]` values) when MTProto is selected.
-Alternatively, choose a Bot API transport during setup.
+    [Open @userinfobot](https://t.me/userinfobot){ target="_blank" rel="noopener noreferrer" }
 
-The bot token and MTProto session always belong to the local installation and
-must remain private.
+    Copy the numeric ID used to authorize the Telegram control panel.
 
-## No compatibility migration
+-   **Create a Telegram API ID/hash**
 
-This release uses the new nested transport configuration directly. If you have
-an experimental configuration from an earlier checkout, regenerate it with
-`asmr-tg-backup setup` or compare it with the packaged example instead of
-expecting old flat Telegram fields to be migrated.
+    [Open Telegram API management](https://my.telegram.org/apps){ target="_blank" rel="noopener noreferrer" }
+
+    This is needed for a source build with its own MTProto application or for a
+    local Bot API server. Official PyPI and GHCR installations are ready to use
+    MTProto without this step.
+
+</div>
+
+Also prepare the destination chat ID or a public `@channel` name.
+
+MTProto signs in as the bot and creates a reusable session during the first
+delivery. It does not require a personal account or phone verification code.
+
+## Pick an installation
+
+- [PyPI and native Linux](pypi.md) is the shortest path: install the package,
+  run `asmr-tg-backup setup`, then register it with
+  `asmr-tg-backup service install`.
+- [Docker Compose](docker-compose.md) keeps the application and its data in a
+  container-managed stack.
+
+## Pick an upload method
+
+| Method | When to use it |
+| --- | --- |
+| MTProto | Default. Uploads the file directly without a separate Bot API server. |
+| Existing Bot API URL | Connect to a Bot API endpoint you already run. |
+| Local Bot API | Run `telegram-bot-api` through native systemd or the Compose `local-api` profile. |
+| Telegram cloud Bot API | Uses a 49 MB per-file setting and splits oversized audio into playable parts. |
+
+## What happens after setup
+
+The PyPI setup asks for the bot token, destination, and control-panel user ID.
+It creates `config.toml`, `sources.toml`, and the SQLite database, but does not
+add any media sources. Start the service, send `/panel` to the bot, and add one
+YouTube or Twitch source. The panel writes sources and the filter to the
+editable `sources.toml`; SQLite contains only the synchronized mirror and
+runtime state. Twitch sources also need application credentials from the
+[Twitch setup guide](../configuration/sources.md#twitch-credentials).
+
+Compose uses `.env`, `config.toml`, and `settings/sources.toml` instead of the
+interactive setup command.
+
+Source builds that use MTProto need their own complete API ID/hash pair. See
+[Architecture and development](../development.md) for the source workflow.

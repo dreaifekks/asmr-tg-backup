@@ -11,6 +11,8 @@ dist/*
 *.session-journal
 .env*
 config.toml
+sources.toml
+settings
 data
 downloads
 outputs

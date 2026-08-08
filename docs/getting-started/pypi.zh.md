@@ -1,147 +1,124 @@
 # PyPI 与原生 Linux
 
-PyPI 是组件最少的部署方式：一个应用进程、SQLite 和一个私有 MTProto session。
-默认路径不需要运行本地 Bot API 服务。
+这种方式只运行一个应用进程，状态保存在 SQLite，MTProto bot session 保存在本地，
+不需要另外部署 Bot API 服务。
 
-## 安装系统工具
+## 1. 安装
 
-Debian 或 Ubuntu 可以运行：
+Debian 或 Ubuntu 可以直接运行：
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y ffmpeg curl pipx
+sudo apt-get install -y ffmpeg pipx
 pipx ensurepath
-```
-
-安装官方发行包：
-
-```bash
-pipx install asmr-tg-backup
+export PATH="$HOME/.local/bin:$PATH"
+pipx install "asmr-tg-backup[performance]"
 asmr-tg-backup --version
 ```
 
-如果经常上传大文件，可以用下面的可选 extra 命令代替上面的普通安装命令：
+`[performance]` 会一并安装 `cryptg`，用于加快 MTProto 上传。
 
-```bash
-pipx install "asmr-tg-backup[performance]"
-```
+## 2. 准备 Telegram
 
-`cryptg` 只是性能加速器；不安装也可以使用核心功能。
+- [通过 BotFather 创建或管理 bot](https://t.me/BotFather){ target="_blank" rel="noopener noreferrer" }
+- [通过 @userinfobot 查看自己的数字用户 ID](https://t.me/userinfobot){ target="_blank" rel="noopener noreferrer" }
+- 准备目标 chat ID；频道有公开用户名时也可以使用 `@channel`。
 
-## 运行引导式初始化
+然后运行：
 
 ```bash
 asmr-tg-backup setup
 ```
 
-默认选项是 **MTProto 直接上传**。使用官方发行包时，setup 会询问：
+运行 setup 后按提示填写 bot token、目标地址和控制面板用户 ID；没有特殊需求时，上传
+方式选择默认的 **MTProto 直接上传**。setup 随后会创建：
 
-1. BotFather token；
-2. 目标 chat ID 或 `@channel`；
-3. 允许打开控制面板的 Telegram 用户 ID。
+- `~/.config/asmr-tg-backup/config.toml`
+- `~/.config/asmr-tg-backup/sources.toml`
+- `~/.local/share/asmr-tg-backup/state.db`
 
-它会在 `~/.config/asmr-tg-backup/` 下写入权限为 `0600` 的配置，在
-`~/.local/share/asmr-tg-backup/` 下初始化 SQLite，并输出准确的运行命令。
-setup 不会发送测试消息。首次运行会在数据目录创建 MTProto session；请像保护 bot
-token 一样保护这个 session。
+MTProto 登录的是 bot，不是个人 Telegram 账号。第一份媒体真正投递时，session 文件才会
+出现在数据目录中。
 
-## 源码构建与自己的 Telegram application
+## 3. 按需配置 Twitch 凭据
 
-源码构建使用 MTProto 时，需要自己的 Telegram application ID/hash。按照 Telegram
-[application 创建说明](https://core.telegram.org/api/obtaining_api_id)取得一对凭据，
-并在 setup 及之后每次服务运行前成对导出：
+YouTube 不需要额外的来源凭据。准备添加 Twitch 来源时，把 Twitch 应用凭据
+写入用户服务读取的环境文件：
 
-```bash
-export ASMR_TG_MTPROTO_API_ID=123456
-export ASMR_TG_MTPROTO_API_HASH=0123456789abcdef0123456789abcdef
-asmr-tg-backup setup
+```dotenv
+TWITCH_CLIENT_ID=replace-with-client-id
+TWITCH_CLIENT_SECRET=replace-with-client-secret
 ```
 
-这两个值是不可拆分的一对；只设置其中一个会报错。也可以把两个值都写入私有的
-`[telegram.mtproto]`。不要把 bot token 或 `.session` 文件复制到源码目录。
+```bash
+chmod 600 ~/.config/asmr-tg-backup/env
+```
 
-## 运行与验证
+[Twitch 配置说明](../configuration/sources.md#twitch-credentials)提供开发者控制台入口，
+也说明了已有 access token 的用法。
 
-使用 setup 输出的路径，例如：
+## 4. 注册后台服务 {#run-as-a-user-service}
+
+下面一条命令会按照当前 pipx/虚拟环境和配置路径生成 systemd 用户服务，同时完成注册、
+立即启动和开机自启动：
+
+```bash
+asmr-tg-backup service install
+```
+
+这条命令可以重复执行：它会更新本应用生成的 unit 并重启 worker，所以 `pipx` 升级后
+再运行一次即可。
+
+使用非默认配置时，在后面加上 `--config /absolute/path/config.toml`。查看状态和实时日志：
+
+```bash
+systemctl --user status asmr-tg-backup.service
+journalctl --user -u asmr-tg-backup.service -f
+```
+
+以后需要停止并注销服务时运行：
+
+```bash
+asmr-tg-backup service uninstall
+```
+
+注销只移除用户服务，不会删除配置、环境文件、SQLite、下载文件或 MTProto session。
+用户级 linger 也会保留，因为其他用户服务可能仍在使用它。
+
+如果只想在前台临时运行：
 
 ```bash
 asmr-tg-backup run \
   --config ~/.config/asmr-tg-backup/config.toml
 ```
 
-在另一个终端检查：
+## 5. 添加来源
+
+向 bot 发送 `/panel`，添加一个 YouTube 或 Twitch 来源。Panel 会更新
+`~/.config/asmr-tg-backup/sources.toml` 并同步运行时数据库。需要批量或完整字段调整时，
+可以编辑该文件后运行：
 
 ```bash
-asmr-tg-backup status \
-  --config ~/.config/asmr-tg-backup/config.toml
+asmr-tg-backup sources validate
+asmr-tg-backup sources apply
 ```
 
-然后向 bot 发送 `/panel`，添加一个来源。确认一次下载和一次投递后，再继续增加来源。
+通过 Panel 或 `asmr-tg-backup status` 确认首次下载和投递。
 
-## 注册用户服务
+## 6. 更新
 
-如果进程需要源码构建凭据或 Twitch 凭据，请创建私有环境文件：
-
-```dotenv
-ASMR_TG_MTPROTO_API_ID=123456
-ASMR_TG_MTPROTO_API_HASH=0123456789abcdef0123456789abcdef
-```
-
-将其保存为 `~/.config/asmr-tg-backup/env` 并设置为 `0600`，然后让
-`systemd --user` unit 同时引用该文件和 setup 生成的配置。`ExecStart` 应使用
-`command -v asmr-tg-backup` 返回的绝对路径。
-
-```ini
-[Unit]
-Description=ASMR archive and Telegram delivery worker
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/asmr-tg-backup run --config %h/.config/asmr-tg-backup/config.toml
-EnvironmentFile=-%h/.config/asmr-tg-backup/env
-Restart=always
-RestartSec=10s
-UMask=0077
-
-[Install]
-WantedBy=default.target
-```
-
-将其保存为 `~/.config/systemd/user/asmr-tg-backup.service`。如果
-`command -v` 返回其他路径，请修改 `ExecStart`。
+更新前先备份 `~/.config/asmr-tg-backup/`（包括来源目录）和
+`~/.local/share/asmr-tg-backup/`。
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user enable --now asmr-tg-backup.service
-journalctl --user -u asmr-tg-backup.service -f
-```
-
-## 高级 Bot API 初始化
-
-在 setup 第一级菜单中选择 **Bot API**，下一层可以：
-
-- 使用已有可信 URL；
-- 验证预装的 `telegram-bot-api` 可执行文件，并在 `127.0.0.1:18081` 注册本地
-  用户 unit；
-- 使用 `api.telegram.org`、49 MB 安全阈值和可播放音频分块。
-
-wheel 不会下载 C++ 服务端。选择本地服务前，应先按照 Telegram
-[官方源码说明](https://github.com/tdlib/telegram-bot-api#installation)完成构建安装。
-本地服务需要自己的 `TELEGRAM_API_ID`/`TELEGRAM_API_HASH`；它与应用 MTProto
-使用的 `ASMR_TG_MTPROTO_API_ID/HASH` 是两套独立配置。
-
-setup 不会把 bot 从云端 Bot API 自动迁移到本地服务。首次在本地服务使用该 token
-前，请执行 Telegram 的
-[本地服务迁移流程](https://github.com/tdlib/telegram-bot-api#moving-a-bot-to-a-local-server)。
-
-## 更新
-
-```bash
+systemctl --user stop asmr-tg-backup.service
 pipx upgrade asmr-tg-backup
-systemctl --user restart asmr-tg-backup.service
+systemctl --user start asmr-tg-backup.service
+asmr-tg-backup --version
 ```
 
-更新前请备份配置、SQLite 数据库、下载文件和 MTProto session。详情参阅
-[运行与维护](../operations.md)。
+## 其他上传与构建方式
+
+- [Telegram 投递](../configuration/telegram.md) 介绍自定义/本地 Bot API 和云端音频分块。
+- [架构与开发](../development.md) 介绍源码构建。源码构建需要自备 API ID/hash，可在
+  [Telegram API 管理页面](https://my.telegram.org/apps){ target="_blank" rel="noopener noreferrer" }申请。

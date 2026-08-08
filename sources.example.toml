@@ -1,0 +1,28 @@
+# Managed most easily from the Telegram control panel. The same catalog can be
+# edited by hand; run `asmr-tg-backup sources apply` after saving changes.
+version = 1
+
+# Case-insensitive regular expression matched against source ids, source names,
+# and discovered media titles. Set it to an empty string to accept everything.
+source_filter = "ASMR"
+
+[[origins]]
+id = "youtube-example"
+provider = "youtube"
+kind = "uploads"
+name = "Example YouTube ASMR channel"
+external_id = "UC_CHANNEL_ID"
+enabled = false
+# "latest" starts with the newest matching item; "all" requests a backfill.
+bootstrap = "latest"
+
+[[origins]]
+id = "twitch-example"
+provider = "twitch"
+kind = "vods"
+name = "Example Twitch ASMR broadcaster"
+external_id = "twitch_login_or_numeric_broadcaster_id"
+enabled = false
+bootstrap = "latest"
+# "vod" waits for an archive; "live" records while the stream is running.
+recording_mode = "vod"

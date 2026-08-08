@@ -158,6 +158,11 @@ class ControlConfig:
 
 
 @dataclass(frozen=True)
+class SourcesConfig:
+    path: Path
+
+
+@dataclass(frozen=True)
 class Config:
     path: Path
     rsshub: RsshubConfig
@@ -167,7 +172,11 @@ class Config:
     download: DownloadConfig
     telegram: TelegramConfig
     control: ControlConfig
+    sources: SourcesConfig
+    # Legacy source declarations are read only for the one-time sources.toml
+    # migration. Runtime source management uses ``sources.path``.
     origins: list[Origin] = field(default_factory=list)
+    legacy_sources_declared: bool = False
     twitch: TwitchConfig = field(default_factory=TwitchConfig)
 
     @property
@@ -378,7 +387,25 @@ def load_config(path: str | Path) -> Config:
         allowed_message_thread_ids=[str(item) for item in control_raw.get("allowed_message_thread_ids", [])],
     )
 
+    sources_raw = raw.get("sources", {})
+    if not isinstance(sources_raw, dict):
+        raise ValueError("sources must be a table")
+    sources_path_value = str(
+        os.environ.get("ASMR_TG_BACKUP_SOURCES_PATH")
+        or sources_raw.get("path")
+        or "sources.toml"
+    ).strip()
+    if not sources_path_value:
+        raise ValueError("sources.path must not be empty")
+    sources_path = Path(sources_path_value).expanduser()
+    if not sources_path.is_absolute():
+        sources_path = config_path.parent / sources_path
+    sources = SourcesConfig(path=sources_path)
+
     origins = _load_origins(raw.get("origins", []), channels, raw_feeds)
+    legacy_sources_declared = any(
+        key in raw for key in ("origins", "channels", "feeds")
+    )
 
     return Config(
         path=config_path,
@@ -389,7 +416,9 @@ def load_config(path: str | Path) -> Config:
         download=download,
         telegram=telegram,
         control=control,
+        sources=sources,
         origins=origins,
+        legacy_sources_declared=legacy_sources_declared,
         twitch=twitch,
     )
 

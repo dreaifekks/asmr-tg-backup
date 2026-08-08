@@ -151,7 +151,7 @@ allowed_user_ids = ["123"]
             )
             expire_idle_panels.assert_called_once_with()
 
-    def test_authorization_and_sub_add(self):
+    def test_authorization_and_catalog_origin_add(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
             config_path.write_text(
@@ -183,36 +183,28 @@ default_routes = ["live"]
             self.assertFalse(bot._authorized({"from": {"id": 456}, "chat": {"id": -200}, "message_thread_id": 99}))
 
             def fake_resolve(channel_ref: str, yt_dlp: str) -> str:
-                return {
-                    "@nightmare": "UCnightmare11111111111111",
-                    "@nightmare2": "UCnightmare22222222222222",
-                    "@nightmare3": "UCnightmare33333333333333",
-                }[channel_ref]
+                self.assertEqual(channel_ref, "@nightmare")
+                return "UCnightmare11111111111111"
 
             with mock.patch("ytb_tg_backup.control.resolve_channel_id", side_effect=fake_resolve):
-                reply = bot._execute('/sub_add n1 "@nightmare" "Nightmare ASMR"', message)
-                self.assertIn("added: n1", reply)
-                self.assertEqual(store.list_subscriptions()[0].channel_id, "UCnightmare11111111111111")
-                self.assertEqual(store.list_subscriptions()[0].routes, ["live"])
+                reply = bot._execute(
+                    '/origin add youtube "@nightmare" "Nightmare ASMR"',
+                    message,
+                )
+                self.assertIn("added:", reply)
 
-                short_reply = bot._execute("/sub add channel @nightmare2 Nightmare Two", message)
-                self.assertIn("added: channel@nightmare2", short_reply)
-                by_id = {sub.id: sub for sub in store.list_subscriptions()}
-                self.assertEqual(by_id["channel@nightmare2"].channel_id, "UCnightmare22222222222222")
-                self.assertEqual(by_id["channel@nightmare2"].routes, ["channel"])
-                self.assertEqual(by_id["channel@nightmare2"].name, "Nightmare Two")
-
-                default_route_reply = bot._execute("/sub add @nightmare3", message)
-                self.assertIn("added: live@nightmare3", default_route_reply)
-                by_id = {sub.id: sub for sub in store.list_subscriptions()}
-                self.assertEqual(by_id["live@nightmare3"].channel_id, "UCnightmare33333333333333")
-                self.assertEqual(by_id["live@nightmare3"].routes, ["live"])
-                self.assertEqual(by_id["live@nightmare3"].name, "nightmare3")
+            origins = store.list_origins(managed_by="catalog")
+            self.assertEqual(len(origins), 1)
+            self.assertEqual(origins[0].external_id, "UCnightmare11111111111111")
+            self.assertEqual(origins[0].name, "Nightmare ASMR")
+            self.assertTrue((Path(tmp) / "sources.toml").is_file())
 
             help_text = bot._execute("/help", message)
-            self.assertIn("/sub add", help_text)
+            self.assertNotIn("/sub add", help_text)
             self.assertIn("/panel", help_text)
             self.assertIn("/origin add twitch", help_text)
+            self.assertIn("/origin rename", help_text)
+            self.assertIn("/origin history", help_text)
             self.assertIn("Default source filter is /ASMR/i", help_text)
 
     def test_provider_neutral_origin_commands(self):
@@ -260,6 +252,10 @@ allowed_user_ids = ["123"]
             self.assertIn("twitch/vods", twitch_vod_reply)
             self.assertIn("mode=vod", twitch_vod_reply)
             rows = store.list_origin_statuses()
+            self.assertEqual({row["managed_by"] for row in rows}, {"catalog"})
+            self.assertTrue(
+                all(str(row["id"]).startswith("source:") for row in rows)
+            )
             self.assertEqual(
                 {(row["provider"], row["kind"], row["external_id"]) for row in rows},
                 {
@@ -292,10 +288,213 @@ allowed_user_ids = ["123"]
                 )
             )
             self.assertEqual(vod_options["recording_mode"], "live")
+            self.assertEqual(vod_options["created_from"], "telegram_panel")
+            self.assertIn(
+                "renamed",
+                bot._execute(f'/origin rename {twitch_vod_id} "Renamed VOD"', message),
+            )
+            self.assertIn(
+                "historical import requested",
+                bot._execute(f"/origin history {twitch_vod_id}", message),
+            )
+            renamed = store.conn.execute(
+                "SELECT name, bootstrap, options_json FROM origins WHERE id=?",
+                (twitch_vod_id,),
+            ).fetchone()
+            self.assertEqual(renamed["name"], "Renamed VOD")
+            self.assertEqual(renamed["bootstrap"], "all")
+            self.assertEqual(
+                json.loads(str(renamed["options_json"]))["created_from"],
+                "telegram_panel",
+            )
             self.assertIn("mode=live", bot._execute("/origin list", message))
             self.assertIn("disabled", bot._execute(f"/origin disable {twitch_id}", message))
             self.assertIn("enabled", bot._execute(f"/origin enable {twitch_id}", message))
             self.assertIn("deleted origin", bot._execute(f"/origin del {twitch_id}", message))
+
+    def test_panel_source_identity_uses_provider_specific_case_rules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[twitch]
+client_id = "test-client"
+access_token = "test-token"
+
+[[origins]]
+id = "existing-twitch"
+provider = "twitch"
+kind = "vods"
+name = "Existing Twitch"
+external_id = "ExampleStreamer"
+recording_mode = "vod"
+
+[control]
+enabled = true
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            message = {"from": {"id": 123}, "chat": {"id": -100}}
+
+            twitch_reply = bot._origin_add(
+                ["twitch", "vods", "examplestreamer", "Updated Twitch"],
+                message,
+                recording_mode="live",
+            )
+            self.assertIn("already exists; enabled: existing-twitch", twitch_reply)
+            self.assertIn("mode=live", twitch_reply)
+            twitch_rows = store.list_origins(managed_by="catalog")
+            self.assertEqual(len(twitch_rows), 1)
+            self.assertEqual(twitch_rows[0].external_id, "ExampleStreamer")
+            self.assertEqual(twitch_rows[0].options["recording_mode"], "live")
+
+            with mock.patch(
+                "ytb_tg_backup.control.resolve_channel_id",
+                side_effect=["UCExampleCase", "UCexampleCase"],
+            ):
+                first_reply = bot._execute(
+                    "/origin add youtube @first First Channel",
+                    message,
+                )
+                second_reply = bot._execute(
+                    "/origin add youtube @second Second Channel",
+                    message,
+                )
+
+            self.assertIn("added:", first_reply)
+            self.assertIn("added:", second_reply)
+            youtube_rows = [
+                row
+                for row in store.list_origins(managed_by="catalog")
+                if row.provider == "youtube"
+            ]
+            self.assertEqual(len(youtube_rows), 2)
+            self.assertEqual(
+                {row.external_id for row in youtube_rows},
+                {"UCExampleCase", "UCexampleCase"},
+            )
+
+    def test_source_views_hide_legacy_history_origins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[control]
+enabled = true
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            message = {"from": {"id": 123}, "chat": {"id": -100}}
+
+            with mock.patch(
+                "ytb_tg_backup.control.resolve_channel_id",
+                return_value="UCCatalogSource",
+            ):
+                self.assertIn(
+                    "added:",
+                    bot._execute(
+                        "/origin add youtube @catalog Catalog Source",
+                        message,
+                    ),
+                )
+            store.upsert_origin(
+                Origin(
+                    id="historical-origin",
+                    provider="youtube",
+                    kind="uploads",
+                    name="Historical Only",
+                    external_id="UCHistoricalOnly",
+                    enabled=True,
+                ),
+                managed_by="legacy",
+            )
+
+            command_text = bot._execute("/origin list", message)
+            home_text, _ = bot._render_home_panel()
+            origins_text, origins_keyboard = bot._render_origins_panel({})
+            callbacks = {
+                str(button["callback_data"])
+                for row in origins_keyboard
+                for button in row
+                if "callback_data" in button
+            }
+
+            self.assertIn("Catalog Source", command_text)
+            self.assertNotIn("Historical Only", command_text)
+            self.assertIn("来源：1/1 已启用", home_text)
+            self.assertIn("Catalog Source", origins_text)
+            self.assertNotIn("Historical Only", origins_text)
+            self.assertFalse(
+                any(_origin_token("historical-origin") in value for value in callbacks)
+            )
+
+    def test_legacy_config_origin_is_migrated_and_editable_as_catalog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[twitch]
+client_id = "test-client"
+access_token = "test-token"
+
+[[origins]]
+id = "legacy-vod"
+provider = "twitch"
+kind = "vods"
+name = "Legacy VOD"
+external_id = "legacy_streamer"
+enabled = true
+bootstrap = "latest"
+recording_mode = "vod"
+future_option = "keep-me"
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            message = {"from": {"id": 123}, "chat": {"id": -100}}
+
+            self.assertIn(
+                "renamed",
+                bot._execute('/origin rename legacy-vod "Catalog VOD"', message),
+            )
+            self.assertTrue(config.sources.path.exists())
+            row = store.conn.execute(
+                "SELECT * FROM origins WHERE id='legacy-vod'"
+            ).fetchone()
+            self.assertEqual(row["managed_by"], "catalog")
+            self.assertEqual(row["name"], "Catalog VOD")
+            self.assertEqual(
+                json.loads(str(row["options_json"]))["future_option"],
+                "keep-me",
+            )
+            self.assertIn(
+                "disabled",
+                bot._execute("/origin disable legacy-vod", message),
+            )
+            self.assertFalse(
+                bool(
+                    store.conn.execute(
+                        "SELECT enabled FROM origins WHERE id='legacy-vod'"
+                    ).fetchone()["enabled"]
+                )
+            )
 
     def test_single_message_panel_adds_and_deletes_twitch_origin(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -344,6 +543,20 @@ allowed_chat_ids = ["-100"]
                             "from": {"id": 123},
                             "message": panel_message,
                             "data": add_twitch_callback,
+                        }
+                    }
+                )
+                vod_kind_callback = _current_panel_callback(
+                    calls,
+                    "p:addtwkind:vods",
+                )
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-add-kind",
+                            "from": {"id": 123},
+                            "message": panel_message,
+                            "data": vod_kind_callback,
                         }
                     }
                 )
@@ -472,6 +685,52 @@ allowed_chat_ids = ["-100"]
                     for payload in edits
                 )
             )
+
+    def test_twitch_panel_selects_kind_before_vod_recording_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[control]
+enabled = true
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            message = {"from": {"id": 123}, "chat": {"id": -100}}
+
+            for kind, label in (("highlights", "Highlights"), ("uploads", "Uploads")):
+                with self.subTest(kind=kind):
+                    state: dict[str, object] = {}
+                    bot._apply_panel_action("p:addtw", state, message)
+                    self.assertEqual(state["view"], "twitch_kind")
+                    bot._apply_panel_action(f"p:addtwkind:{kind}", state, message)
+                    self.assertEqual(state["view"], "input")
+                    self.assertEqual(state["awaiting"], "add_twitch")
+                    self.assertEqual(state["twitch_kind"], kind)
+                    self.assertIsNone(state["twitch_mode"])
+                    prompt, _ = bot._render_panel(state)
+                    self.assertIn(label, prompt)
+                    self.assertNotIn("直播中录制", prompt)
+
+            vods: dict[str, object] = {}
+            bot._apply_panel_action("p:addtw", vods, message)
+            bot._apply_panel_action("p:addtwkind:vods", vods, message)
+            self.assertEqual(vods["view"], "twitch_mode")
+            self.assertIsNone(vods["awaiting"])
+            mode_text, mode_markup = bot._render_panel(vods)
+            self.assertIn("直播中录制", mode_text)
+            callbacks = {
+                button["callback_data"]
+                for row in mode_markup["inline_keyboard"]
+                for button in row
+            }
+            self.assertIn("p:addtwmode:live", callbacks)
 
     def test_panel_browses_searches_and_deletes_tracked_disk_resource(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1453,7 +1712,7 @@ enabled = true
             self.assertIn("error: invalid source regex", invalid)
             self.assertEqual(store.get_bot_state(SOURCE_FILTER_STATE_KEY), "ASMR|sleep")
 
-            off = bot._execute("/sub filter off", message)
+            off = bot._execute("/source_filter off", message)
             self.assertIn("source_filter=off", off)
             self.assertEqual(store.get_bot_state(SOURCE_FILTER_STATE_KEY), "")
 

@@ -17,8 +17,8 @@ RUN apt-get update \
 
 WORKDIR /app
 
-RUN mkdir -p /config /data \
-    && chown -R app:app /config /data
+RUN mkdir -p /config /data /settings \
+    && chown -R app:app /config /data /settings
 
 COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/asmr-tg-backup-entrypoint
 
