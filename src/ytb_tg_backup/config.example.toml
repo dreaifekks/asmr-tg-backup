@@ -17,6 +17,18 @@ log_level = "INFO"
 [sources]
 path = "sources.toml"
 
+# Optional packages are discovered through Python entry points. Installation
+# alone changes nothing; list IDs with `asmr-tg-backup extensions list`, then
+# opt in here and validate with `asmr-tg-backup extensions doctor`.
+[extensions]
+enabled = []
+
+# Keep plugin secrets and subscription URLs in a private file beside this
+# config, then enable its ID above.
+# [extensions."dreaife.proxy-router"]
+# required = true
+# config_file = "proxy.toml"
+
 [download]
 yt_dlp = "yt-dlp"
 ffmpeg = "ffmpeg"
@@ -89,12 +101,16 @@ max_pages_per_poll = 3
 # Helix Get Streams and starts yt-dlp immediately. An origin-level
 # recording_mode overrides this fallback default in sources.toml.
 recording_mode = "vod"
-live_poll_interval_seconds = 30
-live_retry_seconds = 15
-live_worker_count = 1
+
+# Fast polling and the isolated recording lane are shared by every live source
+# provider, including extensions.
+[live]
+poll_interval_seconds = 30
+retry_seconds = 15
+worker_count = 1
 # 0 means no fixed wall-clock limit; service stop and lease loss still terminate
 # yt-dlp cleanly and leave the job retryable.
-live_download_timeout_seconds = 0
+download_timeout_seconds = 0
 
 [control]
 enabled = false

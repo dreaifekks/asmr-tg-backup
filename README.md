@@ -4,10 +4,11 @@
 [简体中文文档](https://dreaifekks.github.io/asmr-tg-backup/zh/) ·
 <a href="https://t.me/+9-Cy-yue1PJiMWY9" target="_blank" rel="noopener noreferrer">Telegram showcase</a>
 
-`asmr-tg-backup` is a background service for discovering ASMR media on YouTube
-and Twitch, archiving it with `yt-dlp`, and optionally delivering the archived
-files to Telegram. It supports YouTube channel uploads plus Twitch VOD and live
-recording.
+`asmr-tg-backup` is an extensible background service for discovering ASMR media,
+archiving it with `yt-dlp`, and optionally delivering the archived files to
+Telegram. The core includes YouTube channel uploads plus Twitch VOD and live
+recording; optional packages can add source providers and scoped network
+routing without taking over durable job state.
 
 ## Highlights
 
@@ -17,6 +18,8 @@ recording.
   releases; no separate Telegram Bot API server is required.
 - Twitch channels can download published VODs or begin recording while a stream
   is live.
+- A typed extension host can add source providers or task-scoped connection
+  routing; extensions are installed and enabled explicitly.
 - Downloads and Telegram delivery are independent jobs, so an upload failure
   does not discard or repeat a completed download.
 - The optional Telegram panel manages sources, filters, status, and tracked
@@ -108,6 +111,7 @@ profile.
 | --- | --- | --- |
 | YouTube | Channel uploads | Uses a real `UC...` channel ID |
 | Twitch | VODs, highlights, uploads, or live recording | Uses Twitch application settings |
+| Extension | Registered kinds | Edit `sources.toml`; the core still schedules and stores every item |
 
 Send `/panel` to add, enable, disable, or remove a source, switch Twitch mode,
 and change the global source filter. The same bot accepts `/origin rename` and
@@ -149,6 +153,29 @@ Twitch sources require a Client ID plus a Client Secret or app access token.
 See [Sources and downloads](https://dreaifekks.github.io/asmr-tg-backup/configuration/sources/)
 for the Twitch developer-console link, `vod`/`live` behavior, credentials, and
 download profiles.
+
+## Optional extensions
+
+Extensions are ordinary Python packages discovered from the same environment as
+the core. Installation alone has no effect: add the package's entry-point ID to
+`[extensions].enabled`, then run:
+
+```bash
+asmr-tg-backup extensions list
+asmr-tg-backup extensions doctor
+```
+
+The first optional repositories for the 0.5 API are:
+
+- [`asmr-tg-backup-ext-proxy-router`](https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router): independent routing for notification,
+  discovery, probe, download, Telegram control, Bot API delivery, and MTProto
+  scopes using HTTP/SOCKS endpoints or a Clash-compatible subscription through
+  Mihomo;
+- [`asmr-tg-backup-ext-niconico-origin`](https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin): public Niconico live-search discovery,
+  with the resulting live probe/download handled by the core.
+
+See the [extension guide](https://dreaifekks.github.io/asmr-tg-backup/configuration/extensions/)
+for installation, configuration, route boundaries, and the API contract.
 
 ## Telegram delivery
 
@@ -207,7 +234,7 @@ The runtime flow is:
 
 ```text
 Panel / CLI -> sources.toml -> SQLite source runtime mirror
-YouTube / Twitch -> provider discovery -> SQLite media and jobs
+Built-in / extension providers -> provider discovery -> SQLite media and jobs
   -> yt-dlp / ffmpeg artifacts
   -> MTProto or Bot API delivery
   -> Telegram message records

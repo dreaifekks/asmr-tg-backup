@@ -17,8 +17,8 @@ asmr-tg-backup run --config config.toml
 - `status` prints job counts and recent items.
 - `poll --no-process` discovers and queues without downloading.
 - `process` handles queued work without fetching sources.
-- `run` starts continuous source polling, workers, Twitch live polling, and the
-  optional control loop.
+- `run` starts continuous source polling, workers, provider-neutral live
+  polling, and the optional control loop.
 
 Use `enqueue` for one explicit YouTube URL:
 
@@ -104,6 +104,6 @@ job counts, and recent files have been verified.
 
 ## Graceful shutdown
 
-SIGTERM stops new claims and allows workers to drain. Twitch live recording
-first interrupts ffmpeg so its current segment can be finalized. Supervisors
-should provide a bounded grace period before force-killing descendants.
+SIGTERM stops new claims and allows workers to drain. A live recording first
+interrupts ffmpeg so its current segment can be finalized. Supervisors should
+provide a bounded grace period before force-killing descendants.

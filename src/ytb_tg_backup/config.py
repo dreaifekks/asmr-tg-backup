@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import re
 import tomllib
 from typing import Any
 
@@ -145,6 +146,14 @@ class TwitchConfig:
 
 
 @dataclass(frozen=True)
+class LiveConfig:
+    poll_interval_seconds: int = 30
+    retry_seconds: int = 15
+    worker_count: int = 1
+    download_timeout_seconds: int = 0
+
+
+@dataclass(frozen=True)
 class ControlConfig:
     enabled: bool = False
     poll_interval_seconds: int = 10
@@ -163,6 +172,20 @@ class SourcesConfig:
 
 
 @dataclass(frozen=True)
+class ExtensionSettings:
+    id: str
+    required: bool = True
+    config_file: Path | None = None
+    options: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ExtensionsConfig:
+    enabled: tuple[str, ...] = ()
+    settings: dict[str, ExtensionSettings] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Config:
     path: Path
     rsshub: RsshubConfig
@@ -173,6 +196,8 @@ class Config:
     telegram: TelegramConfig
     control: ControlConfig
     sources: SourcesConfig
+    extensions: ExtensionsConfig = field(default_factory=ExtensionsConfig)
+    live: LiveConfig = field(default_factory=LiveConfig)
     # Legacy source declarations are read only for the one-time sources.toml
     # migration. Runtime source management uses ``sources.path``.
     origins: list[Origin] = field(default_factory=list)
@@ -368,6 +393,38 @@ def load_config(path: str | Path) -> Config:
         ),
     )
 
+    live_raw = raw.get("live", {})
+    if not isinstance(live_raw, dict):
+        raise ValueError("live must be a table")
+    live = LiveConfig(
+        poll_interval_seconds=max(
+            5,
+            int(
+                live_raw.get(
+                    "poll_interval_seconds",
+                    twitch.live_poll_interval_seconds,
+                )
+            ),
+        ),
+        retry_seconds=max(
+            1,
+            int(live_raw.get("retry_seconds", twitch.live_retry_seconds)),
+        ),
+        worker_count=max(
+            1,
+            int(live_raw.get("worker_count", twitch.live_worker_count)),
+        ),
+        download_timeout_seconds=max(
+            0,
+            int(
+                live_raw.get(
+                    "download_timeout_seconds",
+                    twitch.live_download_timeout_seconds,
+                )
+            ),
+        ),
+    )
+
     control_raw = raw.get("control", {})
     control = ControlConfig(
         enabled=bool(control_raw.get("enabled", False)),
@@ -402,6 +459,8 @@ def load_config(path: str | Path) -> Config:
         sources_path = config_path.parent / sources_path
     sources = SourcesConfig(path=sources_path)
 
+    extensions = _load_extensions(raw.get("extensions", {}), config_path.parent)
+
     origins = _load_origins(raw.get("origins", []), channels, raw_feeds)
     legacy_sources_declared = any(
         key in raw for key in ("origins", "channels", "feeds")
@@ -417,10 +476,72 @@ def load_config(path: str | Path) -> Config:
         telegram=telegram,
         control=control,
         sources=sources,
+        extensions=extensions,
+        live=live,
         origins=origins,
         legacy_sources_declared=legacy_sources_declared,
         twitch=twitch,
     )
+
+
+_EXTENSION_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+def _load_extensions(raw: object, config_dir: Path) -> ExtensionsConfig:
+    if raw is None:
+        return ExtensionsConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("extensions must be a table")
+    enabled_raw = raw.get("enabled", [])
+    if not isinstance(enabled_raw, list) or not all(
+        isinstance(item, str) for item in enabled_raw
+    ):
+        raise ValueError("extensions.enabled must be an array of extension ids")
+    enabled: list[str] = []
+    seen: set[str] = set()
+    for item in enabled_raw:
+        extension_id = item.strip().lower()
+        if not _EXTENSION_ID.fullmatch(extension_id):
+            raise ValueError(f"invalid extension id: {item!r}")
+        if extension_id in seen:
+            raise ValueError(f"duplicate extension id: {extension_id}")
+        seen.add(extension_id)
+        enabled.append(extension_id)
+
+    settings: dict[str, ExtensionSettings] = {}
+    for key, value in raw.items():
+        if key == "enabled":
+            continue
+        extension_id = str(key).strip().lower()
+        if not _EXTENSION_ID.fullmatch(extension_id):
+            raise ValueError(f"invalid extension settings id: {key!r}")
+        if not isinstance(value, dict):
+            raise ValueError(f"extensions.{key} must be a table")
+        config_file: Path | None = None
+        if value.get("config_file") is not None:
+            config_value = str(value["config_file"]).strip()
+            if not config_value:
+                raise ValueError(f"extensions.{key}.config_file must not be empty")
+            config_file = Path(config_value).expanduser()
+            if not config_file.is_absolute():
+                config_file = config_dir / config_file
+        options = {
+            str(option): option_value
+            for option, option_value in value.items()
+            if option not in {"required", "config_file"}
+        }
+        settings[extension_id] = ExtensionSettings(
+            id=extension_id,
+            required=_strict_bool(
+                value.get("required", True),
+                label=f"extensions.{key}.required",
+            ),
+            config_file=config_file,
+            options=options,
+        )
+    for extension_id in enabled:
+        settings.setdefault(extension_id, ExtensionSettings(id=extension_id))
+    return ExtensionsConfig(enabled=tuple(enabled), settings=settings)
 
 
 def _load_origins(

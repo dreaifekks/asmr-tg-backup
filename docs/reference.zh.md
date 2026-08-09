@@ -59,6 +59,8 @@ Docker 设置 `ASMR_TG_BACKUP_DATA_DIR=/data`，把宿主机可写目录 `./sett
 | --- | --- |
 | `[app]` | 数据路径、轮询、重试、租约、工作线程数量和日志 |
 | `[sources]` | 指向统一的 `sources.toml` 来源目录；Panel 与 CLI 操作同一文件 |
+| `[extensions]` | 已启用的扩展入口点 ID |
+| `[extensions."id"]` | 必需标记、私密配置路径与行内扩展选项 |
 | `[download]` | yt-dlp、ffmpeg、格式、路径、超时和附属元数据 |
 | `[download.provider_profiles.*]` | 各来源类型的下载覆盖 |
 | `[telegram]` | 启用、token、目标、transport、媒体和 caption |
@@ -66,6 +68,7 @@ Docker 设置 `ASMR_TG_BACKUP_DATA_DIR=/data`，把宿主机可写目录 `./sett
 | `[telegram.bot_api]` | Bot API 地址、大小限制与可播放分块 |
 | `[control]` | Telegram 面板权限与轮询 |
 | `[twitch]` | Helix 凭据与 VOD/live 行为 |
+| `[live]` | 与提供方无关的直播轮询、重试、worker 数量与录制超时 |
 
 `config.toml` 是进程配置；具体来源和全局来源过滤器保存在 `sources.toml`，因此 Panel
 修改来源时不会重写 `config.toml`。修改全局设置后重启进程；手工修改来源目录后依次

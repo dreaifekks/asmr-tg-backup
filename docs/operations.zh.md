@@ -16,7 +16,7 @@ asmr-tg-backup run --config config.toml
 - `status` 输出任务数量和近期条目。
 - `poll --no-process` 只发现并排队，不下载。
 - `process` 不获取来源，只处理已排队任务。
-- `run` 启动持续来源轮询、worker、Twitch 直播轮询和可选控制循环。
+- `run` 启动持续来源轮询、worker、与提供方无关的直播轮询和可选控制循环。
 
 使用 `enqueue` 可以单独加入一个 YouTube URL：
 
@@ -96,6 +96,5 @@ systemctl --user status asmr-tg-backup.service
 
 ## 停止服务
 
-SIGTERM 会停止领取新任务，并允许 worker 清空手头工作。Twitch 直播录制会先中断
-ffmpeg，使当前分段能够完成封装。进程托管程序应在强制终止子进程前提供有限但充足的
-宽限时间。
+SIGTERM 会停止领取新任务，并允许 worker 清空手头工作。直播录制会先中断 ffmpeg，
+使当前分段能够完成封装。进程托管程序应在强制终止子进程前提供有限但充足的宽限时间。

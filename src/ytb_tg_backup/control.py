@@ -12,8 +12,9 @@ from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from .config import Config
+from .extension_api import HttpRequest, RouteRequest
 from .models import Origin
-from .network import is_loopback_url
+from .network import ConnectionRuntime, NetworkScope, is_loopback_url
 from .source_filter import (
     DEFAULT_SOURCE_FILTER_PATTERN,
     SOURCE_FILTER_STATE_KEY,
@@ -39,14 +40,23 @@ TWITCH_LOGIN_PATTERN = re.compile(r"[a-zA-Z0-9_]{1,25}")
 
 
 class ControlBot:
-    def __init__(self, config: Config, store: Store, logger: logging.Logger):
+    def __init__(
+        self,
+        config: Config,
+        store: Store,
+        logger: logging.Logger,
+        connection: ConnectionRuntime | None = None,
+        providers=None,
+    ):
         self.config = config
         self.store = store
         self.logger = logger
+        self.connection = connection
         self.source_catalog = SourceCatalogManager(
             config.sources.path,
             store,
             max_failures=config.app.max_attempts,
+            providers=providers,
         )
         self._source_catalog_ready = False
 
@@ -242,7 +252,17 @@ class ControlBot:
             if not remaining:
                 return "usage: /origin add youtube [uploads] <@handle|channel_id> [name]"
             source_ref = remaining[0]
-            external_id = resolve_channel_id(source_ref, self.config.download.yt_dlp)
+            if self.connection is None:
+                external_id = resolve_channel_id(
+                    source_ref,
+                    self.config.download.yt_dlp,
+                )
+            else:
+                external_id = resolve_channel_id(
+                    source_ref,
+                    self.config.download.yt_dlp,
+                    self.connection,
+                )
         elif provider == "twitch":
             kind = "vods"
             if remaining and remaining[0].lower() in TWITCH_KINDS:
@@ -1799,22 +1819,57 @@ class ControlBot:
         request_timeout_seconds: int = 30,
     ) -> dict[str, Any]:
         endpoint = f"{self.config.telegram.api_base.rstrip('/')}/bot{self.config.telegram.bot_token}/{method}"
-        request = Request(
-            endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            if is_loopback_url(self.config.telegram.api_base):
-                open_request = build_opener(ProxyHandler({})).open
-            else:
-                open_request = urlopen
-            with open_request(request, timeout=request_timeout_seconds) as response:
-                parsed = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Telegram API HTTP {exc.code}: {body[:500]}") from exc
+        body = json.dumps(payload).encode("utf-8")
+        if self.connection is None:
+            request = Request(
+                endpoint,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                if is_loopback_url(self.config.telegram.api_base):
+                    open_request = build_opener(ProxyHandler({})).open
+                else:
+                    open_request = urlopen
+                with open_request(request, timeout=request_timeout_seconds) as response:
+                    parsed = json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                error_body = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"Telegram API HTTP {exc.code}: {error_body[:500]}"
+                ) from exc
+        else:
+            response = self.connection.request(
+                HttpRequest(
+                    url=endpoint,
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                    body=body,
+                    timeout_seconds=request_timeout_seconds,
+                ),
+                RouteRequest(
+                    scope=(
+                        NetworkScope.TELEGRAM_CONTROL_RECEIVE
+                        if method == "getUpdates"
+                        else NetworkScope.TELEGRAM_CONTROL_SEND
+                    ),
+                    target_url=endpoint,
+                    phase="receive" if method == "getUpdates" else "sending",
+                    idempotent=method in {
+                        "getUpdates",
+                        "getMe",
+                        "getChat",
+                        "answerCallbackQuery",
+                    },
+                ),
+            )
+            if not 200 <= response.status < 300:
+                error_body = response.body.decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"Telegram API HTTP {response.status}: {error_body[:500]}"
+                )
+            parsed = json.loads(response.body.decode("utf-8"))
         if not parsed.get("ok"):
             raise RuntimeError(f"Telegram API error: {parsed}")
         return parsed

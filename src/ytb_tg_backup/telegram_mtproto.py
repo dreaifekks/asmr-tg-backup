@@ -12,6 +12,8 @@ import time
 from typing import Any, Callable, NamedTuple
 import tempfile
 
+from .extension_api import RouteRequest
+from .network import ConnectionRuntime, NetworkScope
 from .telegram_types import (
     BeforeCommit,
     TelegramTransport,
@@ -77,10 +79,13 @@ class MtprotoTransport(TelegramTransport):
         config: Any,
         *,
         bindings: _TelethonBindings | None = None,
+        connection: ConnectionRuntime | None = None,
     ):
         self.config = config
         self._bindings = bindings
+        self.connection = connection or ConnectionRuntime()
         self._client: Any | None = None
+        self._route_context: Any | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._runtime_lock = threading.RLock()
@@ -314,13 +319,26 @@ class MtprotoTransport(TelegramTransport):
         session_path = Path(str(self._mtproto_value("session_path", ""))).expanduser()
         session_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._prepare_session_file(session_path)
-        client = bindings.client_factory(
-            str(session_path),
-            int(self._mtproto_value("api_id", 0)),
-            str(self._mtproto_value("api_hash", "")),
-            receive_updates=False,
+        route_context = self.connection.route(
+            RouteRequest(
+                scope=NetworkScope.TELEGRAM_DELIVERY_MTPROTO,
+                phase="connect",
+                idempotent=True,
+            )
         )
+        route = route_context.__enter__()
+        client: Any | None = None
         try:
+            client_kwargs: dict[str, Any] = {"receive_updates": False}
+            proxy = route.telethon_proxy()
+            if proxy is not None:
+                client_kwargs["proxy"] = proxy
+            client = bindings.client_factory(
+                str(session_path),
+                int(self._mtproto_value("api_id", 0)),
+                str(self._mtproto_value("api_hash", "")),
+                **client_kwargs,
+            )
             started = client.start(bot_token=str(getattr(self.config, "bot_token", "")))
             if inspect.isawaitable(started):
                 await started
@@ -338,15 +356,18 @@ class MtprotoTransport(TelegramTransport):
                     code="session_identity_mismatch",
                     fallback_safe=True,
                 )
-        except Exception:
+        except Exception as exc:
             try:
-                disconnected = client.disconnect()
-                if inspect.isawaitable(disconnected):
-                    await disconnected
+                if client is not None:
+                    disconnected = client.disconnect()
+                    if inspect.isawaitable(disconnected):
+                        await disconnected
             except Exception:
                 pass
+            route_context.__exit__(type(exc), exc, exc.__traceback__)
             raise
         self._client = client
+        self._route_context = route_context
         return client
 
     def _media_attributes(
@@ -458,12 +479,22 @@ class MtprotoTransport(TelegramTransport):
                 thread.join(timeout=10)
 
     async def _disconnect(self) -> None:
-        if self._client is None:
-            return
-        disconnected = self._client.disconnect()
-        if inspect.isawaitable(disconnected):
-            await disconnected
-        self._client = None
+        route_context = self._route_context
+        self._route_context = None
+        try:
+            if self._client is None:
+                return
+            disconnected = self._client.disconnect()
+            if inspect.isawaitable(disconnected):
+                await disconnected
+            self._client = None
+        except Exception as exc:
+            if route_context is not None:
+                route_context.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        else:
+            if route_context is not None:
+                route_context.__exit__(None, None, None)
 
     def __enter__(self) -> MtprotoTransport:
         return self

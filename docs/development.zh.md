@@ -8,8 +8,8 @@
 Panel / 来源 CLI
   -> 原子替换 sources.toml
   -> 事务同步 SQLite 来源运行镜像
-YouTube / Twitch
-  -> 使用该镜像执行来源发现
+内置 / 扩展 provider
+  -> 使用该镜像与类型化 registry 执行来源发现
   -> SQLite 媒体与任务状态
   -> yt-dlp / ffmpeg 下载产物
   -> MTProto 或 Bot API 投递
@@ -27,8 +27,10 @@ Telegram 返回结果不明确，任务会进入 `uncertain`，不会自动重�
 | --- | --- |
 | `cli.py`、`setup.py` | 命令、引导式初始化和私密配置生成 |
 | `config.py` | TOML 读取、环境变量覆盖和校验 |
+| `extension_api.py`、`extensions.py` | 稳定契约、entry-point 加载、类型化能力 registry 与 lifecycle |
+| `network.py` | 任务级 route lease 与统一 HTTP/进程连接行为 |
 | `source_catalog.py` | 来源目录校验、原子写入与 SQLite 同步 |
-| `sources.py`、`youtube.py` | YouTube/Twitch 发现与统一媒体元数据 |
+| `sources.py`、`youtube.py` | 内置 provider 发现与统一媒体元数据 |
 | `service.py` | 轮询、worker 编排、重试和优雅停止 |
 | `store.py` | SQLite schema、迁移、任务、租约和已跟踪资源 |
 | `downloader.py` | `yt-dlp`/`ffmpeg` 执行和衍生媒体文件 |
@@ -89,6 +91,9 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
 - 每组数据库和 MTProto session 只能由一个应用进程使用。
 - 发现、下载和投递状态必须能在重启后继续使用。
 - `sources.toml` 是来源和过滤器的用户配置真源；SQLite 只保留运行镜像与状态。
+- 扩展不得拥有 SQLite、任务或投递状态；进程只导入配置中显式启用的扩展 ID。
+- 每个请求、子进程、上传或 client connection 必须固定一条 route，只能在安全的
+  重试/重连边界切换。
 - 不得自动重试 `uncertain` 状态的 Telegram 投递。
 - token、application 凭据、Twitch 凭据、私密配置、数据库、下载文件和 session 不得
   进入日志、命令行参数、测试数据、源码构建包或提交记录。

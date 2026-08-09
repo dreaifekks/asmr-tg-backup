@@ -9,8 +9,8 @@ application. Installation and operation instructions remain in the user guides.
 Panel / source CLI
   -> atomic sources.toml replacement
   -> transactional SQLite source runtime mirror
-YouTube / Twitch
-  -> provider discovery using that mirror
+Built-in / extension providers
+  -> provider discovery using that mirror and typed registry
   -> SQLite media and job state
   -> yt-dlp / ffmpeg download artifacts
   -> MTProto or Bot API delivery
@@ -29,8 +29,10 @@ accepted the message.
 | --- | --- |
 | `cli.py`, `setup.py` | Commands, guided setup, and generated private configuration |
 | `config.py` | TOML parsing, environment overrides, and validation |
+| `extension_api.py`, `extensions.py` | Stable contracts, entry-point loading, typed capability registry, and lifecycle |
+| `network.py` | Task-scoped route leases and unified HTTP/process connection behavior |
 | `source_catalog.py` | Catalog validation, atomic writes, and SQLite reconciliation |
-| `sources.py`, `youtube.py` | YouTube/Twitch discovery and normalized media metadata |
+| `sources.py`, `youtube.py` | Built-in provider discovery and normalized media metadata |
 | `service.py` | Polling, worker orchestration, retries, and graceful shutdown |
 | `store.py` | SQLite schema, migrations, jobs, leases, and tracked resources |
 | `downloader.py` | `yt-dlp`/`ffmpeg` execution and derived media artifacts |
@@ -97,6 +99,10 @@ paired pages structurally aligned whenever user-visible behavior changes.
 - Keep discovery, download, and delivery state durable across restarts.
 - Keep `sources.toml` authoritative for sources and the filter; SQLite holds
   only their runtime mirror and operational state.
+- Keep extensions outside SQLite/job/delivery ownership and import only IDs
+  explicitly enabled in process configuration.
+- Keep each network route fixed for one request, subprocess, upload, or client
+  connection; switch only at a safe retry/reconnect boundary.
 - Never retry `uncertain` Telegram delivery automatically.
 - Keep tokens, application credentials, Twitch credentials, private
   configuration, databases, downloads, and sessions out of logs, command-line

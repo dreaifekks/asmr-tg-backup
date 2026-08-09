@@ -21,6 +21,7 @@ from .source_filter import (
 )
 
 if TYPE_CHECKING:
+    from .extensions import SourceProviderCatalog
     from .store import Store
 
 
@@ -57,7 +58,10 @@ class SourceCatalog:
     origins: tuple[Origin, ...] = ()
 
 
-def load_source_catalog(path: str | Path) -> SourceCatalog:
+def load_source_catalog(
+    path: str | Path,
+    providers: SourceProviderCatalog | None = None,
+) -> SourceCatalog:
     catalog_path = Path(path).expanduser()
     try:
         with catalog_path.open("rb") as file_handle:
@@ -84,17 +88,21 @@ def load_source_catalog(path: str | Path) -> SourceCatalog:
     for index, item in enumerate(raw_origins):
         if not isinstance(item, dict):
             raise SourceCatalogError(f"origins[{index}] must be a table")
-        origins.append(_origin_from_mapping(item, index=index))
+        origins.append(_origin_from_mapping(item, index=index, providers=providers))
     return validate_source_catalog(
         SourceCatalog(
             version=raw["version"],
             source_filter=raw["source_filter"],
             origins=tuple(origins),
-        )
+        ),
+        providers=providers,
     )
 
 
-def validate_source_catalog(catalog: SourceCatalog) -> SourceCatalog:
+def validate_source_catalog(
+    catalog: SourceCatalog,
+    providers: SourceProviderCatalog | None = None,
+) -> SourceCatalog:
     if not isinstance(catalog, SourceCatalog):
         raise SourceCatalogError("catalog must be a SourceCatalog")
     if type(catalog.version) is not int or catalog.version != CATALOG_VERSION:
@@ -112,11 +120,11 @@ def validate_source_catalog(catalog: SourceCatalog) -> SourceCatalog:
     ids: set[str] = set()
     identities: dict[tuple[str, str, str, str], str] = {}
     for index, raw_origin in enumerate(catalog.origins):
-        origin = _validate_origin(raw_origin, index=index)
+        origin = _validate_origin(raw_origin, index=index, providers=providers)
         if origin.id in ids:
             raise SourceCatalogError(f"duplicate origin id: {origin.id}")
         ids.add(origin.id)
-        identity = normalized_source_identity(origin)
+        identity = normalized_source_identity(origin, providers)
         previous_id = identities.get(identity)
         if previous_id is not None and previous_id != origin.id:
             raise SourceCatalogError(
@@ -131,8 +139,11 @@ def validate_source_catalog(catalog: SourceCatalog) -> SourceCatalog:
     )
 
 
-def render_source_catalog(catalog: SourceCatalog) -> str:
-    catalog = validate_source_catalog(catalog)
+def render_source_catalog(
+    catalog: SourceCatalog,
+    providers: SourceProviderCatalog | None = None,
+) -> str:
+    catalog = validate_source_catalog(catalog, providers)
     lines = [
         f"version = {CATALOG_VERSION}",
         f"source_filter = {_toml_value(catalog.source_filter)}",
@@ -158,9 +169,13 @@ def render_source_catalog(catalog: SourceCatalog) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_source_catalog(path: str | Path, catalog: SourceCatalog) -> None:
+def write_source_catalog(
+    path: str | Path,
+    catalog: SourceCatalog,
+    providers: SourceProviderCatalog | None = None,
+) -> None:
     catalog_path = Path(path).expanduser()
-    rendered = render_source_catalog(catalog).encode("utf-8")
+    rendered = render_source_catalog(catalog, providers).encode("utf-8")
     with _directory_lock(catalog_path.parent):
         _atomic_replace(catalog_path, rendered)
 
@@ -173,10 +188,17 @@ validate = validate_source_catalog
 
 
 class SourceCatalogManager:
-    def __init__(self, path: str | Path, store: Store, max_failures: int = 5):
+    def __init__(
+        self,
+        path: str | Path,
+        store: Store,
+        max_failures: int = 5,
+        providers: SourceProviderCatalog | None = None,
+    ):
         self.path = Path(path).expanduser()
         self.store = store
         self.max_failures = max_failures
+        self.providers = providers
         if self.max_failures <= 0:
             raise SourceCatalogError("max_failures must be positive")
 
@@ -207,7 +229,11 @@ class SourceCatalogManager:
                 database_origins[key] for key in sorted(database_origins)
             )
             seed_origins = (
-                _merge_migration_origins(durable_origins, legacy_origins)
+                _merge_migration_origins(
+                    durable_origins,
+                    legacy_origins,
+                    providers=self.providers,
+                )
                 if legacy_declared
                 else durable_origins
             )
@@ -220,7 +246,8 @@ class SourceCatalogManager:
                         else stored_filter
                     ),
                     origins=seed_origins,
-                )
+                ),
+                providers=self.providers,
             )
             self._write_and_reconcile(catalog, previous=None)
             return catalog
@@ -234,7 +261,7 @@ class SourceCatalogManager:
     def replace(self, catalog: SourceCatalog) -> SourceCatalog:
         """Atomically replace and apply the canonical catalog."""
 
-        updated = validate_source_catalog(catalog)
+        updated = validate_source_catalog(catalog, self.providers)
         with _directory_lock(self.path.parent):
             previous = self.path.read_bytes() if self.path.exists() else None
             self._write_and_reconcile(updated, previous=previous)
@@ -242,7 +269,7 @@ class SourceCatalogManager:
 
     def list(self) -> list[Origin]:
         with _directory_lock(self.path.parent, exclusive=False):
-            return list(load_source_catalog(self.path).origins)
+            return list(load_source_catalog(self.path, self.providers).origins)
 
     def add(self, origin: Origin) -> SourceCatalog:
         def add_origin(catalog: SourceCatalog) -> SourceCatalog:
@@ -339,8 +366,8 @@ class SourceCatalogManager:
     ) -> SourceCatalog:
         with _directory_lock(self.path.parent):
             previous_bytes = self.path.read_bytes()
-            current = load_source_catalog(self.path)
-            updated = validate_source_catalog(mutation(current))
+            current = load_source_catalog(self.path, self.providers)
+            updated = validate_source_catalog(mutation(current), self.providers)
             self._write_and_reconcile(updated, previous=previous_bytes)
             return updated
 
@@ -350,7 +377,7 @@ class SourceCatalogManager:
         *,
         previous: bytes | None,
     ) -> None:
-        rendered = render_source_catalog(catalog).encode("utf-8")
+        rendered = render_source_catalog(catalog, self.providers).encode("utf-8")
         try:
             _atomic_replace(self.path, rendered)
             self._reconcile(catalog)
@@ -378,7 +405,7 @@ class SourceCatalogManager:
             raise SourceCatalogError(str(exc)) from exc
 
     def _load_for_apply(self) -> SourceCatalog:
-        catalog = load_source_catalog(self.path)
+        catalog = load_source_catalog(self.path, self.providers)
         try:
             self.path.chmod(0o600)
         except OSError as exc:
@@ -391,6 +418,8 @@ class SourceCatalogManager:
 def _merge_migration_origins(
     durable_origins: Sequence[Origin],
     legacy_origins: Sequence[Origin],
+    *,
+    providers: SourceProviderCatalog | None = None,
 ) -> tuple[Origin, ...]:
     """Merge explicit legacy declarations without overriding Panel/catalog state."""
 
@@ -399,7 +428,8 @@ def _merge_migration_origins(
 
     def add(origin: Origin, *, legacy: bool) -> None:
         normalized = validate_source_catalog(
-            SourceCatalog(origins=(origin,))
+            SourceCatalog(origins=(origin,)),
+            providers,
         ).origins[0]
         existing = merged_by_id.get(normalized.id)
         if existing is not None:
@@ -411,7 +441,7 @@ def _merge_migration_origins(
                 "Panel/catalog source using the same id"
             )
 
-        identity = normalized_source_identity(normalized)
+        identity = normalized_source_identity(normalized, providers)
         existing_id = identities.get(identity)
         if existing_id is not None:
             source = "legacy declaration" if legacy else "database source"
@@ -429,7 +459,15 @@ def _merge_migration_origins(
     return tuple(merged_by_id[key] for key in sorted(merged_by_id))
 
 
-def normalized_source_identity(origin: Origin) -> tuple[str, str, str, str]:
+def normalized_source_identity(
+    origin: Origin,
+    providers: SourceProviderCatalog | None = None,
+) -> tuple[str, str, str, str]:
+    if providers is not None:
+        try:
+            return providers.identity(origin)
+        except ValueError as exc:
+            raise SourceCatalogError(str(exc)) from exc
     provider = origin.provider.strip().casefold()
     kind = origin.kind.strip().casefold()
     external_id = origin.external_id.strip()
@@ -441,7 +479,12 @@ def normalized_source_identity(origin: Origin) -> tuple[str, str, str, str]:
     return provider, kind, external_id, variant
 
 
-def _origin_from_mapping(raw: dict[str, Any], *, index: int) -> Origin:
+def _origin_from_mapping(
+    raw: dict[str, Any],
+    *,
+    index: int,
+    providers: SourceProviderCatalog | None = None,
+) -> Origin:
     try:
         origin_id = _mapping_string(raw["id"], f"origins[{index}].id")
         provider = _mapping_string(raw["provider"], f"origins[{index}].provider")
@@ -457,7 +500,7 @@ def _origin_from_mapping(raw: dict[str, Any], *, index: int) -> Origin:
     kind = (
         _mapping_string(raw["kind"], f"origins[{index}].kind")
         if "kind" in raw
-        else _default_origin_kind(provider_text)
+        else _default_origin_kind(provider_text, providers)
     )
     name = (
         _mapping_string(raw["name"], f"origins[{index}].name")
@@ -501,17 +544,30 @@ def _mapping_string(value: object, label: str) -> str:
     return value
 
 
-def _validate_origin(origin: Origin, *, index: int) -> Origin:
+def _validate_origin(
+    origin: Origin,
+    *,
+    index: int,
+    providers: SourceProviderCatalog | None = None,
+) -> Origin:
     if not isinstance(origin, Origin):
         raise SourceCatalogError(f"origins[{index}] must be an Origin")
     origin_id = _nonempty_string(origin.id, f"origins[{index}].id")
     provider = _nonempty_string(origin.provider, f"origin {origin_id!r} provider").lower()
     kind = _nonempty_string(origin.kind, f"origin {origin_id!r} kind").lower()
-    supported_kinds = SUPPORTED_SOURCE_KINDS.get(provider)
-    if supported_kinds is None:
-        raise SourceCatalogError(
-            f"origin {origin_id!r} has unsupported provider {provider!r}"
-        )
+    if providers is None:
+        supported_kinds = SUPPORTED_SOURCE_KINDS.get(provider)
+        if supported_kinds is None:
+            raise SourceCatalogError(
+                f"origin {origin_id!r} has unsupported provider {provider!r}"
+            )
+    else:
+        try:
+            supported_kinds = providers.kinds(provider)
+        except ValueError as exc:
+            raise SourceCatalogError(
+                f"origin {origin_id!r} has unsupported provider {provider!r}"
+            ) from exc
     if kind not in supported_kinds:
         choices = ", ".join(sorted(supported_kinds))
         raise SourceCatalogError(
@@ -549,7 +605,7 @@ def _validate_origin(origin: Origin, *, index: int) -> Origin:
         _validate_option_value(value, label=f"origin {origin_id!r} option {key!r}")
         options[key] = list(value) if isinstance(value, tuple) else value
 
-    if "recording_mode" in options:
+    if providers is None and "recording_mode" in options:
         if provider != "twitch" or kind != "vods":
             raise SourceCatalogError(
                 f"origin {origin_id!r} recording_mode is only valid for Twitch kind='vods'"
@@ -561,7 +617,7 @@ def _validate_origin(origin: Origin, *, index: int) -> Origin:
             )
         options["recording_mode"] = mode
 
-    if provider == "rss":
+    if providers is None and provider == "rss":
         if "allowed_media_hosts" in options:
             allowed_hosts = options["allowed_media_hosts"]
             if not isinstance(allowed_hosts, list) or not all(
@@ -578,7 +634,7 @@ def _validate_origin(origin: Origin, *, index: int) -> Origin:
                 f"origin {origin_id!r} allow_private_media must be true or false"
             )
 
-    return Origin(
+    validated = Origin(
         id=origin_id,
         provider=provider,
         kind=kind,
@@ -589,6 +645,12 @@ def _validate_origin(origin: Origin, *, index: int) -> Origin:
         credential_ref=credential_ref,
         options=options,
     )
+    if providers is None:
+        return validated
+    try:
+        return providers.validate_origin(validated)
+    except ValueError as exc:
+        raise SourceCatalogError(f"origin {origin_id!r}: {exc}") from exc
 
 
 def _validate_option_value(value: object, *, label: str) -> None:
@@ -615,7 +677,17 @@ def _nonempty_string(value: object, label: str) -> str:
     return normalized
 
 
-def _default_origin_kind(provider: str) -> str:
+def _default_origin_kind(
+    provider: str,
+    providers: SourceProviderCatalog | None = None,
+) -> str:
+    if providers is not None:
+        try:
+            return providers.default_kind(provider)
+        except ValueError as exc:
+            raise SourceCatalogError(
+                f"unsupported source provider: {provider!r}"
+            ) from exc
     if provider == "youtube":
         return "uploads"
     if provider == "twitch":

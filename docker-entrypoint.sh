@@ -2,7 +2,7 @@
 set -eu
 
 case "${1:-}" in
-  ""|--*|-*|run|poll|process|status|enqueue|init|init-config|setup|sources)
+  ""|--*|-*|run|poll|process|status|enqueue|init|init-config|setup|extensions|sources)
     set -- asmr-tg-backup "$@"
     ;;
 esac

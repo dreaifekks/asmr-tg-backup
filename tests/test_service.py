@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 from ytb_tg_backup.config import load_config
+from ytb_tg_backup.extension_api import HttpResponse
 from ytb_tg_backup.feed import FeedEntry
 from ytb_tg_backup.models import Origin
 from ytb_tg_backup.service import BackupService
@@ -114,7 +115,10 @@ enabled = true
             )
             config = load_config(config_path)
             service = BackupService(config)
-            with mock.patch("ytb_tg_backup.service.fetch_feed", return_value=xml):
+            with mock.patch(
+                "ytb_tg_backup.network.UrllibHttpTransport.request",
+                return_value=HttpResponse(200, "https://example.test/feed", {}, xml),
+            ):
                 service.poll_once(process=False)
                 service.poll_once(process=False)
 
@@ -162,12 +166,14 @@ enabled = true
 </feed>
 """
 
-        def fake_fetch(url: str) -> bytes:
-            if "UC123" in url:
-                return source_match_xml
-            if "UC456" in url:
-                return title_match_xml
-            return filtered_xml
+        def fake_fetch(request, _route):
+            if "UC123" in request.url:
+                body = source_match_xml
+            elif "UC456" in request.url:
+                body = title_match_xml
+            else:
+                body = filtered_xml
+            return HttpResponse(200, request.url, {}, body)
 
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
@@ -200,7 +206,10 @@ enabled = true
             )
             config = load_config(config_path)
             service = BackupService(config)
-            with mock.patch("ytb_tg_backup.service.fetch_feed", side_effect=fake_fetch) as fetch:
+            with mock.patch(
+                "ytb_tg_backup.network.UrllibHttpTransport.request",
+                side_effect=fake_fetch,
+            ) as fetch:
                 service.poll_once(process=False)
             conn = sqlite3.connect(config.db_path)
             rows = conn.execute(
@@ -257,7 +266,10 @@ enabled = true
             service = BackupService(config)
             service.initialize()
             service.store.set_bot_state(SOURCE_FILTER_STATE_KEY, "")
-            with mock.patch("ytb_tg_backup.service.fetch_feed", return_value=xml) as fetch:
+            with mock.patch(
+                "ytb_tg_backup.network.UrllibHttpTransport.request",
+                return_value=HttpResponse(200, "https://example.test/feed", {}, xml),
+            ) as fetch:
                 service.poll_once(process=False)
             service.store.close()
 
@@ -306,7 +318,10 @@ enabled = true
             )
             config = load_config(config_path)
             service = BackupService(config)
-            with mock.patch("ytb_tg_backup.service.fetch_feed", return_value=xml):
+            with mock.patch(
+                "ytb_tg_backup.network.UrllibHttpTransport.request",
+                return_value=HttpResponse(200, "https://example.test/feed", {}, xml),
+            ):
                 service.poll_once(process=False)
             conn = sqlite3.connect(config.db_path)
             rows = conn.execute(

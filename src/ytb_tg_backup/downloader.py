@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import glob
 import importlib.util
 import json
@@ -17,6 +17,8 @@ import threading
 import time
 
 from .config import Config, DownloadProfile
+from .extension_api import RouteRequest
+from .network import ConnectionRuntime, NetworkScope
 
 
 WAIT_LIVE_STATUSES = {"is_live", "is_upcoming", "post_live"}
@@ -81,9 +83,15 @@ class LiveDownloadError(RuntimeError):
 
 
 class Downloader:
-    def __init__(self, config: Config, logger: logging.Logger):
+    def __init__(
+        self,
+        config: Config,
+        logger: logging.Logger,
+        connection: ConnectionRuntime | None = None,
+    ):
         self.config = config
         self.logger = logger
+        self.connection = connection or ConnectionRuntime()
 
     def check_tools(self) -> list[str]:
         missing = []
@@ -108,6 +116,7 @@ class Downloader:
         *,
         provider: str = "youtube",
         live: bool = False,
+        route_request: RouteRequest | None = None,
     ) -> ProbeResult:
         cmd = [
             *self._yt_dlp_command(),
@@ -126,18 +135,25 @@ class Downloader:
             ]
         )
         cmd.extend(self._extra_args(provider))
-        cmd.append(url)
+        request = _route_request(
+            route_request,
+            scope=NetworkScope.MEDIA_PROBE,
+            provider=provider,
+            target_url=url,
+        )
         try:
-            completed = subprocess.run(
-                cmd,
-                check=True,
-                text=True,
-                capture_output=True,
-                timeout=self.config.download.probe_timeout_seconds,
-            )
+            with self.connection.route(request) as route:
+                completed = subprocess.run(
+                    [*cmd, *route.yt_dlp_args(), url],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    timeout=self.config.download.probe_timeout_seconds,
+                    env=route.process_environment(),
+                )
         except subprocess.CalledProcessError as exc:
             detail = f"{exc.stderr or ''}\n{exc.stdout or ''}".lower()
-            if live and provider == "twitch" and _is_twitch_offline_error(detail):
+            if live and _is_live_offline_error(detail, provider=provider):
                 return ProbeResult(live_status="not_live", title=None)
             raise
         data = json.loads(completed.stdout)
@@ -156,6 +172,7 @@ class Downloader:
         ignore_archive: bool = False,
         live: bool = False,
         cancel_events: tuple[threading.Event, ...] = (),
+        route_request: RouteRequest | None = None,
     ) -> DownloadResult:
         self.config.download_dir.mkdir(parents=True, exist_ok=True)
         archive_file = self.archive_file_for_provider(provider)
@@ -242,38 +259,50 @@ class Downloader:
                     f"id = {video_id}",
                 ]
             )
-        cmd.append(url)
+        request = _route_request(
+            route_request,
+            scope=NetworkScope.MEDIA_DOWNLOAD,
+            provider=provider,
+            target_url=url,
+        )
 
         self.logger.info("downloading video_id=%s", video_id)
-        if live:
-            try:
-                completed = self._run_live_download(cmd, cancel_events=cancel_events)
-            except DownloadCancelled as exc:
-                raise DownloadCancelled(
-                    str(exc),
-                    partial_result=self._find_live_attempt_result(
-                        video_id,
-                        str(live_attempt_token),
-                        provider=provider,
-                    ),
-                ) from None
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-                raise LiveDownloadError(
-                    exc,
-                    partial_result=self._find_live_attempt_result(
-                        video_id,
-                        str(live_attempt_token),
-                        provider=provider,
-                    ),
-                ) from exc
-        else:
-            completed = subprocess.run(
-                cmd,
-                check=True,
-                text=True,
-                capture_output=True,
-                timeout=self.config.download.download_timeout_seconds,
-            )
+        with self.connection.route(request) as route:
+            routed_cmd = [*cmd, *route.yt_dlp_args(), url]
+            if live:
+                try:
+                    completed = self._run_live_download(
+                        routed_cmd,
+                        cancel_events=cancel_events,
+                        environment=route.process_environment(),
+                    )
+                except DownloadCancelled as exc:
+                    raise DownloadCancelled(
+                        str(exc),
+                        partial_result=self._find_live_attempt_result(
+                            video_id,
+                            str(live_attempt_token),
+                            provider=provider,
+                        ),
+                    ) from None
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                    raise LiveDownloadError(
+                        exc,
+                        partial_result=self._find_live_attempt_result(
+                            video_id,
+                            str(live_attempt_token),
+                            provider=provider,
+                        ),
+                    ) from exc
+            else:
+                completed = subprocess.run(
+                    routed_cmd,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    timeout=self.config.download.download_timeout_seconds,
+                    env=route.process_environment(),
+                )
         printed_paths = [Path(line.strip()) for line in completed.stdout.splitlines() if line.strip()]
         candidates = [path for path in printed_paths if _looks_like_media(path)]
         if not candidates:
@@ -872,8 +901,9 @@ class Downloader:
         cmd: list[str],
         *,
         cancel_events: tuple[threading.Event, ...],
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        timeout_seconds = self.config.twitch.live_download_timeout_seconds
+        timeout_seconds = self.config.live.download_timeout_seconds
         deadline = time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
         process = subprocess.Popen(
             cmd,
@@ -881,6 +911,7 @@ class Downloader:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            env=environment,
         )
         while True:
             try:
@@ -1013,6 +1044,44 @@ def _is_twitch_offline_error(detail: str) -> bool:
             "is not live",
             "channel is offline",
         )
+    )
+
+
+def _is_live_offline_error(detail: str, *, provider: str) -> bool:
+    if provider == "twitch" and _is_twitch_offline_error(detail):
+        return True
+    return any(
+        marker in detail
+        for marker in (
+            "live event has ended",
+            "live stream has ended",
+            "program has ended",
+            "not being broadcast",
+            "番組が終了",
+            "放送は終了",
+            "放送終了",
+        )
+    )
+
+
+def _route_request(
+    request: RouteRequest | None,
+    *,
+    scope: str,
+    provider: str,
+    target_url: str,
+) -> RouteRequest:
+    if request is None:
+        return RouteRequest(
+            scope=scope,
+            provider=provider,
+            target_url=target_url,
+        )
+    return replace(
+        request,
+        scope=scope,
+        provider=request.provider or provider,
+        target_url=request.target_url or target_url,
     )
 
 

@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asmr-tg-backup"
-version = "0.4.1"
-description = "Archive YouTube and Twitch media with yt-dlp and optionally deliver it to Telegram."
+version = "0.5.0"
+description = "Extensible media archiving with yt-dlp and optional Telegram delivery."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [
     {name = "dreaife"},
 ]
-keywords = ["asmr", "media-archiver", "telegram", "twitch", "youtube", "yt-dlp"]
+keywords = ["asmr", "extensions", "media-archiver", "telegram", "twitch", "youtube", "yt-dlp"]
 requires-python = ">=3.11"
 dependencies = [
     "Telethon>=1.44,<2",

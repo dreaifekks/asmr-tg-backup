@@ -8,8 +8,9 @@ from typing import Any
 class Origin:
     """A configured source of remote media.
 
-    ``external_id`` is interpreted by the provider adapter.  For YouTube it is
-    a UC channel id; for Twitch it can be either a broadcaster id or login.
+    ``external_id`` is interpreted by the provider adapter.  Built-in examples
+    include a YouTube UC channel ID and a Twitch broadcaster ID or login;
+    extensions may define their own provider-specific identity.
     """
 
     id: str

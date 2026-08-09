@@ -23,7 +23,8 @@ from .downloader import (
     ProbeResult,
     WAIT_LIVE_STATUSES,
 )
-from .feed import fetch_feed
+from .extensions import RuntimeDependencies, build_runtime
+from .extension_api import RouteRequest
 from .models import ClaimedJob, MediaCandidate, Origin
 from .source_filter import (
     DEFAULT_SOURCE_FILTER_PATTERN,
@@ -36,7 +37,6 @@ from .source_catalog import SourceCatalogManager, normalized_source_identity
 from .sources import (
     SourceError,
     SourceRegistry,
-    twitch_recording_mode,
     validate_public_media_url,
 )
 from .store import Store, future_iso, now_iso
@@ -48,19 +48,34 @@ from .telegram import (
 
 
 class BackupService:
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        runtime: RuntimeDependencies | None = None,
+    ):
         os.umask(0o077)
         self.config = config
         self.logger = logging.getLogger("asmr_tg_backup")
+        self.runtime = runtime or build_runtime(config, logger=self.logger)
         self.store = Store(config.db_path)
         self.source_catalog = SourceCatalogManager(
             config.sources.path,
             self.store,
             config.app.max_attempts,
+            providers=self.runtime.providers,
         )
-        self.downloader = Downloader(config, self.logger)
-        self.telegram = create_telegram_transport(config.telegram)
-        self.control_bot = ControlBot(config, self.store, self.logger)
+        self.downloader = Downloader(config, self.logger, self.runtime.connection)
+        self.telegram = create_telegram_transport(
+            config.telegram,
+            self.runtime.connection,
+        )
+        self.control_bot = ControlBot(
+            config,
+            self.store,
+            self.logger,
+            connection=self.runtime.connection,
+            providers=self.runtime.providers,
+        )
         self.sources = self._new_source_registry()
         self._stop_event = threading.Event()
 
@@ -76,6 +91,7 @@ class BackupService:
                 path.chmod(0o700)
             except OSError:
                 pass
+        self.runtime.start()
         self.store.initialize()
         catalog_existed = self.source_catalog.path.exists()
         catalog = self.source_catalog.ensure(
@@ -134,10 +150,10 @@ class BackupService:
             threading.Thread(
                 target=self._worker_loop,
                 args=(index, "live"),
-                name=f"twitch-live-worker-{index}",
+                name=f"live-worker-{index}",
                 daemon=True,
             )
-            for index in range(self.config.twitch.live_worker_count)
+            for index in range(self.config.live.worker_count)
         )
         workers.extend(
             (
@@ -149,8 +165,8 @@ class BackupService:
                 ),
                 threading.Thread(
                     target=self._source_poll_loop,
-                    args=(True, self.config.twitch.live_poll_interval_seconds),
-                    name="twitch-live-poll-worker",
+                    args=(True, self.config.live.poll_interval_seconds),
+                    name="live-poll-worker",
                     daemon=True,
                 ),
             )
@@ -193,7 +209,10 @@ class BackupService:
         try:
             self.telegram.close()
         finally:
-            self.store.close()
+            try:
+                self.store.close()
+            finally:
+                self.runtime.stop()
 
     def poll_once(self, *, process: bool) -> None:
         self.initialize()
@@ -203,7 +222,7 @@ class BackupService:
             self.process_pending()
 
     def _source_poll_loop(self, live_recording: bool, interval_seconds: int) -> None:
-        label = "Twitch live" if live_recording else "source"
+        label = "live" if live_recording else "source"
         while not self._stop_event.is_set():
             store: Store | None = None
             try:
@@ -246,14 +265,14 @@ class BackupService:
             is_live_origin = self._is_live_recording_origin(origin)
             if live_recording is not None and is_live_origin != live_recording:
                 continue
-            if origin.provider == "twitch" and origin.kind == "vods":
-                mode = "live" if is_live_origin else "vod"
-                if active_store.reconcile_origin_poll_mode(origin.id, mode):
+            poll_variant = self.runtime.providers.poll_variant(origin)
+            if poll_variant is not None:
+                if active_store.reconcile_origin_poll_mode(origin.id, poll_variant):
                     self.logger.info(
-                        "reset Twitch poll state after recording mode change "
-                        "origin=%s mode=%s",
+                        "reset origin poll state after variant change "
+                        "origin=%s variant=%s",
                         origin.id,
-                        mode,
+                        poll_variant,
                     )
             if not active_store.origin_poll_due(origin.id):
                 continue
@@ -294,7 +313,7 @@ class BackupService:
                 )
                 return
             retry_seconds = exc.retry_after or (
-                self.config.twitch.live_retry_seconds
+                self.config.live.retry_seconds
                 if self._is_live_recording_origin(origin)
                 else self.config.app.retry_seconds
             )
@@ -458,7 +477,11 @@ class BackupService:
             try:
                 store = Store(self.config.db_path)
                 store.initialize()
-                downloader = Downloader(self.config, self.logger)
+                downloader = Downloader(
+                    self.config,
+                    self.logger,
+                    self.runtime.connection,
+                )
                 while not self._stop_event.is_set():
                     processed = self._process_available(
                         store,
@@ -493,10 +516,17 @@ class BackupService:
             try:
                 store = Store(self.config.db_path)
                 store.initialize()
-                downloader = Downloader(self.config, self.logger)
+                downloader = Downloader(
+                    self.config,
+                    self.logger,
+                    self.runtime.connection,
+                )
                 # A single delivery worker owns the MTProto client and its
                 # SQLite session. Download workers never open that session.
-                telegram = create_telegram_transport(self.config.telegram)
+                telegram = create_telegram_transport(
+                    self.config.telegram,
+                    self.runtime.connection,
+                )
                 while not self._stop_event.is_set():
                     processed = self._process_available(
                         store,
@@ -631,8 +661,7 @@ class BackupService:
             )
             return
         live_recording = (
-            str(media["provider"]) == "twitch"
-            and metadata.get("recording_mode") == "live"
+            metadata.get("recording_mode") == "live"
         )
         stream_id = str(metadata.get("stream_id") or "")
         twitch_vod = (
@@ -664,7 +693,7 @@ class BackupService:
                     job,
                     reason_code="live_recording_pending",
                     error="matching Twitch live recording is still in progress",
-                    retry_seconds=self.config.twitch.live_retry_seconds,
+                    retry_seconds=self.config.live.retry_seconds,
                 )
                 return
 
@@ -697,7 +726,7 @@ class BackupService:
                     size_bytes=artifact_path.stat().st_size,
                     delivery_targets=self._delivery_targets(),
                     delivery_max_failures=self.config.app.max_attempts,
-                    live_retry_seconds=self.config.twitch.live_retry_seconds,
+                    live_retry_seconds=self.config.live.retry_seconds,
                 )
                 return
             force_redownload = True
@@ -733,6 +762,17 @@ class BackupService:
                 url,
                 provider=str(media["provider"]),
                 live=live_recording,
+                route_request=RouteRequest(
+                    scope="media.probe",
+                    provider=str(media["provider"]),
+                    media_id=job.media_id,
+                    job_id=job.id,
+                    attempt=job.attempts,
+                    target_url=url,
+                    features=self.runtime.providers.route_features(
+                        str(media["provider"])
+                    ),
+                ),
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as exc:
             store.fail_job(
@@ -740,7 +780,7 @@ class BackupService:
                 reason_code="probe_failed",
                 error=self._safe_error(exc),
                 retry_seconds=(
-                    self.config.twitch.live_retry_seconds
+                    self.config.live.retry_seconds
                     if live_recording
                     else self.config.app.retry_seconds
                 ),
@@ -760,8 +800,8 @@ class BackupService:
                 job,
                 reason_code="stream_replaced",
                 error=(
-                    f"expected Twitch stream {expected_stream_id}, "
-                    f"but channel is now streaming {probe.external_id}"
+                    f"expected live stream {expected_stream_id}, "
+                    f"but the source now exposes {probe.external_id}"
                 ),
             )
             return
@@ -772,7 +812,7 @@ class BackupService:
                 job,
                 reason_code="live_window_missed",
                 error=f"live_status={probe.live_status or 'unknown'}; stream is no longer recordable",
-                retry_seconds=self.config.twitch.live_retry_seconds,
+                retry_seconds=self.config.live.retry_seconds,
             )
             return
         if not live_recording and probe.live_status in WAIT_LIVE_STATUSES:
@@ -797,6 +837,17 @@ class BackupService:
                 },
                 live=live_recording,
                 cancel_events=(self._stop_event, lease_lost_event),
+                route_request=RouteRequest(
+                    scope="media.download",
+                    provider=str(media["provider"]),
+                    media_id=job.media_id,
+                    job_id=job.id,
+                    attempt=job.attempts,
+                    target_url=url,
+                    features=self.runtime.providers.route_features(
+                        str(media["provider"])
+                    ),
+                ),
             )
         except DownloadCancelled as exc:
             self._record_live_segment(
@@ -824,7 +875,11 @@ class BackupService:
                 exc.partial_result,
                 reason="download_interrupted",
             )
-            recovery_probe = self._probe_twitch_live(downloader, url)
+            recovery_probe = self._probe_live(
+                downloader,
+                url,
+                provider=str(media["provider"]),
+            )
             if (
                 recovery_probe is not None
                 and recovery_probe.live_status == "is_live"
@@ -836,8 +891,8 @@ class BackupService:
                     job,
                     reason_code="stream_replaced",
                     error=(
-                        f"expected Twitch stream {expected_stream_id}, "
-                        f"but channel is now streaming {recovery_probe.external_id}"
+                        f"expected live stream {expected_stream_id}, "
+                        f"but the source now exposes {recovery_probe.external_id}"
                     ),
                 )
                 return
@@ -857,17 +912,17 @@ class BackupService:
                     error=(
                         f"{self._safe_error(exc.cause)}; "
                         + (
-                            "the same Twitch stream is still live, so recording "
+                            "the same stream is still live, so recording "
                             "will reconnect"
                             if recovery_probe is not None
                             else (
-                                "Twitch status could not be confirmed, so "
+                                "live status could not be confirmed, so "
                                 "recording will recheck without consuming its "
                                 "failure budget"
                             )
                         )
                     ),
-                    retry_seconds=self.config.twitch.live_retry_seconds,
+                    retry_seconds=self.config.live.retry_seconds,
                 )
                 return
             if (
@@ -880,7 +935,7 @@ class BackupService:
                 job,
                 reason_code="download_failed",
                 error=self._safe_error(exc.cause),
-                retry_seconds=self.config.twitch.live_retry_seconds,
+                retry_seconds=self.config.live.retry_seconds,
             )
             return
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, RuntimeError) as exc:
@@ -889,7 +944,7 @@ class BackupService:
                 reason_code="download_failed",
                 error=self._safe_error(exc),
                 retry_seconds=(
-                    self.config.twitch.live_retry_seconds
+                    self.config.live.retry_seconds
                     if live_recording
                     else self.config.app.retry_seconds
                 ),
@@ -902,7 +957,11 @@ class BackupService:
                 result,
                 reason="stream_finished",
             )
-            completion_probe = self._probe_twitch_live(downloader, url)
+            completion_probe = self._probe_live(
+                downloader,
+                url,
+                provider=str(media["provider"]),
+            )
             if (
                 completion_probe is None
                 or (
@@ -914,15 +973,15 @@ class BackupService:
                     job,
                     reason_code="live_interrupted",
                     error=(
-                        "live downloader exited cleanly but the same Twitch "
+                        "live downloader exited cleanly but the same "
                         "stream is still online; recording will reconnect"
                         if completion_probe is not None
                         else (
-                            "live downloader exited cleanly but Twitch status "
+                            "live downloader exited cleanly but live status "
                             "could not be confirmed; recording will recheck"
                         )
                     ),
-                    retry_seconds=self.config.twitch.live_retry_seconds,
+                    retry_seconds=self.config.live.retry_seconds,
                 )
                 return
             if self._finalize_live_segments(store, downloader, job, media):
@@ -931,7 +990,7 @@ class BackupService:
                 job,
                 reason_code="live_segment_missing",
                 error="live download finished without a usable recording segment",
-                retry_seconds=self.config.twitch.live_retry_seconds,
+                retry_seconds=self.config.live.retry_seconds,
             )
             return
         if twitch_vod and store.has_ready_twitch_live_recording(stream_id):
@@ -947,7 +1006,7 @@ class BackupService:
             size_bytes=result.file_size,
             delivery_targets=self._delivery_targets(),
             delivery_max_failures=self.config.app.max_attempts,
-            live_retry_seconds=self.config.twitch.live_retry_seconds,
+            live_retry_seconds=self.config.live.retry_seconds,
         )
 
     def _delivery_targets(self) -> tuple[str, ...]:
@@ -1177,35 +1236,20 @@ class BackupService:
             self.logger.warning("could not fail job id=%s because its lease was lost", job.id)
 
     def _new_source_registry(self) -> SourceRegistry:
-        return SourceRegistry(
-            self.config.twitch,
-            youtube_fetcher=lambda url: fetch_feed(url),
-            rss_fetcher=lambda url: fetch_feed(url),
-        )
+        return self.runtime.create_source_registry()
 
     def _all_origins(self, store: Store | None = None) -> list[Origin]:
         return (store or self.store).list_origins()
 
     def _is_live_recording_origin(self, origin: Origin) -> bool:
         try:
-            return twitch_recording_mode(origin, self.config.twitch) == "live"
-        except SourceError as exc:
-            self.logger.warning("invalid Twitch recording mode origin=%s: %s", origin.id, exc)
+            return self.runtime.providers.is_live_origin(origin)
+        except (SourceError, ValueError) as exc:
+            self.logger.warning("invalid live origin configuration origin=%s: %s", origin.id, exc)
             return False
 
     def _origin_seed_content_kind(self, origin: Origin) -> str | None:
-        if origin.provider != "twitch":
-            return None
-        if origin.kind == "vods":
-            return (
-                "live_stream"
-                if self._is_live_recording_origin(origin)
-                else "vod"
-            )
-        return {
-            "highlights": "highlight",
-            "uploads": "upload",
-        }.get(origin.kind)
+        return self.runtime.providers.seed_content_kind(origin)
 
     def _origin_poll_configuration_is_current(
         self,
@@ -1222,21 +1266,15 @@ class BackupService:
         )
         if current is None or not current.enabled:
             return False
-        if normalized_source_identity(current)[:3] != normalized_source_identity(
-            polled_origin
-        )[:3]:
-            return False
-        if polled_origin.provider != "twitch" or polled_origin.kind != "vods":
-            return True
         try:
-            return twitch_recording_mode(
+            return normalized_source_identity(
                 current,
-                self.config.twitch,
-            ) == twitch_recording_mode(
+                self.runtime.providers,
+            ) == normalized_source_identity(
                 polled_origin,
-                self.config.twitch,
+                self.runtime.providers,
             )
-        except SourceError:
+        except (SourceError, ValueError):
             return False
 
     def _has_enabled_live_origin(self, store: Store, media_id: int) -> bool:
@@ -1252,13 +1290,25 @@ class BackupService:
             for origin in store.list_origins()
         )
 
-    def _probe_twitch_live(
+    def _probe_live(
         self,
         downloader: Downloader,
         url: str,
+        *,
+        provider: str,
     ) -> ProbeResult | None:
         try:
-            return downloader.probe(url, provider="twitch", live=True)
+            return downloader.probe(
+                url,
+                provider=provider,
+                live=True,
+                route_request=RouteRequest(
+                    scope="media.probe",
+                    provider=provider,
+                    target_url=url,
+                    features=self.runtime.providers.route_features(provider),
+                ),
+            )
         except (
             subprocess.CalledProcessError,
             subprocess.TimeoutExpired,
@@ -1314,7 +1364,7 @@ class BackupService:
                 job,
                 reason_code="live_segment_merge_failed",
                 error=self._safe_error(exc),
-                retry_seconds=self.config.twitch.live_retry_seconds,
+                retry_seconds=self.config.live.retry_seconds,
             )
             return True
         store.complete_download(
@@ -1323,7 +1373,7 @@ class BackupService:
             size_bytes=result.file_size,
             delivery_targets=self._delivery_targets(),
             delivery_max_failures=self.config.app.max_attempts,
-            live_retry_seconds=self.config.twitch.live_retry_seconds,
+            live_retry_seconds=self.config.live.retry_seconds,
         )
         return True
 

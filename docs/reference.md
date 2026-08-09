@@ -61,6 +61,8 @@ MTProto session.
 | --- | --- |
 | `[app]` | Data path, polling, retry, leases, worker count, logging |
 | `[sources]` | Points to the unified `sources.toml` catalog used by both panel and CLI |
+| `[extensions]` | Enabled extension entry-point IDs |
+| `[extensions."id"]` | Required flag, private config path, and inline extension options |
 | `[download]` | yt-dlp, ffmpeg, formats, paths, timeout, sidecars |
 | `[download.provider_profiles.*]` | Per-provider download overrides |
 | `[telegram]` | Enablement, token, destination, transport, media, caption |
@@ -68,6 +70,7 @@ MTProto session.
 | `[telegram.bot_api]` | Endpoint, Bot API size limit, playable splitting |
 | `[control]` | Telegram panel permissions and polling |
 | `[twitch]` | Helix credentials and VOD/live behavior |
+| `[live]` | Provider-neutral live polling, retry, worker count, and recording timeout |
 
 `config.toml` is process configuration. Source rows and the global source
 filter live in `sources.toml`; Panel changes therefore do not rewrite

@@ -918,7 +918,7 @@ class TwitchLiveServiceTest(unittest.TestCase):
             )
             self.assertEqual(
                 {call[3] for call in calls},
-                {"source-poll-worker", "twitch-live-poll-worker"},
+                {"source-poll-worker", "live-poll-worker"},
             )
             self.assertEqual(len({call[4] for call in calls}), 2)
             standard_store.initialize.assert_called_once_with()
@@ -983,20 +983,25 @@ class TwitchLiveServiceTest(unittest.TestCase):
 
             self.assertEqual(standard_processed, 0)
             self.assertEqual(live_processed, 1)
+            self.assertEqual(len(downloader.probe.call_args_list), 2)
+            first_probe, second_probe = downloader.probe.call_args_list
             self.assertEqual(
-                downloader.probe.call_args_list,
-                [
-                    mock.call(
-                        "https://www.twitch.tv/example_streamer",
-                        provider="twitch",
-                        live=True,
-                    ),
-                    mock.call(
-                        "https://www.twitch.tv/example_streamer",
-                        provider="twitch",
-                        live=True,
-                    ),
-                ],
+                first_probe.args,
+                ("https://www.twitch.tv/example_streamer",),
+            )
+            self.assertEqual(first_probe.kwargs["provider"], "twitch")
+            self.assertTrue(first_probe.kwargs["live"])
+            self.assertEqual(first_probe.kwargs["route_request"].scope, "media.probe")
+            self.assertEqual(first_probe.kwargs["route_request"].media_id, media_id)
+            self.assertEqual(
+                second_probe.args,
+                ("https://www.twitch.tv/example_streamer",),
+            )
+            self.assertEqual(second_probe.kwargs["provider"], "twitch")
+            self.assertTrue(second_probe.kwargs["live"])
+            self.assertEqual(
+                second_probe.kwargs["route_request"].scope,
+                "media.probe",
             )
             downloader.download.assert_called_once()
             args = downloader.download.call_args.args

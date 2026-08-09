@@ -13,6 +13,8 @@ import sys
 
 from . import __version__
 from .config import load_config
+from .extension_api import EXTENSION_API_LEVEL, ExtensionError
+from .extensions import ExtensionHost, SourceProviderCatalog, build_runtime
 from .service import BackupService
 from .setup import (
     APPLICATION_UNIT,
@@ -146,6 +148,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_late_config(sources_migrate_parser)
 
+    extensions_parser = subparsers.add_parser(
+        "extensions",
+        help="Inspect and validate installed extension packages",
+    )
+    _add_late_config(extensions_parser)
+    extensions_subparsers = extensions_parser.add_subparsers(
+        dest="extensions_action",
+        required=True,
+    )
+    extensions_list_parser = extensions_subparsers.add_parser(
+        "list",
+        help="List installed and configured extensions without importing them",
+    )
+    _add_late_config(extensions_list_parser)
+    extensions_doctor_parser = extensions_subparsers.add_parser(
+        "doctor",
+        help="Load enabled extensions and validate the composed runtime",
+    )
+    _add_late_config(extensions_doctor_parser)
+
     args = parser.parse_args(argv)
     if args.command == "init-config":
         output_path = Path(args.output).expanduser()
@@ -213,6 +235,52 @@ def main(argv: list[str] | None = None) -> int:
         except SetupError as exc:
             parser.error(str(exc))
 
+    if args.command == "extensions":
+        try:
+            config = load_config(args.config or "config.toml")
+            _configure_logging(config.app.log_level)
+            if args.extensions_action == "list":
+                host = ExtensionHost(
+                    config.extensions,
+                    data_dir=config.app.data_dir,
+                    logger=logging.getLogger("asmr_tg_backup"),
+                )
+                installed = {item.id: item for item in host.installed()}
+                all_ids = sorted(set(installed) | set(config.extensions.enabled))
+                print(f"extension API level: {EXTENSION_API_LEVEL}")
+                print(f"extensions: {len(all_ids)}")
+                for extension_id in all_ids:
+                    item = installed.get(extension_id)
+                    print(f"- id: {extension_id}")
+                    print(f"  installed: {str(item is not None).lower()}")
+                    print(
+                        "  enabled: "
+                        + str(extension_id in config.extensions.enabled).lower()
+                    )
+                    if item is not None:
+                        print(f"  distribution: {item.distribution}")
+                        print(f"  version: {item.version}")
+                return 0
+            if args.extensions_action == "doctor":
+                runtime = build_runtime(config)
+                started = False
+                try:
+                    runtime.start()
+                    started = True
+                    load_source_catalog(config.sources.path, runtime.providers)
+                    runtime.create_source_registry()
+                finally:
+                    if started:
+                        runtime.stop()
+                print(
+                    f"extension runtime healthy: {len(config.extensions.enabled)} "
+                    f"enabled, API level {EXTENSION_API_LEVEL}"
+                )
+                return 0
+            raise ValueError(f"unknown extensions command: {args.extensions_action}")
+        except (ExtensionError, OSError, TypeError, ValueError) as exc:
+            parser.error(str(exc))
+
     if args.command == "sources":
         try:
             config = load_config(args.config or "config.toml")
@@ -221,20 +289,27 @@ def main(argv: list[str] | None = None) -> int:
             if args.sources_action == "path":
                 print(config.sources.path)
                 return 0
+            runtime = build_runtime(config) if hasattr(config, "extensions") else None
+            providers = (
+                runtime.providers
+                if runtime is not None
+                and isinstance(runtime.providers, SourceProviderCatalog)
+                else None
+            )
             if args.sources_action == "validate":
                 source_path = (
                     Path(args.file).expanduser()
                     if args.file
                     else config.sources.path
                 )
-                catalog = load_source_catalog(source_path)
+                catalog = _load_catalog(source_path, providers)
                 print(
                     f"valid source catalog: {source_path} "
                     f"({len(catalog.origins)} sources)"
                 )
                 return 0
             if args.sources_action == "list":
-                catalog = load_source_catalog(config.sources.path)
+                catalog = _load_catalog(config.sources.path, providers)
                 _print_sources(
                     catalog.version,
                     catalog.source_filter,
@@ -242,9 +317,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 0
             if args.sources_action == "export":
-                catalog = load_source_catalog(config.sources.path)
+                catalog = _load_catalog(config.sources.path, providers)
                 output_path = Path(args.output).expanduser()
-                write_source_catalog(output_path, catalog)
+                _write_catalog(output_path, catalog, providers)
                 print(f"exported source catalog to {output_path}")
                 return 0
 
@@ -255,11 +330,12 @@ def main(argv: list[str] | None = None) -> int:
                     config.sources.path,
                     store,
                     config.app.max_attempts,
+                    providers=providers,
                 )
                 return _run_sources_command(args, config, manager)
             finally:
                 store.close()
-        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        except (ExtensionError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
             parser.error(str(exc))
 
     config = load_config(args.config or "config.toml")
@@ -365,7 +441,12 @@ def _run_sources_command(args, config, manager: SourceCatalogManager) -> int:
     if args.sources_action == "apply":
         if args.file:
             source_path = Path(args.file).expanduser()
-            catalog = load_source_catalog(source_path)
+            providers = (
+                manager.providers
+                if isinstance(manager.providers, SourceProviderCatalog)
+                else None
+            )
+            catalog = _load_catalog(source_path, providers)
             catalog = manager.replace(catalog)
         else:
             catalog = manager.apply()
@@ -388,6 +469,19 @@ def _run_sources_command(args, config, manager: SourceCatalogManager) -> int:
         return 0
 
     raise ValueError(f"unknown sources command: {args.sources_action}")
+
+
+def _load_catalog(path: Path, providers: SourceProviderCatalog | None):
+    if providers is None:
+        return load_source_catalog(path)
+    return load_source_catalog(path, providers)
+
+
+def _write_catalog(path: Path, catalog, providers: SourceProviderCatalog | None) -> None:
+    if providers is None:
+        write_source_catalog(path, catalog)
+        return
+    write_source_catalog(path, catalog, providers)
 
 
 def _print_sources(version: int, source_filter: str, origins) -> None:

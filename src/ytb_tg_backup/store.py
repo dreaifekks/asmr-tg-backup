@@ -1970,8 +1970,9 @@ class Store:
         return row is None or row["next_poll_at"] is None or str(row["next_poll_at"]) <= now_iso()
 
     def reconcile_origin_poll_mode(self, origin_id: str, recording_mode: str) -> bool:
-        if recording_mode not in {"vod", "live"}:
-            raise ValueError("recording_mode must be 'vod' or 'live'")
+        recording_mode = str(recording_mode).strip()
+        if not recording_mode:
+            raise ValueError("recording_mode must not be empty")
         key = f"_origin_poll_mode:{origin_id}"
         row = self.conn.execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
         previous_mode = str(row["value"]) if row is not None else None

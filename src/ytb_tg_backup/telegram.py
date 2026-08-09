@@ -10,7 +10,8 @@ import tempfile
 from typing import Any
 
 from .config import TelegramConfig
-from .network import is_loopback_url
+from .extension_api import RouteRequest
+from .network import ConnectionRuntime, NetworkScope
 from .telegram_types import (
     BeforeCommit,
     TelegramTransport,
@@ -22,8 +23,13 @@ from .telegram_types import (
 class TelegramUploader:
     transport_name = "bot_api"
 
-    def __init__(self, config: TelegramConfig):
+    def __init__(
+        self,
+        config: TelegramConfig,
+        connection: ConnectionRuntime | None = None,
+    ):
         self.config = config
+        self.connection = connection or ConnectionRuntime()
 
     def validate(self) -> None:
         if not self.config.enabled:
@@ -281,20 +287,26 @@ class TelegramUploader:
         upload_timeout_seconds: int,
         before_commit: BeforeCommit | None = None,
     ) -> dict[str, object]:
-        api_base = str(self._bot_api_value("api_base", "https://api.telegram.org"))
-        if is_loopback_url(api_base):
-            cmd = [cmd[0], "--noproxy", "*", *cmd[1:]]
-        if before_commit is not None:
-            before_commit()
+        route_request = RouteRequest(
+            scope=NetworkScope.TELEGRAM_DELIVERY_BOT_API,
+            target_url=endpoint,
+            phase="sending",
+            idempotent=False,
+        )
         try:
-            completed = subprocess.run(
-                cmd,
-                check=True,
-                text=True,
-                capture_output=True,
-                input=_curl_stdin_config(endpoint),
-                timeout=upload_timeout_seconds,
-            )
+            with self.connection.route(route_request) as route:
+                routed_cmd = [cmd[0], *route.curl_args(), *cmd[1:]]
+                if before_commit is not None:
+                    before_commit()
+                completed = subprocess.run(
+                    routed_cmd,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    input=_curl_stdin_config(endpoint),
+                    timeout=upload_timeout_seconds,
+                    env=route.process_environment(),
+                )
         except subprocess.TimeoutExpired:
             raise self._error(
                 f"Telegram upload timed out after {upload_timeout_seconds} seconds",
@@ -536,17 +548,20 @@ def _bot_api_retry_after(payload: object) -> int | None:
 BotApiTransport = TelegramUploader
 
 
-def create_telegram_transport(config: TelegramConfig) -> TelegramTransport:
+def create_telegram_transport(
+    config: TelegramConfig,
+    connection: ConnectionRuntime | None = None,
+) -> TelegramTransport:
     value = getattr(config, "upload_transport", "mtproto")
     if hasattr(value, "value"):
         value = value.value
     transport = str(value).strip().lower().replace("-", "_")
     if transport == "bot_api":
-        return TelegramUploader(config)
+        return TelegramUploader(config, connection)
     if transport == "mtproto":
         from .telegram_mtproto import MtprotoTransport
 
-        return MtprotoTransport(config)
+        return MtprotoTransport(config, connection=connection)
     raise TelegramUploadError(
         f"unsupported telegram.upload_transport: {value}",
         code="configuration",

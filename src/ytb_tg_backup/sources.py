@@ -6,15 +6,27 @@ import json
 import re
 import socket
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Protocol
+from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-from .config import TwitchConfig
+from .config import Config, TwitchConfig
+from .extension_api import (
+    ExtensionRegistrar,
+    HttpClient,
+    HttpRequest,
+    RouteRequest,
+    SourceAdapter,
+    SourceAdapterContext,
+    SourceError,
+    SourceProviderDefinition,
+)
 from .feed import fetch_feed, parse_feed
 from .models import DiscoveryResult, MediaCandidate, Origin
+from .network import NetworkScope
 from .youtube import youtube_channel_feed_url
 
 
@@ -24,19 +36,6 @@ TWITCH_USER_CACHE_FIELDS = (
     "broadcaster_id",
     "broadcaster_refresh_after",
 )
-
-
-class SourceError(RuntimeError):
-    def __init__(self, message: str, *, code: str = "source_error", retry_after: int | None = None):
-        super().__init__(message)
-        self.code = code
-        self.retry_after = retry_after
-
-
-class SourceAdapter(Protocol):
-    provider: str
-
-    def discover(self, origin: Origin, checkpoint: str | None = None) -> DiscoveryResult: ...
 
 
 class YouTubePublicSource:
@@ -113,8 +112,9 @@ class RssSource:
 class TwitchHelixSource:
     provider = "twitch"
 
-    def __init__(self, config: TwitchConfig):
+    def __init__(self, config: TwitchConfig, http: HttpClient | None = None):
         self.config = config
+        self.http = http
         self._access_token = config.access_token
 
     def discover(self, origin: Origin, checkpoint: str | None = None) -> DiscoveryResult:
@@ -345,8 +345,50 @@ class TwitchHelixSource:
             },
         )
         try:
-            with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
-                payload = _read_json_response(response, label="Twitch API")
+            if self.http is None:
+                with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
+                    payload = _read_json_response(response, label="Twitch API")
+            else:
+                response = self.http.request(
+                    HttpRequest(
+                        url=url,
+                        headers={str(key): str(value) for key, value in request.header_items()},
+                        timeout_seconds=self.config.request_timeout_seconds,
+                    ),
+                    RouteRequest(
+                        scope=(
+                            NetworkScope.SOURCE_NOTIFICATION
+                            if path == "streams"
+                            else NetworkScope.ORIGIN_RESOLVE
+                            if path == "users"
+                            else NetworkScope.SOURCE_DISCOVERY
+                        ),
+                        provider="twitch",
+                        target_url=url,
+                    ),
+                )
+                if response.status == 401 and retry_auth and self.config.client_secret:
+                    self._refresh_app_token()
+                    return self._api_json(path, params, retry_auth=False)
+                if response.status == 429:
+                    reset_at = _int_header(response.headers, "Ratelimit-Reset")
+                    retry_after = max(1, reset_at - int(time.time())) if reset_at else None
+                    raise SourceError(
+                        "Twitch API HTTP 429",
+                        code="rate_limited",
+                        retry_after=retry_after,
+                    )
+                if response.status in {401, 403}:
+                    raise SourceError(
+                        f"Twitch API HTTP {response.status}",
+                        code="auth_invalid",
+                    )
+                if not 200 <= response.status < 300:
+                    raise SourceError(
+                        f"Twitch API HTTP {response.status}",
+                        code="http_error",
+                    )
+                payload = json.loads(response.body.decode("utf-8"))
         except HTTPError as exc:
             if exc.code == 401 and retry_auth and self.config.client_secret:
                 self._refresh_app_token()
@@ -379,8 +421,30 @@ class TwitchHelixSource:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
-                payload = _read_json_response(response, label="Twitch OAuth")
+            if self.http is None:
+                with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
+                    payload = _read_json_response(response, label="Twitch OAuth")
+            else:
+                response = self.http.request(
+                    HttpRequest(
+                        url=request.full_url,
+                        method="POST",
+                        headers={str(key): str(value) for key, value in request.header_items()},
+                        body=request.data,
+                        timeout_seconds=self.config.request_timeout_seconds,
+                    ),
+                    RouteRequest(
+                        scope=NetworkScope.SOURCE_DISCOVERY,
+                        provider="twitch",
+                        target_url=request.full_url,
+                    ),
+                )
+                if not 200 <= response.status < 300:
+                    raise SourceError(
+                        f"Twitch OAuth HTTP {response.status}",
+                        code="auth_invalid",
+                    )
+                payload = json.loads(response.body.decode("utf-8"))
         except HTTPError as exc:
             raise SourceError(f"Twitch OAuth HTTP {exc.code}", code="auth_invalid") from None
         except (URLError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -394,11 +458,23 @@ class TwitchHelixSource:
 class SourceRegistry:
     def __init__(
         self,
-        twitch: TwitchConfig,
+        twitch: TwitchConfig | tuple[SourceProviderDefinition, ...],
+        context: SourceAdapterContext | None = None,
         *,
         youtube_fetcher: Callable[[str], bytes] = fetch_feed,
         rss_fetcher: Callable[[str], bytes] = fetch_feed,
     ):
+        if isinstance(twitch, tuple):
+            if context is None:
+                raise ValueError("extension source registry requires adapter context")
+            self._defaults: dict[str, SourceAdapter] = {}
+            self._adapters: dict[tuple[str, str], SourceAdapter] = {}
+            for definition in twitch:
+                adapter = definition.adapter_factory(context)
+                self._defaults[definition.provider] = adapter
+                for kind in definition.kinds:
+                    self._adapters[(definition.provider, kind)] = adapter
+            return
         youtube = YouTubePublicSource(youtube_fetcher)
         rss = RssSource(rss_fetcher)
         twitch_source = TwitchHelixSource(twitch)
@@ -424,6 +500,169 @@ class SourceRegistry:
         except KeyError:
             label = provider if kind is None else f"{provider}/{kind}"
             raise SourceError(f"unsupported source adapter: {label}", code="invalid_origin") from None
+
+
+def register_builtin_source_providers(
+    registrar: ExtensionRegistrar,
+    config: Config,
+) -> None:
+    registrar.add_source_provider(
+        SourceProviderDefinition(
+            provider="youtube",
+            kinds=frozenset({"uploads", "vod_after_live"}),
+            default_kind="uploads",
+            adapter_factory=lambda context: YouTubePublicSource(
+                lambda url: _fetch_feed_through_runtime(
+                    context.http,
+                    url,
+                    provider="youtube",
+                    scope=NetworkScope.SOURCE_NOTIFICATION,
+                )
+            ),
+            validate_origin=lambda origin: origin,
+            identity=_generic_origin_identity,
+            is_live_origin=lambda _origin: False,
+            seed_content_kind=lambda _origin: None,
+            poll_variant=lambda _origin: None,
+        )
+    )
+    registrar.add_source_provider(
+        SourceProviderDefinition(
+            provider="rss",
+            kinds=frozenset({"feed"}),
+            default_kind="feed",
+            adapter_factory=lambda context: RssSource(
+                lambda url: _fetch_feed_through_runtime(
+                    context.http,
+                    url,
+                    provider="rss",
+                    scope=NetworkScope.SOURCE_DISCOVERY,
+                )
+            ),
+            validate_origin=_validate_rss_origin,
+            identity=_generic_origin_identity,
+            is_live_origin=lambda _origin: False,
+            seed_content_kind=lambda _origin: None,
+            poll_variant=lambda _origin: None,
+        )
+    )
+    registrar.add_source_provider(
+        SourceProviderDefinition(
+            provider="twitch",
+            kinds=frozenset({"vods", "highlights", "uploads"}),
+            default_kind="vods",
+            adapter_factory=lambda context: TwitchHelixSource(
+                config.twitch,
+                context.http,
+            ),
+            validate_origin=_validate_twitch_origin,
+            identity=_twitch_origin_identity,
+            is_live_origin=lambda origin: twitch_recording_mode(
+                origin,
+                config.twitch,
+            ) == "live",
+            seed_content_kind=lambda origin: _twitch_seed_content_kind(
+                origin,
+                config.twitch,
+            ),
+            poll_variant=lambda origin: (
+                twitch_recording_mode(origin, config.twitch)
+                if origin.kind == "vods"
+                else None
+            ),
+        )
+    )
+
+
+def _fetch_feed_through_runtime(
+    http: HttpClient,
+    url: str,
+    *,
+    provider: str,
+    scope: NetworkScope,
+) -> bytes:
+    response = http.request(
+        HttpRequest(
+            url=url,
+            timeout_seconds=30,
+            max_response_bytes=10 * 1024 * 1024,
+        ),
+        RouteRequest(
+            scope=scope,
+            provider=provider,
+            target_url=url,
+        ),
+    )
+    if not 200 <= response.status < 300:
+        raise SourceError(
+            f"{provider} source HTTP {response.status}",
+            code=f"http_{response.status}",
+        )
+    return response.body
+
+
+def _generic_origin_identity(origin: Origin) -> tuple[str, str, str, str]:
+    return (
+        origin.provider.strip().casefold(),
+        origin.kind.strip().casefold(),
+        origin.external_id.strip(),
+        "",
+    )
+
+
+def _twitch_origin_identity(origin: Origin) -> tuple[str, str, str, str]:
+    variant = (
+        str(origin.options.get("recording_mode") or "vod").strip().casefold()
+        if origin.kind == "vods"
+        else ""
+    )
+    return (
+        "twitch",
+        origin.kind.strip().casefold(),
+        origin.external_id.strip().casefold(),
+        variant,
+    )
+
+
+def _validate_twitch_origin(origin: Origin) -> Origin:
+    options = dict(origin.options)
+    if "recording_mode" not in options:
+        return origin
+    if origin.kind != "vods":
+        raise ValueError("recording_mode is only valid for Twitch kind='vods'")
+    mode = str(options["recording_mode"]).strip().lower()
+    if mode not in {"vod", "live"}:
+        raise ValueError("recording_mode must be 'vod' or 'live'")
+    options["recording_mode"] = mode
+    return replace(origin, options=options)
+
+
+def _validate_rss_origin(origin: Origin) -> Origin:
+    options = dict(origin.options)
+    if "allowed_media_hosts" in options:
+        allowed_hosts = options["allowed_media_hosts"]
+        if not isinstance(allowed_hosts, list) or not all(
+            isinstance(item, str) for item in allowed_hosts
+        ):
+            raise ValueError("allowed_media_hosts must be an array of strings")
+    if "allow_private_media" in options and not isinstance(
+        options["allow_private_media"],
+        bool,
+    ):
+        raise ValueError("allow_private_media must be true or false")
+    return origin
+
+
+def _twitch_seed_content_kind(
+    origin: Origin,
+    config: TwitchConfig,
+) -> str | None:
+    if origin.kind == "vods":
+        return "live_stream" if twitch_recording_mode(origin, config) == "live" else "vod"
+    return {
+        "highlights": "highlight",
+        "uploads": "upload",
+    }.get(origin.kind)
 
 
 def twitch_recording_mode(origin: Origin, config: TwitchConfig) -> str:

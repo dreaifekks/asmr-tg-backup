@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-08-09
+
+- Add an API-level-1 extension host based on Python entry points. Enabled
+  packages can register typed source providers or one process-wide connection
+  policy/HTTP transport, while core retains ownership of SQLite, jobs,
+  deduplication, retries, downloads, and Telegram delivery uncertainty.
+- Route provider resolution, notification/discovery polling, yt-dlp probes and
+  downloads, Telegram control traffic, Bot API uploads, and MTProto connections
+  through task-scoped route leases. Explicit direct routes remove inherited
+  proxy variables, and loopback Bot API endpoints remain forced direct.
+- Generalize the former Twitch-only fast polling/recording lane into provider-
+  neutral live scheduling so extension origins can emit `live_stream` items
+  without taking over workers or durable state.
+- Add `extensions list` for import-free package discovery and
+  `extensions doctor` for enabled-extension loading, lifecycle startup, source
+  catalog validation, and composed-runtime checks. Keep extensions disabled by
+  default and support private per-extension TOML files.
+- Publish matching optional repositories for scoped HTTP/SOCKS/Mihomo
+  subscription routing and Niconico live-search discovery. The core package
+  does not acquire their proxy, WebSocket, or site-specific dependencies.
+
 ## 0.4.1 - 2026-08-08
 
 - Add `asmr-tg-backup service install` and `service uninstall` for generated

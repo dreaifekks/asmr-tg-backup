@@ -14,6 +14,15 @@ log_level = "INFO"
 [sources]
 path = "/home/your-user/.config/asmr-tg-backup/sources.toml"
 
+# Optional packages are inert until their entry-point IDs are explicitly
+# enabled. Keep extension secrets in a private config file, not in this sample.
+[extensions]
+enabled = []
+
+# [extensions."dreaife.proxy-router"]
+# required = true
+# config_file = "proxy.toml"
+
 [download]
 yt_dlp = "/home/your-user/dev/asmr-tg-backup/.venv/bin/yt-dlp"
 ffmpeg = "/usr/bin/ffmpeg"
@@ -74,11 +83,14 @@ request_timeout_seconds = 30
 max_pages_per_poll = 3
 # Fallback for Twitch vods origins without recording_mode in sources.toml.
 recording_mode = "vod"
-live_poll_interval_seconds = 30
-live_retry_seconds = 15
-live_worker_count = 1
+
+# Shared fast-polling and isolated recording lane for every live provider.
+[live]
+poll_interval_seconds = 30
+retry_seconds = 15
+worker_count = 1
 # 0 disables the wall-clock timeout for long-running live recordings.
-live_download_timeout_seconds = 0
+download_timeout_seconds = 0
 
 [control]
 enabled = false
