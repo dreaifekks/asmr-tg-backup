@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.0 - 2026-08-10
+
 - Add `extensions enable <short-name>` as the primary trusted-extension flow.
   It resolves only the built-in catalog, injects the package into the current
   pipx/virtualenv, runs the extension-owned minimal setup, writes a private
