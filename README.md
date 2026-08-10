@@ -157,15 +157,21 @@ download profiles.
 ## Optional extensions
 
 Extensions are ordinary Python packages discovered from the same environment as
-the core. Installation alone has no effect: add the package's entry-point ID to
-`[extensions].enabled`, then run:
+the core. For the built-in trusted catalog, one command handles same-environment
+installation, minimal private setup, enablement, validation, and a safe restart
+of the matching managed user service:
 
 ```bash
-asmr-tg-backup extensions list
-asmr-tg-backup extensions doctor
+asmr-tg-backup extensions enable proxy-router
+asmr-tg-backup extensions enable niconico-origin
 ```
 
-The first optional repositories for the 0.5 API are:
+The command never rewrites `config.toml`; it maintains a private managed
+sidecar beside it. Containers still install selected extensions at image build
+time. Advanced and third-party extensions can be installed and configured
+manually, then checked with `extensions list` and `extensions doctor`.
+
+The first optional repositories using the 0.6 one-command setup layer are:
 
 - [`asmr-tg-backup-ext-proxy-router`](https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router): independent routing for notification,
   discovery, probe, download, Telegram control, Bot API delivery, and MTProto

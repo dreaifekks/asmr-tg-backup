@@ -3,6 +3,7 @@ import io
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -11,6 +12,119 @@ from ytb_tg_backup import setup
 
 
 class SetupTest(unittest.TestCase):
+    def test_managed_service_inspection_matches_exact_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            unit_path = root / setup.APPLICATION_UNIT
+            unit_path.write_text(
+                setup._render_application_unit(
+                    executable=Path(sys.executable),
+                    config_path=config_path,
+                    environment_path=root / "env",
+                ),
+                encoding="utf-8",
+            )
+            active = subprocess.CompletedProcess([], 0, "", "")
+            with (
+                mock.patch(
+                    "ytb_tg_backup.setup.application_service_path",
+                    return_value=unit_path,
+                ),
+                mock.patch(
+                    "ytb_tg_backup.setup._find_systemctl",
+                    return_value=Path("/usr/bin/systemctl"),
+                ),
+                mock.patch(
+                    "ytb_tg_backup.setup._require_managed_application_fragment"
+                ) as require_fragment,
+                mock.patch(
+                    "ytb_tg_backup.setup._run_systemctl_user",
+                    return_value=active,
+                ) as systemctl,
+            ):
+                status = setup.inspect_managed_application_service(config_path)
+
+            self.assertTrue(status.matched)
+            self.assertTrue(status.active)
+            require_fragment.assert_called_once()
+            systemctl.assert_called_once_with(
+                Path("/usr/bin/systemctl"),
+                "is-active",
+                "--quiet",
+                setup.APPLICATION_UNIT,
+                check=False,
+            )
+
+    def test_managed_service_inspection_ignores_another_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            unit_path = root / setup.APPLICATION_UNIT
+            unit_path.write_text(
+                setup._render_application_unit(
+                    executable=Path("/bin/true"),
+                    config_path=root / "other.toml",
+                    environment_path=root / "env",
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch(
+                    "ytb_tg_backup.setup.application_service_path",
+                    return_value=unit_path,
+                ),
+                mock.patch("ytb_tg_backup.setup._find_systemctl") as find_systemctl,
+            ):
+                status = setup.inspect_managed_application_service(
+                    root / "config.toml"
+                )
+
+            self.assertFalse(status.matched)
+            self.assertFalse(status.active)
+            find_systemctl.assert_not_called()
+
+    def test_managed_service_inspection_ignores_another_python_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            unit_path = root / setup.APPLICATION_UNIT
+            unit_path.write_text(
+                setup._render_application_unit(
+                    executable=Path("/another/venv/bin/python"),
+                    config_path=config_path,
+                    environment_path=root / "env",
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch(
+                    "ytb_tg_backup.setup.application_service_path",
+                    return_value=unit_path,
+                ),
+                mock.patch("ytb_tg_backup.setup._find_systemctl") as find_systemctl,
+            ):
+                status = setup.inspect_managed_application_service(config_path)
+
+            self.assertFalse(status.matched)
+            self.assertFalse(status.active)
+            find_systemctl.assert_not_called()
+
+    def test_restart_managed_service_skips_inactive_unit_by_default(self):
+        status = setup.ManagedApplicationServiceStatus(matched=True, active=False)
+        with (
+            mock.patch(
+                "ytb_tg_backup.setup.inspect_managed_application_service",
+                return_value=status,
+            ),
+            mock.patch("ytb_tg_backup.setup._find_systemctl") as find_systemctl,
+        ):
+            restarted = setup.restart_managed_application_service(
+                Path("/tmp/config.toml")
+            )
+
+        self.assertFalse(restarted)
+        find_systemctl.assert_not_called()
+
     def test_api_hash_prompt_rejects_wrong_length(self):
         stderr = io.StringIO()
         valid_hash = "0123456789abcdef0123456789abcdef"

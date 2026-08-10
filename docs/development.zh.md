@@ -28,6 +28,7 @@ Telegram 返回结果不明确，任务会进入 `uncertain`，不会自动重�
 | `cli.py`、`setup.py` | 命令、引导式初始化和私密配置生成 |
 | `config.py` | TOML 读取、环境变量覆盖和校验 |
 | `extension_api.py`、`extensions.py` | 稳定契约、entry-point 加载、类型化能力 registry 与 lifecycle |
+| `extension_catalog.py`、`extension_install.py`、`extension_management.py`、`extension_state.py` | 受信短名匹配、同环境安装、一键启用事务与受管 sidecar |
 | `network.py` | 任务级 route lease 与统一 HTTP/进程连接行为 |
 | `source_catalog.py` | 来源目录校验、原子写入与 SQLite 同步 |
 | `sources.py`、`youtube.py` | 内置 provider 发现与统一媒体元数据 |

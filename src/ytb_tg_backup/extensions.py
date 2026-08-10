@@ -13,11 +13,16 @@ from .config import Config, ExtensionSettings, ExtensionsConfig
 from .extension_api import (
     EXTENSION_API_LEVEL,
     EXTENSION_ENTRY_POINT_GROUP,
+    EXTENSION_SETUP_API_LEVEL,
+    EXTENSION_SETUP_ENTRY_POINT_GROUP,
     ConnectionPolicyFactory,
     ExtensionContext,
     ExtensionError,
     ExtensionManifest,
     ExtensionRegistrar,
+    ExtensionSetupContext,
+    ExtensionSetupManifest,
+    ExtensionSetupResult,
     HttpTransportFactory,
     RuntimeFactoryContext,
     SourceAdapterContext,
@@ -40,6 +45,12 @@ class _LoadedExtension:
     id: str
     instance: object
     manifest: ExtensionManifest
+
+
+@dataclass(frozen=True)
+class PreparedExtensionSetup:
+    manifest: ExtensionSetupManifest
+    result: ExtensionSetupResult
 
 
 class SourceProviderCatalog:
@@ -390,6 +401,89 @@ class ExtensionHost:
                 )
             file_config = raw
         return {**file_config, **settings.options}
+
+
+def prepare_extension_setup(
+    extension_id: str,
+    context: ExtensionSetupContext,
+) -> PreparedExtensionSetup:
+    matches = [
+        entry_point
+        for entry_point in metadata.entry_points(
+            group=EXTENSION_SETUP_ENTRY_POINT_GROUP
+        )
+        if entry_point.name.strip().lower() == extension_id
+    ]
+    if not matches:
+        raise ExtensionError(
+            f"extension {extension_id!r} has no setup entry point"
+        )
+    if len(matches) != 1:
+        raise ExtensionError(
+            f"duplicate setup entry point for extension {extension_id!r}"
+        )
+    try:
+        loaded = matches[0].load()
+        setup = loaded
+        if not isinstance(setup, ExtensionSetupManifest) and not hasattr(
+            setup, "manifest"
+        ):
+            setup = setup()
+        if isinstance(setup, ExtensionSetupManifest):
+            manifest = setup
+            result = ExtensionSetupResult(config=manifest.default_config or None)
+        else:
+            manifest = getattr(setup, "manifest", None)
+            if not isinstance(manifest, ExtensionSetupManifest):
+                raise ExtensionError(
+                    f"extension {extension_id!r} setup did not expose "
+                    "ExtensionSetupManifest"
+                )
+            result = setup.configure(context)
+            if not isinstance(result, ExtensionSetupResult):
+                raise ExtensionError(
+                    f"extension {extension_id!r} setup returned an invalid result"
+                )
+    except ExtensionError:
+        raise
+    except Exception as exc:
+        raise ExtensionError(
+            f"could not configure extension {extension_id!r}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if manifest.extension_id != extension_id:
+        raise ExtensionError(
+            f"setup entry point {extension_id!r} returned manifest for "
+            f"{manifest.extension_id!r}"
+        )
+    if manifest.api_level != EXTENSION_SETUP_API_LEVEL:
+        raise ExtensionError(
+            f"extension {extension_id!r} setup API level {manifest.api_level} "
+            f"is incompatible with core setup API level {EXTENSION_SETUP_API_LEVEL}"
+        )
+    if manifest.config_filename is not None:
+        filename = Path(manifest.config_filename)
+        if filename.name != manifest.config_filename or filename.suffix != ".toml":
+            raise ExtensionError(
+                f"extension {extension_id!r} setup config filename must be a "
+                "single .toml filename"
+            )
+    return PreparedExtensionSetup(manifest=manifest, result=result)
+
+
+def doctor_extension_runtime(config: Config) -> None:
+    from .source_catalog import load_source_catalog
+
+    runtime = build_runtime(config)
+    started = False
+    try:
+        runtime.start()
+        started = True
+        load_source_catalog(config.sources.path, runtime.providers)
+        runtime.create_source_registry()
+    finally:
+        if started:
+            runtime.stop()
 
 
 def build_runtime(

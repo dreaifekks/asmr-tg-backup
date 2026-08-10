@@ -14,7 +14,14 @@ import sys
 from . import __version__
 from .config import load_config
 from .extension_api import EXTENSION_API_LEVEL, ExtensionError
-from .extensions import ExtensionHost, SourceProviderCatalog, build_runtime
+from .extension_catalog import TRUSTED_EXTENSIONS, trusted_extension_by_id
+from .extension_management import ExtensionManagementError, enable_extension
+from .extensions import (
+    ExtensionHost,
+    SourceProviderCatalog,
+    build_runtime,
+    doctor_extension_runtime,
+)
 from .service import BackupService
 from .setup import (
     APPLICATION_UNIT,
@@ -167,6 +174,25 @@ def main(argv: list[str] | None = None) -> int:
         help="Load enabled extensions and validate the composed runtime",
     )
     _add_late_config(extensions_doctor_parser)
+    extensions_enable_parser = extensions_subparsers.add_parser(
+        "enable",
+        help="Install, configure, validate, and activate one trusted extension",
+    )
+    _add_late_config(extensions_enable_parser)
+    extensions_enable_parser.add_argument(
+        "extension",
+        help="Trusted short name, such as proxy-router or niconico-origin",
+    )
+    extensions_enable_parser.add_argument(
+        "--reconfigure",
+        action="store_true",
+        help="Run the extension's setup again even when it is already enabled",
+    )
+    extensions_enable_parser.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="Do not restart a matching managed user service",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "init-config":
@@ -237,7 +263,41 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "extensions":
         try:
-            config = load_config(args.config or "config.toml")
+            extension_config_path = _extension_command_config_path(args.config)
+            if args.extensions_action == "enable":
+                result = enable_extension(
+                    args.extension,
+                    extension_config_path,
+                    reconfigure=args.reconfigure,
+                    restart_service=not args.no_restart,
+                )
+                if result.already_enabled:
+                    print(
+                        f"extension already enabled and healthy: "
+                        f"{result.extension.slug}"
+                    )
+                else:
+                    print(f"enabled extension: {result.extension.slug}")
+                print(f"id: {result.extension.extension_id}")
+                print(
+                    f"package: {result.extension.distribution} "
+                    f"{result.extension.version}"
+                )
+                if result.config_path is not None:
+                    print(f"private config: {result.config_path}")
+                if result.service_restarted:
+                    print(f"restarted {APPLICATION_UNIT}")
+                else:
+                    print("service restart: not needed")
+                for suggestion in result.suggested_origins:
+                    print(
+                        "optional source: "
+                        f"{suggestion.provider}/{suggestion.kind} "
+                        f"{suggestion.external_id!r}; add it to sources.toml"
+                    )
+                return 0
+
+            config = load_config(extension_config_path)
             _configure_logging(config.app.log_level)
             if args.extensions_action == "list":
                 host = ExtensionHost(
@@ -246,7 +306,11 @@ def main(argv: list[str] | None = None) -> int:
                     logger=logging.getLogger("asmr_tg_backup"),
                 )
                 installed = {item.id: item for item in host.installed()}
-                all_ids = sorted(set(installed) | set(config.extensions.enabled))
+                all_ids = sorted(
+                    set(installed)
+                    | set(config.extensions.enabled)
+                    | {item.extension_id for item in TRUSTED_EXTENSIONS}
+                )
                 print(f"extension API level: {EXTENSION_API_LEVEL}")
                 print(f"extensions: {len(all_ids)}")
                 for extension_id in all_ids:
@@ -257,29 +321,29 @@ def main(argv: list[str] | None = None) -> int:
                         "  enabled: "
                         + str(extension_id in config.extensions.enabled).lower()
                     )
+                    trusted = trusted_extension_by_id(extension_id)
+                    if trusted is not None:
+                        print(f"  trusted_slug: {trusted.slug}")
                     if item is not None:
                         print(f"  distribution: {item.distribution}")
                         print(f"  version: {item.version}")
                 return 0
             if args.extensions_action == "doctor":
-                runtime = build_runtime(config)
-                started = False
-                try:
-                    runtime.start()
-                    started = True
-                    load_source_catalog(config.sources.path, runtime.providers)
-                    runtime.create_source_registry()
-                finally:
-                    if started:
-                        runtime.stop()
+                doctor_extension_runtime(config)
                 print(
                     f"extension runtime healthy: {len(config.extensions.enabled)} "
                     f"enabled, API level {EXTENSION_API_LEVEL}"
                 )
                 return 0
             raise ValueError(f"unknown extensions command: {args.extensions_action}")
+        except ExtensionManagementError as exc:
+            print(f"extension operation failed: {exc}", file=sys.stderr)
+            return 1
         except (ExtensionError, OSError, TypeError, ValueError) as exc:
             parser.error(str(exc))
+        except (EOFError, KeyboardInterrupt):
+            print("\nextension setup cancelled", file=sys.stderr)
+            return 130
 
     if args.command == "sources":
         try:
@@ -391,6 +455,15 @@ def main(argv: list[str] | None = None) -> int:
 
 def _add_late_config(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", default=argparse.SUPPRESS, help="Path to TOML config")
+
+
+def _extension_command_config_path(value: str | None) -> Path:
+    if value:
+        return Path(value).expanduser()
+    local = Path("config.toml")
+    if local.is_file():
+        return local
+    return default_config_path()
 
 
 class _ConfigAlreadyExistsError(RuntimeError):

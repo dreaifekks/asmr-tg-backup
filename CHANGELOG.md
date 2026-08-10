@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Add `extensions enable <short-name>` as the primary trusted-extension flow.
+  It resolves only the built-in catalog, injects the package into the current
+  pipx/virtualenv, runs the extension-owned minimal setup, writes a private
+  managed sidecar without rewriting `config.toml`, validates the composed
+  runtime, and restarts only an active managed service using the same config.
+- Add a separate setup entry-point API so optional repositories own their
+  onboarding. The proxy router offers SOCKS5, HTTP/SOCKS URL, and hidden Mihomo
+  subscription setup with scope presets; Niconico remains zero-config and
+  exposes an optional source suggestion. Failed validation or restart restores
+  the previous managed state and private extension config.
+
 ## 0.5.0 - 2026-08-09
 
 - Add an API-level-1 extension host based on Python entry points. Enabled

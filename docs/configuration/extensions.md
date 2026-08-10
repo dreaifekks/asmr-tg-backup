@@ -1,6 +1,7 @@
 # Extensions
 
-Version 0.5 introduces extension API level 1. An extension is a separately
+Version 0.5 introduced runtime extension API level 1; version 0.6 adds the
+trusted one-command setup layer. An extension is a separately
 installed Python distribution that registers capabilities through the
 `asmr_tg_backup.extensions` entry-point group. Packages are discovered only
 from the core application's Python environment and are imported only after
@@ -36,46 +37,80 @@ connection policy and one HTTP transport may be registered for a process, so
 enabling two competing network routers fails during startup instead of making
 ordering decide behavior.
 
-## Install into the same environment
+## One-command enablement
 
 The two reference packages are the
 [`proxy-router`](https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router)
 and
 [`niconico-origin`](https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin)
-extensions. Install only the capabilities needed by that deployment.
+extensions. Install only the capabilities needed by that deployment. For these
+trusted entries, the normal path is one command:
+
+```bash
+asmr-tg-backup extensions enable proxy-router
+asmr-tg-backup extensions enable niconico-origin
+```
+
+`enable` resolves an exact short name from the catalog bundled with the core.
+It does not accept arbitrary package names or URLs. It then installs the pinned
+distribution into the current pipx environment or virtual environment, checks
+both runtime and setup entry points without importing them, runs the
+extension-owned minimal setup, enables it, runs the same composed-runtime
+checks as `doctor`, and restarts an active core-managed systemd service only
+when that service uses the same main config. Repeating a healthy enable is a
+no-op; use `--reconfigure` to run setup again or `--no-restart` to leave the
+current process alone.
+
+The proxy setup defaults to `127.0.0.1:7891` SOCKS5 and media-only routing, but
+also accepts an HTTP/SOCKS URL or a hidden Mihomo subscription URL plus broader
+scope presets. Niconico needs no extension config; the command prints its
+optional ASMR live-search source suggestion without silently adding a source
+that could start recording.
+
+The command never rewrites the main config. For `config.toml`, it atomically
+maintains `config.extensions.toml` plus private files below `extensions/`, all
+with mode `0600`. Main-config extension settings take precedence over managed
+defaults. If setup, validation, or service restart fails, the previous sidecar
+and private extension config are restored; a newly installed package may stay
+installed but disabled.
+
+## Manual and container installation
+
+The following is the advanced path for image builds and deployments that do
+not allow runtime package installation.
 
 For pipx installations, inject each selected extension into the existing
 application environment:
 
 ```bash
 pipx inject asmr-tg-backup \
-  'asmr-tg-backup-ext-proxy-router @ git+https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router.git@v0.1.0'
+  'asmr-tg-backup-ext-proxy-router==0.2.0'
 pipx inject asmr-tg-backup \
-  'asmr-tg-backup-ext-niconico-origin @ git+https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin.git@v0.1.0'
+  'asmr-tg-backup-ext-niconico-origin==0.2.0'
 ```
 
 For a virtual environment, use its interpreter:
 
 ```bash
 .venv/bin/python -m pip install \
-  'git+https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router.git@v0.1.0' \
-  'git+https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin.git@v0.1.0'
+  'asmr-tg-backup-ext-proxy-router==0.2.0' \
+  'asmr-tg-backup-ext-niconico-origin==0.2.0'
 ```
 
 An official container remains minimal. Build a small derived image when an
 extension is needed:
 
 ```dockerfile
-FROM ghcr.io/dreaifekks/asmr-tg-backup:0.5.0
+FROM ghcr.io/dreaifekks/asmr-tg-backup:0.6.0
 RUN python -m pip install --no-cache-dir \
-    'git+https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router.git@v0.1.0' \
-    'git+https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin.git@v0.1.0'
+    'asmr-tg-backup-ext-proxy-router==0.2.0' \
+    'asmr-tg-backup-ext-niconico-origin==0.2.0'
 ```
 
-Pin tags or immutable commit IDs. Do not install an unreviewed extension into a
-service that holds Telegram credentials or private media.
+Pin exact versions or immutable commit IDs. Do not install an unreviewed
+extension into a service that holds Telegram credentials or private media.
 
-## Enable and validate
+## Manual enable and validation
 
 `extensions list` reads distribution metadata without importing package code:
 
@@ -109,7 +144,9 @@ config_file = "proxy.toml"
 Relative `config_file` paths resolve beside `config.toml`. Inline fields are
 merged over top-level fields from that file. Keep both files mode `0600`.
 
-Before restarting, run:
+This manual configuration remains supported for third-party extensions or
+deployments managed entirely by configuration management. Before restarting,
+run:
 
 ```bash
 asmr-tg-backup extensions doctor --config config.toml
@@ -189,7 +226,9 @@ Entry-point factories return an object with an `ExtensionManifest` and
 
 Use only the public types in `ytb_tg_backup.extension_api`. Set
 `manifest.api_level = 1` and declare a compatible core range in package
-metadata, such as `asmr-tg-backup>=0.5,<0.6`. Registration finishes before the
+metadata. A runtime-only API-level-1 extension can support 0.5, while an
+extension using setup API level 1 should require
+`asmr-tg-backup>=0.6,<0.7`. Registration finishes before the
 runtime registry is frozen; lifecycle `start` runs after core construction and
 `stop` runs in reverse order. A startup failure stops extensions that already
 started.
@@ -201,3 +240,17 @@ origin options in the provider definition rather than reading core internals.
 If every media URL from the provider needs a route capability such as
 `websocket`, declare it in `SourceProviderDefinition.route_features`; a network
 policy can then reject incompatible endpoints before starting yt-dlp.
+
+An extension can optionally keep onboarding outside its runtime object by
+publishing a setup entry point with the same ID:
+
+```toml
+[project.entry-points."asmr_tg_backup.extension_setups"]
+"example.provider" = "example_extension.setup:create_configurator"
+```
+
+Setup API level 1 exposes only prompt adapters, existing private configuration,
+a mapping result for core-owned TOML serialization, and optional origin
+suggestions. The core writes files and owns enable/doctor/restart rollback;
+extension setup code never receives the database, Telegram token, or service
+control.

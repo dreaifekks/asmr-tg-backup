@@ -1,6 +1,7 @@
 # 扩展
 
-0.5 版引入扩展 API level 1。扩展是单独安装的 Python distribution，通过
+0.5 版引入 runtime 扩展 API level 1，0.6 版增加受信的一键 setup 层。扩展是单独
+安装的 Python distribution，通过
 `asmr_tg_backup.extensions` entry-point group 注册能力。核心只会从自身所在的 Python
 环境中发现扩展，并且只有在配置中显式启用 ID 后才会导入扩展代码。
 
@@ -32,44 +33,70 @@ route request   -> policy lease     -> 单次请求/进程/连接
 和一个 HTTP transport；如果同时启用两个竞争的网络路由器，启动会明确失败，不会让
 安装顺序暗中决定行为。
 
-## 安装到同一个环境
+## 一条命令启用
 
 两个参考实现分别是
 [`proxy-router`](https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router)
 和
 [`niconico-origin`](https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin)
-扩展。每个部署只需安装自己需要的能力。
+扩展。每个部署只需安装自己需要的能力。对于核心内置受信目录中的扩展，正常路径只需
+一条命令：
+
+```bash
+asmr-tg-backup extensions enable proxy-router
+asmr-tg-backup extensions enable niconico-origin
+```
+
+`enable` 只会精确匹配核心随包发布的短名，不接受任意包名或 URL。随后它会把固定版本
+安装到当前 pipx/虚拟环境，先静态检查 runtime 与 setup entry point，再运行扩展自己
+提供的最小配置、写入启用状态、执行与 `doctor` 相同的组合运行时检查；只有当前正在
+运行的核心托管 systemd 服务使用同一份主配置时，才会安全重启。重复启用一个健康
+扩展不会重复安装、写文件或重启；`--reconfigure` 可重新配置，`--no-restart` 可保留
+当前进程。
+
+代理向导默认使用 `127.0.0.1:7891` SOCKS5 和“仅媒体探测/下载”预设，也支持现有
+HTTP/SOCKS URL、隐藏输入的 Mihomo 订阅和更广的 scope 预设。Niconico 扩展本身无需
+配置；命令只会显示可选 ASMR 直播搜索来源，不会悄悄添加可能开始录制的来源。
+
+该命令绝不会重写主配置。对于 `config.toml`，它原子维护同目录的
+`config.extensions.toml` 和 `extensions/` 下的私密扩展配置，权限均为 `0600`；主配置
+中的扩展设置优先于受管默认值。如果 setup、校验或服务重启失败，会恢复之前的 sidecar
+与私密配置；本次新装的包可以保留，但仍处于未启用状态。
+
+## 手工与容器安装
+
+以下流程保留给镜像构建及禁止运行时安装包的部署。
 
 使用 pipx 安装核心时，把选中的扩展逐个注入已有应用环境：
 
 ```bash
 pipx inject asmr-tg-backup \
-  'asmr-tg-backup-ext-proxy-router @ git+https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router.git@v0.1.0'
+  'asmr-tg-backup-ext-proxy-router==0.2.0'
 pipx inject asmr-tg-backup \
-  'asmr-tg-backup-ext-niconico-origin @ git+https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin.git@v0.1.0'
+  'asmr-tg-backup-ext-niconico-origin==0.2.0'
 ```
 
 使用虚拟环境时，调用该环境的解释器：
 
 ```bash
 .venv/bin/python -m pip install \
-  'git+https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router.git@v0.1.0' \
-  'git+https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin.git@v0.1.0'
+  'asmr-tg-backup-ext-proxy-router==0.2.0' \
+  'asmr-tg-backup-ext-niconico-origin==0.2.0'
 ```
 
 官方容器保持最小依赖；需要扩展时构建一个很薄的派生镜像：
 
 ```dockerfile
-FROM ghcr.io/dreaifekks/asmr-tg-backup:0.5.0
+FROM ghcr.io/dreaifekks/asmr-tg-backup:0.6.0
 RUN python -m pip install --no-cache-dir \
-    'git+https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router.git@v0.1.0' \
-    'git+https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin.git@v0.1.0'
+    'asmr-tg-backup-ext-proxy-router==0.2.0' \
+    'asmr-tg-backup-ext-niconico-origin==0.2.0'
 ```
 
-请固定 tag 或不可变 commit ID。不要把未经审查的扩展安装到持有 Telegram 凭据或
+请固定精确版本或不可变 commit ID。不要把未经审查的扩展安装到持有 Telegram 凭据或
 私密媒体的服务中。
 
-## 启用与检查
+## 手工启用与检查
 
 `extensions list` 只读取 distribution 元数据，不导入扩展代码：
 
@@ -102,7 +129,7 @@ config_file = "proxy.toml"
 相对 `config_file` 路径以 `config.toml` 所在目录为基准。行内字段会覆盖该文件的
 顶层同名字段。两个文件都应使用 `0600` 权限。
 
-重启前运行：
+这种手工配置仍适用于第三方扩展或完全由配置管理系统维护的部署。重启前运行：
 
 ```bash
 asmr-tg-backup extensions doctor --config config.toml
@@ -173,8 +200,9 @@ Entry-point factory 返回带 `ExtensionManifest` 和 `register`、`start`、`st
 ```
 
 只使用 `ytb_tg_backup.extension_api` 中的公共类型。设置
-`manifest.api_level = 1`，并在包元数据声明兼容核心范围，例如
-`asmr-tg-backup>=0.5,<0.6`。注册完成后 runtime registry 会冻结；lifecycle `start`
+`manifest.api_level = 1`，并在包元数据声明兼容核心范围。仅使用 runtime API level 1
+的扩展可以支持 0.5；使用 setup API level 1 的扩展应要求
+`asmr-tg-backup>=0.6,<0.7`。注册完成后 runtime registry 会冻结；lifecycle `start`
 在核心构建后运行，`stop` 按相反顺序执行。启动失败时，已经启动的扩展会被停止。
 
 来源 adapter 只获得窄化的 `SourceAdapterContext`：带路由的 HTTP client、logger 与
@@ -183,3 +211,15 @@ Entry-point factory 返回带 `ExtensionManifest` 和 `register`、`start`、`st
 的所有媒体 URL 都需要 `websocket` 之类的 route 能力，应在
 `SourceProviderDefinition.route_features` 中声明；网络 policy 就能在启动 yt-dlp 前
 排除不兼容端点。
+
+扩展也可以使用相同 ID 发布独立 setup entry point，把安装交互留在扩展仓库而不是
+runtime 对象中：
+
+```toml
+[project.entry-points."asmr_tg_backup.extension_setups"]
+"example.provider" = "example_extension.setup:create_configurator"
+```
+
+Setup API level 1 只暴露提示适配器、已有私密配置、由核心序列化为 TOML 的 mapping
+结果，以及可选来源建议。核心统一负责写文件、enable/doctor/restart 与失败回滚；扩展
+setup 代码拿不到数据库、Telegram token 或服务控制权。

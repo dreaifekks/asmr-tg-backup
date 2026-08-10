@@ -21,6 +21,9 @@
 | `asmr-tg-backup sources apply [--file PATH] --config PATH` | Reconcile the canonical catalog, or atomically replace it from another valid file |
 | `asmr-tg-backup sources export --output PATH [--config PATH]` | Export a private catalog snapshot |
 | `asmr-tg-backup sources migrate --config PATH` | Create the unified catalog from legacy TOML/SQLite sources |
+| `asmr-tg-backup extensions list [--config PATH]` | List trusted, installed, and enabled extensions without importing them |
+| `asmr-tg-backup extensions enable NAME [--config PATH]` | Install, minimally configure, validate, enable, and safely restart one trusted extension |
+| `asmr-tg-backup extensions doctor [--config PATH]` | Validate the composed runtime for all enabled extensions |
 
 ### Guided setup choices
 
@@ -38,6 +41,8 @@ XDG variables replace the corresponding default roots.
 | Resource | XDG path | Default |
 | --- | --- | --- |
 | Setup config | `$XDG_CONFIG_HOME/asmr-tg-backup/config.toml` | `~/.config/asmr-tg-backup/config.toml` |
+| Managed extension state | Beside each main config as `NAME.extensions.toml` | `~/.config/asmr-tg-backup/config.extensions.toml` |
+| Private extension configs | `extensions/` beside the main config | `~/.config/asmr-tg-backup/extensions/` |
 | Source catalog | beside the setup config by default | `~/.config/asmr-tg-backup/sources.toml` |
 | Worker environment | next to the setup config as `env` | `~/.config/asmr-tg-backup/env` |
 | Worker unit | `$XDG_CONFIG_HOME/systemd/user/asmr-tg-backup.service` | `~/.config/systemd/user/asmr-tg-backup.service` |

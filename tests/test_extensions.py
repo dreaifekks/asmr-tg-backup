@@ -11,9 +11,16 @@ from ytb_tg_backup.extension_api import (
     EXTENSION_API_LEVEL,
     ExtensionError,
     ExtensionManifest,
+    ExtensionSetupContext,
+    ExtensionSetupManifest,
+    ExtensionSetupResult,
     SourceProviderDefinition,
 )
-from ytb_tg_backup.extensions import ExtensionHost, RuntimeBuilder
+from ytb_tg_backup.extensions import (
+    ExtensionHost,
+    RuntimeBuilder,
+    prepare_extension_setup,
+)
 from ytb_tg_backup.models import DiscoveryResult
 
 
@@ -136,6 +143,53 @@ class ExtensionHostTest(unittest.TestCase):
 
         self.assertEqual(merged["route"], "inline")
         self.assertEqual(merged["scopes"]["media_download"], "proxy")
+
+    def test_static_setup_manifest_is_loaded_without_runtime_registration(self):
+        manifest = ExtensionSetupManifest(extension_id="example.extension")
+        entry_point = mock.Mock()
+        entry_point.name = "example.extension"
+        entry_point.load.return_value = lambda: manifest
+        prompts = mock.Mock()
+        context = ExtensionSetupContext(
+            interactive=True,
+            reconfigure=False,
+            existing_config={},
+            prompts=prompts,
+        )
+        with mock.patch(
+            "ytb_tg_backup.extensions.metadata.entry_points",
+            return_value=[entry_point],
+        ):
+            prepared = prepare_extension_setup("example.extension", context)
+
+        self.assertIs(prepared.manifest, manifest)
+        self.assertIsNone(prepared.result.config)
+        prompts.assert_not_called()
+
+    def test_configurator_result_and_manifest_id_are_validated(self):
+        class Configurator:
+            manifest = ExtensionSetupManifest(extension_id="other.extension")
+
+            def configure(self, _context):
+                return ExtensionSetupResult(config={})
+
+        entry_point = mock.Mock()
+        entry_point.name = "example.extension"
+        entry_point.load.return_value = lambda: Configurator()
+        context = ExtensionSetupContext(
+            interactive=True,
+            reconfigure=False,
+            existing_config={},
+            prompts=mock.Mock(),
+        )
+        with (
+            mock.patch(
+                "ytb_tg_backup.extensions.metadata.entry_points",
+                return_value=[entry_point],
+            ),
+            self.assertRaisesRegex(ExtensionError, "manifest for 'other.extension'"),
+        ):
+            prepare_extension_setup("example.extension", context)
 
 
 class RuntimeBuilderTest(unittest.TestCase):

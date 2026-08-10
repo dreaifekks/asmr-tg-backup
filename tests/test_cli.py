@@ -12,6 +12,7 @@ from unittest import mock
 from ytb_tg_backup import __version__
 from ytb_tg_backup.cli import main
 from ytb_tg_backup.config import load_config
+from ytb_tg_backup.extension_management import ExtensionManagementError
 from ytb_tg_backup.models import Origin
 from ytb_tg_backup.source_catalog import (
     SourceCatalog,
@@ -44,6 +45,72 @@ class CliTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0)
         self.assertEqual(output.getvalue(), f"asmr-tg-backup {__version__}\n")
         load_config.assert_not_called()
+
+    def test_extensions_enable_is_single_command_orchestration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            extension = SimpleNamespace(
+                slug="proxy-router",
+                extension_id="dreaife.proxy-router",
+                distribution="asmr-tg-backup-ext-proxy-router",
+                version="0.2.0",
+            )
+            result = SimpleNamespace(
+                extension=extension,
+                already_enabled=False,
+                config_path=Path(tmp) / "extensions/proxy-router.toml",
+                service_restarted=True,
+                suggested_origins=(),
+            )
+            stdout = io.StringIO()
+            with (
+                mock.patch(
+                    "ytb_tg_backup.cli.enable_extension",
+                    return_value=result,
+                ) as enable,
+                redirect_stdout(stdout),
+            ):
+                exit_code = main(
+                    [
+                        "extensions",
+                        "enable",
+                        "proxy",
+                        "--config",
+                        str(config_path),
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        enable.assert_called_once_with(
+            "proxy",
+            config_path,
+            reconfigure=False,
+            restart_service=True,
+        )
+        self.assertIn("enabled extension: proxy-router", stdout.getvalue())
+        self.assertIn("restarted asmr-tg-backup.service", stdout.getvalue())
+
+    def test_extensions_enable_runtime_failure_returns_one(self):
+        stderr = io.StringIO()
+        with (
+            mock.patch(
+                "ytb_tg_backup.cli.enable_extension",
+                side_effect=ExtensionManagementError("package install failed"),
+            ),
+            redirect_stderr(stderr),
+        ):
+            exit_code = main(
+                [
+                    "extensions",
+                    "enable",
+                    "niconico",
+                    "--config",
+                    "/tmp/config.toml",
+                ]
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("package install failed", stderr.getvalue())
 
     def test_init_config_creates_private_file_before_loading_config(self):
         with tempfile.TemporaryDirectory() as tmp:

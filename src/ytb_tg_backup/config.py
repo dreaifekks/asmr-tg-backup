@@ -7,6 +7,7 @@ import re
 import tomllib
 from typing import Any
 
+from .extension_state import load_managed_extension_state, merge_extension_tables
 from .models import Origin
 from .youtube import youtube_channel_feed_url
 
@@ -459,7 +460,11 @@ def load_config(path: str | Path) -> Config:
         sources_path = config_path.parent / sources_path
     sources = SourcesConfig(path=sources_path)
 
-    extensions = _load_extensions(raw.get("extensions", {}), config_path.parent)
+    managed_extensions = load_managed_extension_state(config_path)
+    extensions = _load_extensions(
+        merge_extension_tables(raw.get("extensions", {}), managed_extensions),
+        config_path.parent,
+    )
 
     origins = _load_origins(raw.get("origins", []), channels, raw_feeds)
     legacy_sources_declared = any(

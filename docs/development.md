@@ -30,6 +30,7 @@ accepted the message.
 | `cli.py`, `setup.py` | Commands, guided setup, and generated private configuration |
 | `config.py` | TOML parsing, environment overrides, and validation |
 | `extension_api.py`, `extensions.py` | Stable contracts, entry-point loading, typed capability registry, and lifecycle |
+| `extension_catalog.py`, `extension_install.py`, `extension_management.py`, `extension_state.py` | Trusted short-name resolution, same-environment installation, one-command enable transactions, and managed sidecars |
 | `network.py` | Task-scoped route leases and unified HTTP/process connection behavior |
 | `source_catalog.py` | Catalog validation, atomic writes, and SQLite reconciliation |
 | `sources.py`, `youtube.py` | Built-in provider discovery and normalized media metadata |

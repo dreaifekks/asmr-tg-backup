@@ -98,6 +98,12 @@ class ApplicationServiceResult:
 
 
 @dataclass(frozen=True)
+class ManagedApplicationServiceStatus:
+    matched: bool
+    active: bool
+
+
+@dataclass(frozen=True)
 class _InstalledLocalApi:
     setup: LocalApiSetup
 
@@ -288,6 +294,59 @@ def uninstall_application_service() -> Path | None:
         raise SetupError(f"could not remove application user service {unit_path}: {exc}") from exc
     _run_systemctl_user(systemctl, "daemon-reload")
     return unit_path
+
+
+def inspect_managed_application_service(
+    config_path: Path,
+) -> ManagedApplicationServiceStatus:
+    """Inspect only a core-managed unit from this runtime and configuration."""
+
+    candidate = config_path.expanduser()
+    if not candidate.is_absolute():
+        candidate = (Path.cwd() / candidate).absolute()
+    unit_path = application_service_path()
+    existing = _existing_application_unit(unit_path)
+    if existing is None or not existing.startswith(
+        (APPLICATION_UNIT_MARKER + "\n").encode("utf-8")
+    ):
+        return ManagedApplicationServiceStatus(matched=False, active=False)
+    executable = Path(sys.executable).expanduser()
+    if not executable.is_absolute():
+        executable = (Path.cwd() / executable).absolute()
+    expected_exec_start = (
+        "ExecStart="
+        + " ".join(_application_exec_arguments(executable, candidate))
+    ).encode("utf-8")
+    if expected_exec_start not in existing.splitlines():
+        return ManagedApplicationServiceStatus(matched=False, active=False)
+
+    systemctl = _find_systemctl()
+    _require_managed_application_fragment(systemctl, unit_path)
+    active = (
+        _run_systemctl_user(
+            systemctl,
+            "is-active",
+            "--quiet",
+            APPLICATION_UNIT,
+            check=False,
+        ).returncode
+        == 0
+    )
+    return ManagedApplicationServiceStatus(matched=True, active=active)
+
+
+def restart_managed_application_service(
+    config_path: Path,
+    *,
+    require_active: bool = True,
+) -> bool:
+    status = inspect_managed_application_service(config_path)
+    if not status.matched or (require_active and not status.active):
+        return False
+    systemctl = _find_systemctl()
+    _run_systemctl_user(systemctl, "restart", APPLICATION_UNIT)
+    _run_systemctl_user(systemctl, "is-active", "--quiet", APPLICATION_UNIT)
+    return True
 
 
 def run_interactive_setup(output_path: Path) -> SetupResult:
@@ -985,14 +1044,7 @@ def _render_application_unit(
     config_path: Path,
     environment_path: Path,
 ) -> str:
-    exec_arguments = (
-        _unit_exec_quote(str(executable)),
-        "-m",
-        "ytb_tg_backup",
-        "run",
-        "--config",
-        _unit_exec_quote(str(config_path)),
-    )
+    exec_arguments = _application_exec_arguments(executable, config_path)
     return (
         f"{APPLICATION_UNIT_MARKER}\n"
         "[Unit]\n"
@@ -1018,6 +1070,20 @@ def _render_application_unit(
         "UMask=0077\n\n"
         "[Install]\n"
         "WantedBy=default.target\n"
+    )
+
+
+def _application_exec_arguments(
+    executable: Path,
+    config_path: Path,
+) -> tuple[str, ...]:
+    return (
+        _unit_exec_quote(str(executable)),
+        "-m",
+        "ytb_tg_backup",
+        "run",
+        "--config",
+        _unit_exec_quote(str(config_path)),
     )
 
 

@@ -21,6 +21,9 @@
 | `asmr-tg-backup sources apply [--file PATH] --config PATH` | 同步当前目录，或从另一份有效文件原子替换后同步 |
 | `asmr-tg-backup sources export --output PATH [--config PATH]` | 导出一份私有来源目录快照 |
 | `asmr-tg-backup sources migrate --config PATH` | 从旧版 TOML/SQLite 创建统一目录 |
+| `asmr-tg-backup extensions list [--config PATH]` | 不导入扩展代码，列出受信、已安装与已启用扩展 |
+| `asmr-tg-backup extensions enable NAME [--config PATH]` | 安装、最小配置、校验、启用并安全重启一个受信扩展 |
+| `asmr-tg-backup extensions doctor [--config PATH]` | 校验所有已启用扩展组成的运行时 |
 
 ### 引导式 setup 选项
 
@@ -38,6 +41,8 @@ XDG 变量会替换对应的默认根目录。
 | 资源 | XDG 路径 | 默认路径 |
 | --- | --- | --- |
 | Setup 配置 | `$XDG_CONFIG_HOME/asmr-tg-backup/config.toml` | `~/.config/asmr-tg-backup/config.toml` |
+| 受管扩展状态 | 每份主配置旁的 `NAME.extensions.toml` | `~/.config/asmr-tg-backup/config.extensions.toml` |
+| 私密扩展配置 | 主配置旁的 `extensions/` 目录 | `~/.config/asmr-tg-backup/extensions/` |
 | 来源目录 | 默认与 setup 配置同目录 | `~/.config/asmr-tg-backup/sources.toml` |
 | Worker 环境文件 | 与 setup 配置同目录的 `env` | `~/.config/asmr-tg-backup/env` |
 | Worker unit | `$XDG_CONFIG_HOME/systemd/user/asmr-tg-backup.service` | `~/.config/systemd/user/asmr-tg-backup.service` |

@@ -11,6 +11,8 @@ from .models import DiscoveryResult, Origin
 
 EXTENSION_API_LEVEL = 1
 EXTENSION_ENTRY_POINT_GROUP = "asmr_tg_backup.extensions"
+EXTENSION_SETUP_API_LEVEL = 1
+EXTENSION_SETUP_ENTRY_POINT_GROUP = "asmr_tg_backup.extension_setups"
 
 
 class ExtensionError(RuntimeError):
@@ -227,3 +229,62 @@ class Extension(Protocol):
     def start(self) -> None: ...
 
     def stop(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class OriginSuggestion:
+    """An optional source an extension can offer during explicit setup."""
+
+    provider: str
+    kind: str
+    name: str
+    external_id: str
+    bootstrap: str = "latest"
+    options: Mapping[str, Any] = field(default_factory=dict)
+    prompt: str = ""
+
+
+@dataclass(frozen=True)
+class ExtensionSetupManifest:
+    """Static, side-effect-free metadata for an extension setup entry point."""
+
+    extension_id: str
+    api_level: int = EXTENSION_SETUP_API_LEVEL
+    config_filename: str | None = None
+    default_config: Mapping[str, Any] = field(default_factory=dict)
+    suggested_origins: tuple[OriginSuggestion, ...] = ()
+
+
+class SetupPrompter(Protocol):
+    def choose(
+        self,
+        message: str,
+        choices: Mapping[str, str],
+        *,
+        default: str,
+    ) -> str: ...
+
+    def text(self, message: str, *, default: str = "") -> str: ...
+
+    def secret(self, message: str) -> str: ...
+
+    def confirm(self, message: str, *, default: bool = False) -> bool: ...
+
+
+@dataclass(frozen=True)
+class ExtensionSetupContext:
+    interactive: bool
+    reconfigure: bool
+    existing_config: Mapping[str, Any]
+    prompts: SetupPrompter
+
+
+@dataclass(frozen=True)
+class ExtensionSetupResult:
+    config: Mapping[str, Any] | None = None
+
+
+class ExtensionConfigurator(Protocol):
+    manifest: ExtensionSetupManifest
+
+    def configure(self, context: ExtensionSetupContext) -> ExtensionSetupResult: ...

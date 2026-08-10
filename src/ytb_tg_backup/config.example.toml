@@ -18,7 +18,9 @@ log_level = "INFO"
 path = "sources.toml"
 
 # Optional packages are discovered through Python entry points. Installation
-# alone changes nothing; list IDs with `asmr-tg-backup extensions list`, then
+# alone changes nothing. Trusted extensions can be installed and enabled with
+# `asmr-tg-backup extensions enable <short-name>`; the command keeps its state
+# in a private sidecar and does not rewrite this file. Advanced users can still
 # opt in here and validate with `asmr-tg-backup extensions doctor`.
 [extensions]
 enabled = []
