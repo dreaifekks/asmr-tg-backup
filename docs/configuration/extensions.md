@@ -38,10 +38,18 @@ ordering decide behavior.
 
 ## Install into the same environment
 
-For pipx installations, inject the extension into the existing application
-environment:
+The two reference packages are the
+[`proxy-router`](https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router)
+and
+[`niconico-origin`](https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin)
+extensions. Install only the capabilities needed by that deployment.
+
+For pipx installations, inject each selected extension into the existing
+application environment:
 
 ```bash
+pipx inject asmr-tg-backup \
+  'asmr-tg-backup-ext-proxy-router @ git+https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router.git@v0.1.0'
 pipx inject asmr-tg-backup \
   'asmr-tg-backup-ext-niconico-origin @ git+https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin.git@v0.1.0'
 ```
@@ -50,6 +58,7 @@ For a virtual environment, use its interpreter:
 
 ```bash
 .venv/bin/python -m pip install \
+  'git+https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router.git@v0.1.0' \
   'git+https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin.git@v0.1.0'
 ```
 
@@ -59,6 +68,7 @@ extension is needed:
 ```dockerfile
 FROM ghcr.io/dreaifekks/asmr-tg-backup:0.5.0
 RUN python -m pip install --no-cache-dir \
+    'git+https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router.git@v0.1.0' \
     'git+https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin.git@v0.1.0'
 ```
 

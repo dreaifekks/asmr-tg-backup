@@ -34,9 +34,17 @@ route request   -> policy lease     -> 单次请求/进程/连接
 
 ## 安装到同一个环境
 
-使用 pipx 安装核心时，把扩展注入已有应用环境：
+两个参考实现分别是
+[`proxy-router`](https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router)
+和
+[`niconico-origin`](https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin)
+扩展。每个部署只需安装自己需要的能力。
+
+使用 pipx 安装核心时，把选中的扩展逐个注入已有应用环境：
 
 ```bash
+pipx inject asmr-tg-backup \
+  'asmr-tg-backup-ext-proxy-router @ git+https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router.git@v0.1.0'
 pipx inject asmr-tg-backup \
   'asmr-tg-backup-ext-niconico-origin @ git+https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin.git@v0.1.0'
 ```
@@ -45,6 +53,7 @@ pipx inject asmr-tg-backup \
 
 ```bash
 .venv/bin/python -m pip install \
+  'git+https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router.git@v0.1.0' \
   'git+https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin.git@v0.1.0'
 ```
 
@@ -53,6 +62,7 @@ pipx inject asmr-tg-backup \
 ```dockerfile
 FROM ghcr.io/dreaifekks/asmr-tg-backup:0.5.0
 RUN python -m pip install --no-cache-dir \
+    'git+https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router.git@v0.1.0' \
     'git+https://github.com/dreaifekks/asmr-tg-backup-ext-niconico-origin.git@v0.1.0'
 ```
 
