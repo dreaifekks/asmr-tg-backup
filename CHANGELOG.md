@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.6.1 - 2026-08-10
+
+- Add extension-aware Telegram source controls. Enabled non-built-in source
+  providers automatically receive an add button, while creation, duplicate
+  detection, and live-safe bootstrap use the provider's registered contract.
+
 ## 0.6.0 - 2026-08-10
 
 - Add `extensions enable <short-name>` as the primary trusted-extension flow.

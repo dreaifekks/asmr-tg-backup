@@ -170,6 +170,9 @@ The command never rewrites `config.toml`; it maintains a private managed
 sidecar beside it. Containers still install selected extensions at image build
 time. Advanced and third-party extensions can be installed and configured
 manually, then checked with `extensions list` and `extensions doctor`.
+Enabled source extensions are also discovered by the Telegram panel: it adds a
+provider-specific origin button and shows created origins as `provider/kind`,
+without creating or recording any source until the user submits it.
 
 The first optional repositories using the 0.6 one-command setup layer are:
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -13,6 +14,7 @@ from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from .config import Config
 from .extension_api import HttpRequest, RouteRequest
+from .extensions import SourceProviderCatalog
 from .models import Origin
 from .network import ConnectionRuntime, NetworkScope, is_loopback_url
 from .source_filter import (
@@ -37,6 +39,7 @@ PANEL_SNAPSHOT_MAX_AGE_SECONDS = 30
 PANEL_REVISION_SEPARATOR = "~"
 TWITCH_KINDS = {"vods", "highlights", "uploads"}
 TWITCH_LOGIN_PATTERN = re.compile(r"[a-zA-Z0-9_]{1,25}")
+BUILTIN_PANEL_PROVIDERS = frozenset({"youtube", "twitch", "rss"})
 
 
 class ControlBot:
@@ -273,7 +276,20 @@ class ControlBot:
             source_ref = remaining[0]
             external_id = _normalize_twitch_source(source_ref)
         else:
-            return "panel currently supports youtube and twitch origins"
+            if provider not in self._panel_extension_providers():
+                available = ", ".join(
+                    ("youtube", "twitch", *self._panel_extension_providers())
+                )
+                return (
+                    f"unsupported panel source provider: {provider}; "
+                    f"available: {available}"
+                )
+            definition = self.source_catalog.providers.definition(provider)
+            kind = definition.default_kind
+            source_ref = remaining[0].strip()
+            if not source_ref:
+                return f"usage: /origin add {provider} <external_id> [name]"
+            external_id = source_ref
 
         effective_recording_mode: str | None = None
         if provider == "twitch" and kind == "vods":
@@ -286,38 +302,12 @@ class ControlBot:
             raise ValueError("recording_mode is only supported for twitch/vods")
 
         name = " ".join(remaining[1:]).strip() or _default_name(source_ref)
-        source_identity = _panel_source_identity(provider, kind, external_id)
-        existing = next(
-            (
-                row
-                for row in self.store.list_origin_statuses()
-                if row["managed_by"] == "catalog"
-                and _panel_source_identity(
-                    str(row["provider"]),
-                    str(row["kind"]),
-                    str(row["external_id"]),
-                )
-                == source_identity
-            ),
-            None,
-        )
-        if existing is not None:
-            if recording_mode is not None and effective_recording_mode is not None:
-                self.source_catalog.set_recording_mode(
-                    str(existing["id"]),
-                    effective_recording_mode,
-                )
-            self.source_catalog.set_enabled(str(existing["id"]), True)
-            mode_suffix = (
-                f" mode={effective_recording_mode}"
-                if recording_mode is not None and effective_recording_mode is not None
-                else ""
-            )
-            return f"already exists; enabled: {existing['id']}{mode_suffix}"
-
         credentials_ready = self._twitch_credentials_ready()
         enabled = provider != "twitch" or credentials_ready
-        options: dict[str, Any] = {"created_from": "telegram_panel"}
+        extension_provider = provider in self._panel_extension_providers()
+        options: dict[str, Any] = (
+            {} if extension_provider else {"created_from": "telegram_panel"}
+        )
         if effective_recording_mode is not None:
             options["recording_mode"] = effective_recording_mode
         origin = Origin(
@@ -330,6 +320,42 @@ class ControlBot:
             bootstrap="latest",
             options=options,
         )
+        if extension_provider:
+            providers = self.source_catalog.providers
+            origin = providers.validate_origin(origin)
+            if providers.is_live_origin(origin):
+                origin = replace(origin, bootstrap="all")
+
+        source_identity = _panel_source_identity(
+            origin,
+            providers=self.source_catalog.providers,
+        )
+        existing = next(
+            (
+                candidate
+                for candidate in self.store.list_origins(managed_by="catalog")
+                if _panel_source_identity(
+                    candidate,
+                    providers=self.source_catalog.providers,
+                )
+                == source_identity
+            ),
+            None,
+        )
+        if existing is not None:
+            if recording_mode is not None and effective_recording_mode is not None:
+                self.source_catalog.set_recording_mode(
+                    existing.id,
+                    effective_recording_mode,
+                )
+            self.source_catalog.set_enabled(existing.id, True)
+            mode_suffix = (
+                f" mode={effective_recording_mode}"
+                if recording_mode is not None and effective_recording_mode is not None
+                else ""
+            )
+            return f"already exists; enabled: {existing.id}{mode_suffix}"
+
         self.source_catalog.add(origin)
         suffix = ""
         if provider == "twitch" and not credentials_ready:
@@ -366,6 +392,38 @@ class ControlBot:
         mode = str(override or self.config.twitch.recording_mode).lower().strip()
         return mode if mode in {"vod", "live"} else self.config.twitch.recording_mode
 
+    def _panel_extension_providers(self) -> tuple[str, ...]:
+        providers = self.source_catalog.providers
+        if providers is None:
+            return ()
+        return tuple(
+            provider
+            for provider in providers.providers
+            if provider not in BUILTIN_PANEL_PROVIDERS
+        )
+
+    def _resolve_panel_provider(self, token: str) -> str:
+        matched = tuple(
+            provider
+            for provider in self._panel_extension_providers()
+            if _provider_token(provider) == token
+        )
+        if len(matched) != 1:
+            raise ValueError("source provider is no longer available")
+        return matched[0]
+
+    def _extension_provider_button_rows(
+        self,
+    ) -> list[list[dict[str, str]]]:
+        buttons = [
+            _button(
+                f"➕ {_provider_label(provider)}",
+                f"p:addprovider:{_provider_token(provider)}",
+            )
+            for provider in self._panel_extension_providers()
+        ]
+        return [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+
     def _origin_list(self) -> str:
         self._ensure_source_catalog()
         rows = [
@@ -388,13 +446,19 @@ class ControlBot:
             lines.append("(none)")
         return "\n".join(lines)
 
-    @staticmethod
-    def _origin_usage() -> str:
+    def _origin_usage(self) -> str:
+        add_commands = [
+            "/origin add youtube <@handle|channel_id> [name]",
+            "/origin add twitch [vods|highlights|uploads] <login|user_id> [name]",
+            *(
+                f"/origin add {provider} <external_id> [name]"
+                for provider in self._panel_extension_providers()
+            ),
+        ]
         return "\n".join(
             [
                 "origin commands:",
-                "/origin add youtube <@handle|channel_id> [name]",
-                "/origin add twitch [vods|highlights|uploads] <login|user_id> [name]",
+                *add_commands,
                 "/origin list",
                 "/origin enable|disable <origin_id>",
                 "/origin mode <origin_id> <vod|live>",
@@ -489,6 +553,7 @@ class ControlBot:
                     "awaiting": None,
                     "twitch_kind": None,
                     "twitch_mode": None,
+                    "source_provider": None,
                 }
             )
             return
@@ -636,13 +701,34 @@ class ControlBot:
             state.update({"view": "filter", "awaiting": None})
             return
         if action == "addyt":
-            state.update({"view": "input", "awaiting": "add_youtube"})
+            state.update(
+                {
+                    "view": "input",
+                    "awaiting": "add_youtube",
+                    "source_provider": None,
+                }
+            )
             return
         if action == "addtw":
             state.update(
                 {
                     "view": "twitch_kind",
                     "awaiting": None,
+                    "twitch_kind": None,
+                    "twitch_mode": None,
+                    "source_provider": None,
+                }
+            )
+            return
+        if action == "addprovider":
+            if len(parts) != 3:
+                raise ValueError("invalid source provider action")
+            provider = self._resolve_panel_provider(parts[2])
+            state.update(
+                {
+                    "view": "input",
+                    "awaiting": "add_provider",
+                    "source_provider": provider,
                     "twitch_kind": None,
                     "twitch_mode": None,
                 }
@@ -699,6 +785,7 @@ class ControlBot:
                     "awaiting": None,
                     "twitch_kind": None,
                     "twitch_mode": None,
+                    "source_provider": None,
                     "flash": "已取消输入",
                 }
             )
@@ -789,6 +876,7 @@ class ControlBot:
                     "awaiting": None,
                     "twitch_kind": None,
                     "twitch_mode": None,
+                    "source_provider": None,
                     "flash": "已取消输入",
                 }
             )
@@ -818,6 +906,21 @@ class ControlBot:
                         "awaiting": None,
                         "twitch_kind": None,
                         "twitch_mode": None,
+                        "source_provider": None,
+                        "flash": reply,
+                    }
+                )
+            elif awaiting == "add_provider":
+                provider = str(state.get("source_provider") or "")
+                if provider not in self._panel_extension_providers():
+                    raise ValueError("来源插件已停用，请重新打开面板")
+                args = shlex.split(text)
+                reply = self._origin_add([provider, *args], message)
+                state.update(
+                    {
+                        "view": "origins",
+                        "awaiting": None,
+                        "source_provider": None,
                         "flash": reply,
                     }
                 )
@@ -874,6 +977,7 @@ class ControlBot:
                 "awaiting": None,
                 "twitch_kind": None,
                 "twitch_mode": None,
+                "source_provider": None,
                 "flash": "已取消输入",
             }
         )
@@ -887,6 +991,7 @@ class ControlBot:
             "awaiting": None,
             "twitch_kind": None,
             "twitch_mode": None,
+            "source_provider": None,
         }
         self._render_panel_message(message, state)
         self._retire_replaced_panel_message(message, previous_state, state)
@@ -997,7 +1102,24 @@ class ControlBot:
                     "发送“全部”可清除搜索。"
                 ),
             }
-            text = prompts.get(str(awaiting), "等待输入")
+            if awaiting == "add_provider":
+                provider = str(state.get("source_provider") or "")
+                providers = self.source_catalog.providers
+                if (
+                    providers is None
+                    or provider not in self._panel_extension_providers()
+                ):
+                    text = "来源插件已停用，请取消并重新打开面板。"
+                else:
+                    kind = providers.default_kind(provider)
+                    text = (
+                        f"添加 {_provider_label(provider)} 来源\n\n"
+                        "请发送：<来源标识> [显示名称]\n"
+                        f"来源类型：{provider}/{kind}\n"
+                        "来源标识包含空格时，请使用引号包住。"
+                    )
+            else:
+                text = prompts.get(str(awaiting), "等待输入")
             if flash_error:
                 text = f"⚠️ {flash_error}\n\n{text}"
             elif flash:
@@ -1064,12 +1186,14 @@ class ControlBot:
                 f"快照：{_format_snapshot_time(str(snapshot['generated_at']))}",
             ]
         )
-        return text, [
+        keyboard = [
             [_button("📚 来源", "p:origins:0"), _button("💾 本地资源", "p:resources:0")],
             [_button("📊 状态", "p:stats"), _button("🔎 过滤器", "p:filter")],
             [_button("➕ YouTube", "p:addyt"), _button("➕ Twitch", "p:addtw")],
-            [_button("🔄 刷新", "p:refresh")],
         ]
+        keyboard.extend(self._extension_provider_button_rows())
+        keyboard.append([_button("🔄 刷新", "p:refresh")])
+        return text, keyboard
 
     def _render_twitch_mode_panel(
         self,
@@ -1167,11 +1291,12 @@ class ControlBot:
             navigation.append(_button("➡️", f"p:origins:{page + 1}"))
         if navigation:
             keyboard.append(navigation)
-        keyboard.extend(
-            [
-                [_button("➕ YouTube", "p:addyt"), _button("➕ Twitch", "p:addtw")],
-                [_button("🏠 返回", "p:home"), _button("🔄 刷新", f"p:originsrefresh:{page}")],
-            ]
+        keyboard.append(
+            [_button("➕ YouTube", "p:addyt"), _button("➕ Twitch", "p:addtw")]
+        )
+        keyboard.extend(self._extension_provider_button_rows())
+        keyboard.append(
+            [_button("🏠 返回", "p:home"), _button("🔄 刷新", f"p:originsrefresh:{page}")]
         )
         return "\n".join(lines), keyboard
 
@@ -1761,6 +1886,10 @@ class ControlBot:
         return "\n".join(lines)
 
     def _help(self) -> str:
+        extension_origin_commands = [
+            f"/origin add {provider} <external_id> [name]"
+            for provider in self._panel_extension_providers()
+        ]
         return "\n".join(
             [
                 "Media audio backup bot",
@@ -1771,6 +1900,7 @@ class ControlBot:
                 "Provider-neutral origins:",
                 "/origin add youtube @handle [name]",
                 "/origin add twitch [vods|highlights|uploads] login [name]",
+                *extension_origin_commands,
                 "/origin list",
                 "/origin enable|disable <origin_id>",
                 "/origin mode <origin_id> <vod|live>",
@@ -1920,25 +2050,31 @@ def _dynamic_origin_id(provider: str, kind: str, external_id: str) -> str:
 
 
 def _panel_source_identity(
-    provider: str,
-    kind: str,
-    external_id: str,
-) -> tuple[str, str, str]:
+    origin: Origin,
+    *,
+    providers: SourceProviderCatalog | None = None,
+) -> tuple[str, str, str, str]:
     """Compare Panel sources using the catalog's provider-specific rules.
 
     Twitch VOD recording mode is intentionally excluded: selecting a new mode
     in the Panel updates the existing source instead of adding a parallel row.
     """
 
-    return normalized_source_identity(
-        Origin(
-            id="panel-identity",
-            provider=provider,
-            kind=kind,
-            name="panel-identity",
-            external_id=external_id,
-        )
-    )[:3]
+    identity = normalized_source_identity(origin, providers)
+    if identity[0] == "twitch" and identity[1] == "vods":
+        return identity[:3] + ("",)
+    return identity
+
+
+def _provider_token(provider: str) -> str:
+    return hashlib.sha256(provider.encode("utf-8")).hexdigest()[:16]
+
+
+def _provider_label(provider: str) -> str:
+    words = [word for word in re.split(r"[._-]+", provider) if word]
+    if not words:
+        return "Provider"
+    return " ".join(word[:1].upper() + word[1:] for word in words)
 
 
 def _origin_token(origin_id: str) -> str:

@@ -67,6 +67,13 @@ scope presets. Niconico needs no extension config; the command prints its
 optional ASMR live-search source suggestion without silently adding a source
 that could start recording.
 
+After an enabled extension registers a non-built-in source provider, the
+Telegram panel automatically adds a matching provider button, such as
+`➕ Niconico`. Selecting it asks for `<external_id> [display name]`; quote an
+identifier that contains spaces. No source is created and no recording starts
+until the user submits that input. The new source then appears under
+`📚 Sources` as `provider/kind`.
+
 The command never rewrites the main config. For `config.toml`, it atomically
 maintains `config.extensions.toml` plus private files below `extensions/`, all
 with mode `0600`. Main-config extension settings take precedence over managed
@@ -101,7 +108,7 @@ An official container remains minimal. Build a small derived image when an
 extension is needed:
 
 ```dockerfile
-FROM ghcr.io/dreaifekks/asmr-tg-backup:0.6.0
+FROM ghcr.io/dreaifekks/asmr-tg-backup:0.6.1
 RUN python -m pip install --no-cache-dir \
     'asmr-tg-backup-ext-proxy-router==0.2.0' \
     'asmr-tg-backup-ext-niconico-origin==0.2.0'
@@ -162,9 +169,10 @@ without that optional capability.
 
 ## Add an extension source
 
-The Telegram panel deliberately exposes only the built-in YouTube/Twitch
-onboarding flow. Add extension-specific origin kinds to `sources.toml`, then
-apply them with the core CLI. For the Niconico extension:
+The Telegram panel discovers enabled extension providers and offers their
+default source kind through a generated button. The equivalent manual path is
+to add the extension-specific origin to `sources.toml`, then apply it with the
+core CLI. For the Niconico extension:
 
 ```toml
 [[origins]]

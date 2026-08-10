@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
@@ -7,7 +8,9 @@ import unittest
 from unittest import mock
 
 from ytb_tg_backup.config import load_config
-from ytb_tg_backup.control import ControlBot, _origin_token
+from ytb_tg_backup.control import ControlBot, _origin_token, _provider_token
+from ytb_tg_backup.extension_api import SourceProviderDefinition
+from ytb_tg_backup.extensions import SourceProviderCatalog
 from ytb_tg_backup.models import MediaCandidate, Origin
 from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
 from ytb_tg_backup.store import Store
@@ -685,6 +688,135 @@ allowed_chat_ids = ["-100"]
                     for payload in edits
                 )
             )
+
+    def test_panel_discovers_and_adds_an_extension_source_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "test-token"
+
+[control]
+enabled = true
+allowed_user_ids = ["123"]
+allowed_chat_ids = ["-100"]
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+
+            def validate_niconico(origin: Origin) -> Origin:
+                keyword = origin.external_id.strip()
+                if not keyword:
+                    raise ValueError("Niconico keyword must not be empty")
+                return replace(
+                    origin,
+                    external_id=keyword,
+                    options={"max_results": 20},
+                )
+
+            definition = SourceProviderDefinition(
+                provider="niconico",
+                kinds=frozenset({"live_search"}),
+                default_kind="live_search",
+                adapter_factory=lambda _context: mock.Mock(),
+                validate_origin=validate_niconico,
+                identity=lambda origin: (
+                    "niconico",
+                    "live_search",
+                    origin.external_id.strip().casefold(),
+                    str(origin.options["max_results"]),
+                ),
+                is_live_origin=lambda _origin: True,
+                seed_content_kind=lambda _origin: "live_stream",
+                poll_variant=lambda _origin: "live-search-v1",
+            )
+            providers = SourceProviderCatalog({"niconico": definition})
+            bot = ControlBot(
+                config,
+                store,
+                logging.getLogger("test"),
+                providers=providers,
+            )
+            calls: list[tuple[str, dict]] = []
+
+            def fake_api(method: str, payload: dict) -> dict:
+                calls.append((method, payload))
+                if method == "sendMessage":
+                    return {"ok": True, "result": {"message_id": 500}}
+                return {"ok": True, "result": True}
+
+            command_message = {
+                "message_id": 10,
+                "from": {"id": 123},
+                "chat": {"id": -100},
+                "text": "/panel",
+            }
+            panel_message = {"message_id": 500, "chat": {"id": -100}}
+            add_callback_base = f"p:addprovider:{_provider_token('niconico')}"
+
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                bot._handle_update({"message": command_message})
+                add_callback = _current_panel_callback(calls, add_callback_base)
+                bot._handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-add-niconico",
+                            "from": {"id": 123},
+                            "message": panel_message,
+                            "data": add_callback,
+                        }
+                    }
+                )
+                prompt = next(
+                    payload["text"]
+                    for method, payload in reversed(calls)
+                    if method == "editMessageText"
+                )
+                self.assertIn("Niconico", prompt)
+                self.assertIn("niconico/live_search", prompt)
+
+                bot._handle_update(
+                    {
+                        "message": {
+                            "message_id": 11,
+                            "from": {"id": 123},
+                            "chat": {"id": -100},
+                            "text": 'ASMR "Niconico ASMR"',
+                        }
+                    }
+                )
+
+            origins = store.list_origins(managed_by="catalog")
+            self.assertEqual(len(origins), 1)
+            self.assertEqual(origins[0].provider, "niconico")
+            self.assertEqual(origins[0].kind, "live_search")
+            self.assertEqual(origins[0].external_id, "ASMR")
+            self.assertEqual(origins[0].name, "Niconico ASMR")
+            self.assertEqual(origins[0].bootstrap, "all")
+            self.assertEqual(origins[0].options, {"max_results": 20})
+            self.assertIn(
+                "/origin add niconico <external_id> [name]",
+                bot._help(),
+            )
+            latest_panel = next(
+                payload
+                for method, payload in reversed(calls)
+                if method == "editMessageText"
+            )
+            self.assertIn("niconico/live_search", latest_panel["text"])
+
+            duplicate = bot._execute(
+                "/origin add niconico asmr Duplicate",
+                command_message,
+            )
+            self.assertIn("already exists; enabled", duplicate)
+            self.assertEqual(len(store.list_origins(managed_by="catalog")), 1)
 
     def test_twitch_panel_selects_kind_before_vod_recording_mode(self):
         with tempfile.TemporaryDirectory() as tmp:

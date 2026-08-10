@@ -58,6 +58,11 @@ asmr-tg-backup extensions enable niconico-origin
 HTTP/SOCKS URL、隐藏输入的 Mihomo 订阅和更广的 scope 预设。Niconico 扩展本身无需
 配置；命令只会显示可选 ASMR 直播搜索来源，不会悄悄添加可能开始录制的来源。
 
+启用的扩展注册非内置来源 provider 后，Telegram 面板会自动增加对应按钮，例如
+`➕ Niconico`。点击后输入 `<来源标识> [显示名称]`；标识包含空格时需使用引号包住。
+用户提交前不会创建来源或开始录制。创建后，该来源会在 `📚 来源` 中显示为
+`provider/kind`。
+
 该命令绝不会重写主配置。对于 `config.toml`，它原子维护同目录的
 `config.extensions.toml` 和 `extensions/` 下的私密扩展配置，权限均为 `0600`；主配置
 中的扩展设置优先于受管默认值。如果 setup、校验或服务重启失败，会恢复之前的 sidecar
@@ -87,7 +92,7 @@ pipx inject asmr-tg-backup \
 官方容器保持最小依赖；需要扩展时构建一个很薄的派生镜像：
 
 ```dockerfile
-FROM ghcr.io/dreaifekks/asmr-tg-backup:0.6.0
+FROM ghcr.io/dreaifekks/asmr-tg-backup:0.6.1
 RUN python -m pip install --no-cache-dir \
     'asmr-tg-backup-ext-proxy-router==0.2.0' \
     'asmr-tg-backup-ext-niconico-origin==0.2.0'
@@ -143,8 +148,9 @@ lifecycle、用组合后的 provider registry 校验来源目录，并实例化�
 
 ## 添加扩展来源
 
-Telegram Panel 目前只提供内置 YouTube/Twitch 的引导流程。扩展特有的来源 kind 应
-写入 `sources.toml`，再通过核心 CLI 应用。Niconico 扩展示例：
+Telegram Panel 会发现已启用的扩展 provider，并通过自动生成的按钮添加其默认来源
+kind。等价的手工方式是把扩展特有的来源写入 `sources.toml`，再通过核心 CLI 应用。
+Niconico 扩展示例：
 
 ```toml
 [[origins]]
