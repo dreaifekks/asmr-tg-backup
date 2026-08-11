@@ -9,6 +9,7 @@ and browse tracked local resources from one inline message.
 ```toml
 [control]
 enabled = true
+api_base = ""
 poll_interval_seconds = 10
 panel_idle_timeout_seconds = 3600
 allow_disk_delete = false
@@ -24,6 +25,44 @@ members of that chat.
 
 The panel closes after one idle hour by default. Set
 `panel_idle_timeout_seconds = 0` to disable the timeout.
+
+## Control-only Bot API endpoint
+
+`control.api_base` selects the Bot API endpoint used for `getUpdates`, callback
+acknowledgements, command registration, and panel message sends/edits. An empty
+value, or omitting the field, inherits `telegram.bot_api.api_base` for backward
+compatibility.
+
+To keep MTProto media delivery unchanged while the panel uses a trusted local
+Bot API server:
+
+```toml
+[telegram]
+upload_transport = "mtproto"
+
+[telegram.bot_api]
+api_base = "https://api.telegram.org"
+
+[control]
+enabled = true
+api_base = "http://127.0.0.1:18081"
+```
+
+The endpoint receives the bot token. Use HTTPS for remote servers; unencrypted
+HTTP is appropriate only for a trusted loopback endpoint. Loopback requests are
+always forced direct and cannot be captured by an extension or environment
+proxy.
+
+If `telegram.upload_transport = "bot_api"`, normally point
+`telegram.bot_api.api_base` at the same local server as the panel. The override
+does not make Telegram's cloud and local Bot API safe to use simultaneously for
+one bot token.
+
+Changing this field does not migrate the bot between Telegram's cloud Bot API
+and a local Bot API server. Prepare the local server, stop the application,
+complete the server's documented bot migration, update the field, and then
+restart. Never run cloud and local `getUpdates` consumers for the same bot at
+the same time.
 
 ## Source management
 
@@ -52,7 +91,7 @@ control, or configuration snapshots.
 | Data | Storage | How it changes |
 | --- | --- | --- |
 | Sources, enabled state, names, bootstrap range, Twitch mode, global filter | `sources.toml`; SQLite only holds the synchronized runtime mirror | Panel buttons or `/origin` commands; or edit the file and run `sources apply` |
-| Telegram, download, Twitch credential references, panel authorization | `config.toml` and optional `env` | Edit and restart the service |
+| Telegram, download, Twitch credential references, panel endpoint and authorization | `config.toml` and optional `env` | Edit and restart the service |
 | Poll cursors, errors, media, jobs, deliveries, file records | `state.db` | Maintained by the running service |
 | Current panel message, navigation session, Telegram update offset | `state.db` | Maintained automatically by the panel |
 | Downloads and MTProto session | Application data directory | Maintained by the service; explicit file deletion may use the panel |

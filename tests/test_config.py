@@ -53,9 +53,40 @@ enabled = true
             config.app.data_dir / "telegram-mtproto.session",
         )
         self.assertFalse(config.control.enabled)
+        self.assertEqual(config.control.api_base, "")
         self.assertEqual(config.control.panel_idle_timeout_seconds, 3600)
         self.assertFalse(config.control.allow_disk_delete)
         self.assertTrue(config.control.delete_webhook_on_startup)
+
+    def test_control_api_base_is_an_optional_validated_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                """
+[telegram.bot_api]
+api_base = "https://api.telegram.org"
+
+[control]
+api_base = "http://[::1]:18081/"
+""".strip()
+            )
+
+            config = load_config(path)
+
+        self.assertEqual(config.telegram.bot_api.api_base, "https://api.telegram.org")
+        self.assertEqual(config.control.api_base, "http://[::1]:18081")
+
+        invalid_values = (
+            "ftp://127.0.0.1:18081",
+            "http://user:password@127.0.0.1:18081",
+            "http://127.0.0.1:18081?token=secret",
+        )
+        for value in invalid_values:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                invalid_path = Path(tmp) / "config.toml"
+                invalid_path.write_text(f'[control]\napi_base = "{value}"')
+                with self.assertRaisesRegex(ValueError, "control.api_base must be an http"):
+                    load_config(invalid_path)
 
     def test_disk_delete_requires_explicit_control_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp:

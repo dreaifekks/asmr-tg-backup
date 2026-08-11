@@ -73,7 +73,7 @@ MTProto session.
 | `[telegram]` | Enablement, token, destination, transport, media, caption |
 | `[telegram.mtproto]` | Application pair, session path, MTProto size limit |
 | `[telegram.bot_api]` | Endpoint, Bot API size limit, playable splitting |
-| `[control]` | Telegram panel permissions and polling |
+| `[control]` | Telegram panel endpoint, permissions, and polling |
 | `[twitch]` | Helix credentials and VOD/live behavior |
 | `[live]` | Provider-neutral live polling, retry, worker count, and recording timeout |
 
@@ -93,7 +93,7 @@ catalog and run `sources validate` followed by `sources apply`.
 | `ASMR_TG_UPLOAD_TRANSPORT` | `telegram.upload_transport` |
 | `ASMR_TG_MTPROTO_API_ID` | `telegram.mtproto.api_id` |
 | `ASMR_TG_MTPROTO_API_HASH` | `telegram.mtproto.api_hash` |
-| `TELEGRAM_API_BASE` | `telegram.bot_api.api_base` |
+| `TELEGRAM_API_BASE` | `telegram.bot_api.api_base`; inherited by control unless `control.api_base` is set |
 | `TELEGRAM_MAX_UPLOAD_BYTES` | `telegram.bot_api.max_upload_bytes` |
 | `TWITCH_CLIENT_ID` | Twitch client ID |
 | `TWITCH_ACCESS_TOKEN` | Existing Twitch app access token |

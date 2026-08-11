@@ -73,9 +73,9 @@ ASMR_TG_MTPROTO_API_HASH=0123456789abcdef0123456789abcdef
 - `mtproto` 通过一个持久化 MTProto client 上传，不需要额外 Bot API 服务；
 - `bot_api` 使用配置的 HTTP Bot API 端点，并且只有媒体上传需要 `curl`。
 
-即使媒体使用 MTProto，Telegram 控制面板仍使用 Bot API 地址。如果启用了控制面板，
-请确保 `[telegram.bot_api].api_base` 可访问。控制面板使用自己的 Python HTTP client，
-不需要 `curl`。
+即使媒体使用 MTProto，Telegram 控制面板仍会使用一个 Bot API 地址。设置了
+`[control].api_base` 时优先使用它，否则继承 `[telegram.bot_api].api_base`。控制面板
+使用自己的 Python HTTP client，不需要 `curl`。
 
 MTProto、Bot API 与音频分块之间不存在自动回退顺序。Telegram 可能已经接受消息时发生
 超时，会被记录为 uncertain，以避免重复消息。transport 切换始终需要显式配置。

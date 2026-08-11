@@ -92,7 +92,7 @@ pipx inject asmr-tg-backup \
 官方容器保持最小依赖；需要扩展时构建一个很薄的派生镜像：
 
 ```dockerfile
-FROM ghcr.io/dreaifekks/asmr-tg-backup:0.6.2
+FROM ghcr.io/dreaifekks/asmr-tg-backup:0.6.3
 RUN python -m pip install --no-cache-dir \
     'asmr-tg-backup-ext-proxy-router==0.2.0' \
     'asmr-tg-backup-ext-niconico-origin==0.2.0'

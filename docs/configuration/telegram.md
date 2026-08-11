@@ -81,10 +81,10 @@ bot token and does not replace it.
 - `bot_api` uses the configured HTTP Bot API endpoint and requires `curl` for
   media uploads.
 
-The Telegram control panel continues to use the Bot API endpoint even when
-media uses MTProto. Keep `[telegram.bot_api].api_base` reachable if the control
-panel is enabled. The control panel uses its own Python HTTP client and does not
-require `curl`.
+The Telegram control panel continues to use a Bot API endpoint even when media
+uses MTProto. It uses `[control].api_base` when set and otherwise inherits
+`[telegram.bot_api].api_base`. The control panel has its own Python HTTP client
+and does not require `curl`.
 
 There is no automatic fallback sequence between MTProto, Bot API, and audio
 splitting. A timeout after Telegram may have accepted a message is recorded as

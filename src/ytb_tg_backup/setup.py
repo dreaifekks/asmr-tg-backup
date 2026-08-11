@@ -1121,6 +1121,9 @@ def _write_setup_config(output_path: Path, setup: SetupAnswers) -> None:
         "max_upload_parts = 10\n\n"
         "[control]\n"
         "enabled = true\n"
+        "# Empty inherits telegram.bot_api.api_base; set a trusted local URL "
+        "to separate panel traffic.\n"
+        'api_base = ""\n'
         "allow_disk_delete = false\n"
         f"allowed_user_ids = [{_toml_string(setup.allowed_user_id)}]\n"
         "allowed_chat_ids = []\n"

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.6.3 - 2026-08-11
+
+- Add an optional `control.api_base` override so Telegram command polling,
+  callback acknowledgements, and panel message updates can use a trusted local
+  Bot API server without changing the selected media transport. Existing
+  configurations continue to inherit `telegram.bot_api.api_base`.
+
 ## 0.6.2 - 2026-08-11
 
 - Make the Telegram long-poll worker use the same runtime-aware `ControlBot`

@@ -81,7 +81,7 @@ session_path = "telegram-mtproto.session"
 max_upload_bytes = 1990000000
 
 [telegram.bot_api]
-# Used by the control bot and whenever upload_transport="bot_api".
+# Used whenever upload_transport="bot_api" and as the control bot fallback.
 # TELEGRAM_API_BASE and TELEGRAM_MAX_UPLOAD_BYTES override these values.
 api_base = "https://api.telegram.org"
 max_upload_bytes = 49000000
@@ -116,6 +116,10 @@ download_timeout_seconds = 0
 
 [control]
 enabled = false
+# Optional control-only Bot API endpoint. Empty inherits
+# telegram.bot_api.api_base. Use only a trusted endpoint because it receives
+# the bot token; loopback HTTP endpoints are forced direct.
+api_base = ""
 # Telegram getUpdates long-poll window; accepted range is 1-30 seconds.
 poll_interval_seconds = 10
 # Close the inline panel after this many seconds without a valid interaction.

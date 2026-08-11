@@ -71,7 +71,7 @@ Docker 设置 `ASMR_TG_BACKUP_DATA_DIR=/data`，把宿主机可写目录 `./sett
 | `[telegram]` | 启用、token、目标、transport、媒体和 caption |
 | `[telegram.mtproto]` | Application 凭据对、session 路径与 MTProto 大小限制 |
 | `[telegram.bot_api]` | Bot API 地址、大小限制与可播放分块 |
-| `[control]` | Telegram 面板权限与轮询 |
+| `[control]` | Telegram 面板地址、权限与轮询 |
 | `[twitch]` | Helix 凭据与 VOD/live 行为 |
 | `[live]` | 与提供方无关的直播轮询、重试、worker 数量与录制超时 |
 
@@ -90,7 +90,7 @@ Docker 设置 `ASMR_TG_BACKUP_DATA_DIR=/data`，把宿主机可写目录 `./sett
 | `ASMR_TG_UPLOAD_TRANSPORT` | `telegram.upload_transport` |
 | `ASMR_TG_MTPROTO_API_ID` | `telegram.mtproto.api_id` |
 | `ASMR_TG_MTPROTO_API_HASH` | `telegram.mtproto.api_hash` |
-| `TELEGRAM_API_BASE` | `telegram.bot_api.api_base` |
+| `TELEGRAM_API_BASE` | `telegram.bot_api.api_base`；未设置 `control.api_base` 时由控制面继承 |
 | `TELEGRAM_MAX_UPLOAD_BYTES` | `telegram.bot_api.max_upload_bytes` |
 | `TWITCH_CLIENT_ID` | Twitch client ID |
 | `TWITCH_ACCESS_TOKEN` | 已有 Twitch app access token |

@@ -8,6 +8,7 @@ Telegram 控制面板是管理来源的首选入口。发送 `/panel` 或 `/star
 ```toml
 [control]
 enabled = true
+api_base = ""
 poll_interval_seconds = 10
 panel_idle_timeout_seconds = 3600
 allow_disk_delete = false
@@ -20,6 +21,36 @@ allowed_message_thread_ids = []
 为空时会拒绝全部命令。建议至少填写一个用户 ID；只限制聊天会允许该聊天的所有成员。
 
 面板默认空闲一小时后关闭。设置 `panel_idle_timeout_seconds = 0` 可关闭空闲超时。
+
+## 控制面专用 Bot API 地址
+
+`control.api_base` 决定 `getUpdates`、callback 确认、命令注册以及面板消息发送/编辑所用的
+Bot API 地址。留空或省略时会继承 `telegram.bot_api.api_base`，因此旧配置行为不变。
+
+如果媒体保持使用 MTProto 投递，而控制面板希望使用可信的本地 Bot API 服务：
+
+```toml
+[telegram]
+upload_transport = "mtproto"
+
+[telegram.bot_api]
+api_base = "https://api.telegram.org"
+
+[control]
+enabled = true
+api_base = "http://127.0.0.1:18081"
+```
+
+该地址会收到 bot token。远程服务必须使用 HTTPS；未加密 HTTP 只适合可信的 loopback
+地址。loopback 请求始终强制直连，不会被扩展或环境代理接管。
+
+如果 `telegram.upload_transport = "bot_api"`，通常应让
+`telegram.bot_api.api_base` 与控制面板指向同一个本地服务。这个覆盖项不会让同一个 bot
+token 可以安全地同时使用 Telegram 云端与本地 Bot API。
+
+修改这个字段不会自动在 Telegram 云端 Bot API 与本地 Bot API 服务之间迁移 bot。
+应先准备本地服务并停止应用，按本地服务文档完成 bot 迁移，再修改配置并重启。同一个
+bot 不能同时运行云端和本地 `getUpdates` consumer。
 
 ## 来源管理
 
@@ -45,7 +76,7 @@ SQLite 运行时镜像。手工编辑同一文件并执行 `asmr-tg-backup sourc
 | 内容 | 保存位置 | 如何修改 |
 | --- | --- | --- |
 | 来源、启用状态、名称、导入范围、Twitch 模式、全局过滤器 | `sources.toml`；SQLite 仅保留同步后的运行镜像 | Panel 按钮或 `/origin` 命令；也可编辑文件后运行 `sources apply` |
-| Telegram、下载、Twitch 凭据引用、Panel 权限 | `config.toml` 与可选 `env` | 编辑后重启服务 |
+| Telegram、下载、Twitch 凭据引用、Panel 地址与权限 | `config.toml` 与可选 `env` | 编辑后重启服务 |
 | 轮询游标、错误、媒体、任务、投递和文件记录 | `state.db` | 由服务运行时维护 |
 | 当前 Panel 消息、会话导航和 Telegram update offset | `state.db` | 由 Panel 自动维护 |
 | 下载文件和 MTProto session | 应用数据目录 | 由服务维护；文件删除可在 Panel 中明确执行 |

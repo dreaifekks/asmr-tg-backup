@@ -1948,7 +1948,11 @@ class ControlBot:
         *,
         request_timeout_seconds: int = 30,
     ) -> dict[str, Any]:
-        endpoint = f"{self.config.telegram.api_base.rstrip('/')}/bot{self.config.telegram.bot_token}/{method}"
+        api_base = (
+            self.config.control.api_base
+            or self.config.telegram.bot_api.api_base.rstrip("/")
+        )
+        endpoint = f"{api_base}/bot{self.config.telegram.bot_token}/{method}"
         body = json.dumps(payload).encode("utf-8")
         if self.connection is None:
             request = Request(
@@ -1958,7 +1962,7 @@ class ControlBot:
                 method="POST",
             )
             try:
-                if is_loopback_url(self.config.telegram.api_base):
+                if is_loopback_url(api_base):
                     open_request = build_opener(ProxyHandler({})).open
                 else:
                     open_request = urlopen

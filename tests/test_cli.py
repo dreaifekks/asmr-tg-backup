@@ -193,6 +193,7 @@ class CliTest(unittest.TestCase):
             self.assertNotIn("api_id", raw["telegram"]["mtproto"])
             self.assertNotIn("api_hash", raw["telegram"]["mtproto"])
             self.assertEqual(raw["telegram"]["mtproto"]["max_upload_bytes"], 1_990_000_000)
+            self.assertEqual(raw["control"]["api_base"], "")
             self.assertEqual(raw["control"]["allowed_user_ids"], ["123456789"])
 
             with mock.patch(
@@ -202,6 +203,7 @@ class CliTest(unittest.TestCase):
                 config = load_config(config_path)
             self.assertTrue(config.telegram.enabled)
             self.assertTrue(config.control.enabled)
+            self.assertEqual(config.control.api_base, "")
             self.assertEqual(config.telegram.bot_token, token)
             self.assertEqual(config.telegram.mtproto.api_id, 12345)
             self.assertEqual(config.control.allowed_user_ids, ["123456789"])

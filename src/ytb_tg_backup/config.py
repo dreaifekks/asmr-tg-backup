@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import tomllib
 from typing import Any
+from urllib.parse import urlsplit
 
 from .extension_state import load_managed_extension_state, merge_extension_tables
 from .models import Origin
@@ -157,6 +158,7 @@ class LiveConfig:
 @dataclass(frozen=True)
 class ControlConfig:
     enabled: bool = False
+    api_base: str = ""
     poll_interval_seconds: int = 10
     panel_idle_timeout_seconds: int = 3600
     allow_disk_delete: bool = False
@@ -429,6 +431,10 @@ def load_config(path: str | Path) -> Config:
     control_raw = raw.get("control", {})
     control = ControlConfig(
         enabled=bool(control_raw.get("enabled", False)),
+        api_base=_optional_api_base(
+            control_raw.get("api_base", ""),
+            label="control.api_base",
+        ),
         poll_interval_seconds=max(1, min(30, int(control_raw.get("poll_interval_seconds", 10)))),
         panel_idle_timeout_seconds=max(
             0,
@@ -652,6 +658,36 @@ def _strict_bool(value: object, *, label: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{label} must be true or false")
     return value
+
+
+def _optional_api_base(value: object, *, label: str) -> str:
+    normalized = str(value).strip().rstrip("/")
+    if not normalized:
+        return ""
+    if any(character.isspace() for character in normalized):
+        raise ValueError(
+            f"{label} must be an http(s) URL without credentials, whitespace, query, or fragment"
+        )
+    try:
+        parsed = urlsplit(normalized)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError as exc:
+        raise ValueError(
+            f"{label} must be an http(s) URL without credentials, whitespace, query, or fragment"
+        ) from exc
+    if not (
+        parsed.scheme.lower() in {"http", "https"}
+        and hostname
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+    ):
+        raise ValueError(
+            f"{label} must be an http(s) URL without credentials, whitespace, query, or fragment"
+        )
+    return normalized
 
 
 def official_mtproto_credentials() -> tuple[int | None, str]:

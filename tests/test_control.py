@@ -9,7 +9,8 @@ from unittest import mock
 
 from ytb_tg_backup.config import load_config
 from ytb_tg_backup.control import ControlBot, _origin_token, _provider_token
-from ytb_tg_backup.extension_api import SourceProviderDefinition
+from ytb_tg_backup.extension_api import HttpResponse, SourceProviderDefinition
+from ytb_tg_backup.network import NetworkScope
 from ytb_tg_backup.extensions import SourceProviderCatalog
 from ytb_tg_backup.models import MediaCandidate, Origin
 from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
@@ -44,10 +45,15 @@ class ControlBotTest(unittest.TestCase):
     bot_token = "secret-token"
 
     [telegram.bot_api]
+    api_base = "https://telegram.example"
+
+    [control]
     api_base = "http://[::1]:18081"
     """.strip()
             )
             config = load_config(config_path)
+            self.assertEqual(config.telegram.bot_api.api_base, "https://telegram.example")
+            self.assertEqual(config.control.api_base, "http://[::1]:18081")
             bot = ControlBot(config, mock.Mock(), logging.getLogger("test"))
             response = mock.MagicMock()
             response.__enter__.return_value = response
@@ -110,6 +116,51 @@ class ControlBotTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         build_opener.assert_not_called()
         urlopen.assert_called_once()
+
+    def test_control_api_override_is_used_by_the_routed_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "secret-token"
+
+[telegram.bot_api]
+api_base = "https://telegram.example"
+
+[control]
+api_base = "http://127.0.0.1:18081"
+""".strip()
+            )
+            config = load_config(config_path)
+            connection = mock.Mock()
+            connection.request.return_value = HttpResponse(
+                200,
+                "http://127.0.0.1:18081/bottest/getUpdates",
+                {},
+                b'{"ok": true, "result": []}',
+            )
+            bot = ControlBot(
+                config,
+                mock.Mock(),
+                logging.getLogger("test"),
+                connection=connection,
+            )
+
+            result = bot._api("getUpdates", {}, request_timeout_seconds=15)
+
+        self.assertTrue(result["ok"])
+        request, route_request = connection.request.call_args.args
+        self.assertEqual(
+            request.url,
+            "http://127.0.0.1:18081/botsecret-token/getUpdates",
+        )
+        self.assertEqual(route_request.target_url, request.url)
+        self.assertEqual(route_request.scope, NetworkScope.TELEGRAM_CONTROL_RECEIVE)
+        self.assertEqual(request.timeout_seconds, 15)
 
     def test_get_updates_uses_long_poll_and_a_longer_http_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:
