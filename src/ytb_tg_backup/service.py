@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
@@ -45,6 +45,10 @@ from .telegram import (
     TelegramUploadError,
     create_telegram_transport,
 )
+
+
+ARTIFACT_CLEANUP_INTERVAL_SECONDS = 3600
+ARTIFACT_CLEANUP_BATCH_SIZE = 100
 
 
 class BackupService:
@@ -187,6 +191,14 @@ class BackupService:
                 threading.Thread(
                     target=self._control_loop,
                     name="control-worker",
+                    daemon=True,
+                )
+            )
+        if self._artifact_cleanup_enabled():
+            workers.append(
+                threading.Thread(
+                    target=self._artifact_cleanup_loop,
+                    name="artifact-cleanup-worker",
                     daemon=True,
                 )
             )
@@ -469,6 +481,8 @@ class BackupService:
             job_types=("download", "telegram_delivery"),
             download_lane="standard",
         )
+        if self._artifact_cleanup_enabled():
+            self._cleanup_delivered_artifacts_once(self.store)
 
     def _worker_loop(self, index: int, download_lane: str = "standard") -> None:
         owner = (
@@ -552,6 +566,281 @@ class BackupService:
                         self.logger.exception("could not close Telegram delivery transport")
                 if store is not None:
                     store.close()
+
+    def _artifact_cleanup_loop(self) -> None:
+        """Periodically apply process and complete-backup retention policies."""
+
+        while not self._stop_event.is_set():
+            store: Store | None = None
+            try:
+                store = Store(self.config.db_path)
+                store.initialize()
+                while not self._stop_event.is_set():
+                    self._cleanup_delivered_artifacts_once(store)
+                    if self._stop_event.wait(ARTIFACT_CLEANUP_INTERVAL_SECONDS):
+                        break
+            except Exception:
+                self.logger.exception(
+                    "artifact cleanup worker crashed; reconnecting"
+                )
+                self._stop_event.wait(60)
+            finally:
+                if store is not None:
+                    store.close()
+
+    def _artifact_cleanup_enabled(self) -> bool:
+        storage = self.config.storage
+        return (
+            storage.archive_dir is not None
+            or storage.process_retention_hours > 0
+            or storage.backup_retention_hours > 0
+        )
+
+    def _cleanup_delivered_artifacts_once(self, store: Store) -> dict[str, int]:
+        """Run one bounded process/complete-backup retention sweep."""
+
+        summary = {
+            "candidates": 0,
+            "resources": 0,
+            "process_candidates": 0,
+            "process_resources": 0,
+            "master_candidates": 0,
+            "master_resources": 0,
+            "archive_candidates": 0,
+            "archive_resources": 0,
+            "archive_cleanup_sources": 0,
+            "archive_source_deleted": 0,
+            "archive_copied_bytes": 0,
+            "deleted_files": 0,
+            "missing_files": 0,
+            "skipped_resources": 0,
+            "failed_resources": 0,
+            "freed_bytes": 0,
+        }
+        if not self._artifact_cleanup_enabled():
+            return summary
+
+        storage = self.config.storage
+        if storage.archive_dir is not None:
+            cleanup_ids = store.list_archive_source_cleanup_candidates(
+                limit=ARTIFACT_CLEANUP_BATCH_SIZE,
+            )
+            for artifact_id in cleanup_ids:
+                if self._stop_event.is_set():
+                    break
+                try:
+                    cleanup = store.cleanup_archived_master_source(
+                        artifact_id,
+                        self.config.managed_storage_roots,
+                    )
+                except Exception as exc:
+                    summary["failed_resources"] += 1
+                    self.logger.warning(
+                        "archive source cleanup failed artifact=%s: %s",
+                        artifact_id,
+                        self._safe_error(exc),
+                    )
+                    continue
+                summary["archive_cleanup_sources"] += 1
+                if bool(cleanup["source_deleted"]):
+                    summary["archive_source_deleted"] += 1
+                if not bool(cleanup["completed"]):
+                    summary["failed_resources"] += 1
+
+            archive_before = (
+                datetime.now(timezone.utc)
+                - timedelta(hours=storage.archive_after_delivery_hours)
+            ).isoformat()
+            try:
+                store.validate_archive_destination(
+                    self.config.download_dir,
+                    storage.archive_dir,
+                    require_mount=storage.archive_require_mount,
+                )
+            except Exception as exc:
+                archive_candidates = []
+                self.logger.warning(
+                    "mounted archive is unavailable; new transfers were "
+                    "skipped: %s",
+                    self._safe_error(exc),
+                )
+            else:
+                archive_candidates = store.list_master_archive_candidates(
+                    archive_before,
+                    limit=ARTIFACT_CLEANUP_BATCH_SIZE,
+                )
+            summary["archive_candidates"] += len(archive_candidates)
+            summary["candidates"] += len(archive_candidates)
+            failed_archive_groups: set[str] = set()
+            for candidate in archive_candidates:
+                if self._stop_event.is_set():
+                    break
+                group_key = str(candidate["group_key"])
+                if group_key in failed_archive_groups:
+                    continue
+                artifact_id = int(candidate["artifact_id"])
+                resource = store.get_disk_resource(
+                    artifact_id,
+                    self.config.managed_storage_roots,
+                )
+                if resource is None:
+                    continue
+                try:
+                    archived = store.archive_master(
+                        artifact_id,
+                        self.config.download_dir,
+                        storage.archive_dir,
+                        expected_revision=str(resource["resource_revision"]),
+                        delivered_before=archive_before,
+                        require_mount=storage.archive_require_mount,
+                    )
+                except Exception as exc:
+                    failed_archive_groups.add(group_key)
+                    summary["failed_resources"] += 1
+                    self.logger.warning(
+                        "backup archive transfer failed group=%s artifact=%s: %s",
+                        group_key,
+                        artifact_id,
+                        self._safe_error(exc),
+                    )
+                    continue
+                if bool(archived.get("archived")):
+                    summary["archive_resources"] += 1
+                    summary["resources"] += 1
+                    summary["archive_copied_bytes"] += int(
+                        archived["copied_bytes"]
+                    )
+                    if bool(archived.get("source_deleted")):
+                        summary["archive_source_deleted"] += 1
+                if not bool(archived["completed"]):
+                    failed_archive_groups.add(group_key)
+                    if bool(archived.get("skipped")):
+                        summary["skipped_resources"] += 1
+                    else:
+                        summary["failed_resources"] += 1
+
+        policies: list[tuple[str, int]] = []
+        if storage.process_retention_hours > 0:
+            policies.append(("process", storage.process_retention_hours))
+        if storage.backup_retention_hours > 0:
+            policies.append(("master", storage.backup_retention_hours))
+
+        for scope, retention_hours in policies:
+            if self._stop_event.is_set():
+                break
+            retention_name = "backup" if scope == "master" else scope
+            delivered_before = (
+                datetime.now(timezone.utc) - timedelta(hours=retention_hours)
+            ).isoformat()
+            if scope == "process":
+                candidates = store.list_process_retention_candidates(
+                    delivered_before,
+                    limit=ARTIFACT_CLEANUP_BATCH_SIZE,
+                )
+            else:
+                candidates = store.list_delivery_retention_candidates(
+                    delivered_before,
+                    limit=ARTIFACT_CLEANUP_BATCH_SIZE,
+                )
+            summary[f"{scope}_candidates"] += len(candidates)
+            summary["candidates"] += len(candidates)
+
+            failed_groups: set[str] = set()
+            for candidate in candidates:
+                if self._stop_event.is_set():
+                    break
+                group_key = str(candidate["group_key"])
+                if group_key in failed_groups:
+                    continue
+                artifact_id = int(candidate["artifact_id"])
+                resource = store.get_disk_resource(
+                    artifact_id,
+                    self.config.managed_storage_roots,
+                )
+                if resource is None:
+                    continue
+                try:
+                    if scope == "process":
+                        result = store.purge_process_artifacts(
+                            artifact_id,
+                            self.config.managed_storage_roots,
+                            expected_revision=str(
+                                resource["resource_revision"]
+                            ),
+                            delivered_before=delivered_before,
+                        )
+                    else:
+                        result = store.purge_disk_resource(
+                            artifact_id,
+                            self.config.managed_storage_roots,
+                            expected_revision=str(
+                                resource["resource_revision"]
+                            ),
+                            source="delivery_retention",
+                            delivery_retention_before=delivered_before,
+                        )
+                except Exception as exc:
+                    failed_groups.add(group_key)
+                    summary["failed_resources"] += 1
+                    self.logger.warning(
+                        "artifact %s retention cleanup skipped "
+                        "group=%s artifact=%s: %s",
+                        retention_name,
+                        group_key,
+                        artifact_id,
+                        self._safe_error(exc),
+                    )
+                    continue
+                if not bool(result["completed"]):
+                    failed_groups.add(group_key)
+                    if bool(result.get("skipped")):
+                        summary["skipped_resources"] += 1
+                        self.logger.info(
+                            "artifact %s retention eligibility changed "
+                            "group=%s artifact=%s",
+                            retention_name,
+                            group_key,
+                            artifact_id,
+                        )
+                        continue
+                    summary["failed_resources"] += 1
+                    self.logger.warning(
+                        "artifact %s retention cleanup incomplete "
+                        "group=%s artifact=%s errors=%s",
+                        retention_name,
+                        group_key,
+                        artifact_id,
+                        result.get("errors") or [],
+                    )
+                    continue
+                summary["resources"] += 1
+                summary[f"{scope}_resources"] += 1
+                summary["deleted_files"] += int(result["deleted_files"])
+                summary["missing_files"] += int(result["missing_files"])
+                summary["freed_bytes"] += int(result["freed_bytes"])
+
+        if (
+            summary["resources"]
+            or summary["skipped_resources"]
+            or summary["failed_resources"]
+        ):
+            self.logger.info(
+                "artifact retention cleanup candidates=%d resources=%d "
+                "archive=%d process=%d backup=%d files=%d missing=%d "
+                "skipped=%d failed=%d freed_bytes=%d archive_bytes=%d",
+                summary["candidates"],
+                summary["resources"],
+                summary["archive_resources"],
+                summary["process_resources"],
+                summary["master_resources"],
+                summary["deleted_files"],
+                summary["missing_files"],
+                summary["skipped_resources"],
+                summary["failed_resources"],
+                summary["freed_bytes"],
+                summary["archive_copied_bytes"],
+            )
+        return summary
 
     def _control_loop(self) -> None:
         if not self.config.telegram.bot_token:
@@ -1062,7 +1351,7 @@ class BackupService:
             store.defer_job(
                 job,
                 reason_code="artifact_missing",
-                error="master artifact is missing; download requeued",
+                error="complete backup file is missing; download requeued",
                 retry_seconds=self.config.app.retry_seconds,
             )
             return

@@ -82,6 +82,15 @@ class DownloadConfig:
 
 
 @dataclass(frozen=True)
+class StorageConfig:
+    process_retention_hours: int = 0
+    backup_retention_hours: int = 0
+    archive_dir: Path | None = None
+    archive_after_delivery_hours: int = 24
+    archive_require_mount: bool = True
+
+
+@dataclass(frozen=True)
 class MtprotoConfig:
     api_id: int | None = None
     api_hash: str = ""
@@ -196,6 +205,7 @@ class Config:
     app: AppConfig
     feeds: list[FeedConfig]
     download: DownloadConfig
+    storage: StorageConfig
     telegram: TelegramConfig
     control: ControlConfig
     sources: SourcesConfig
@@ -214,6 +224,13 @@ class Config:
     @property
     def download_dir(self) -> Path:
         return self.app.data_dir / "downloads"
+
+    @property
+    def managed_storage_roots(self) -> tuple[Path, ...]:
+        roots = [self.download_dir]
+        if self.storage.archive_dir is not None:
+            roots.append(self.storage.archive_dir)
+        return tuple(roots)
 
     @property
     def archive_file(self) -> Path:
@@ -370,6 +387,44 @@ def load_config(path: str | Path) -> Config:
     if not 1 <= telegram.bot_api.max_upload_parts <= 10:
         raise ValueError("telegram.bot_api.max_upload_parts must be between 1 and 10")
 
+    storage_raw = raw.get("storage", {})
+    if not isinstance(storage_raw, dict):
+        raise ValueError("storage must be a table")
+    archive_dir = _optional_archive_dir(
+        storage_raw.get("archive_dir", ""),
+        label="storage.archive_dir",
+    )
+    storage = StorageConfig(
+        process_retention_hours=_strict_non_negative_int(
+            storage_raw.get("process_retention_hours", 0),
+            label="storage.process_retention_hours",
+        ),
+        backup_retention_hours=_strict_non_negative_int(
+            storage_raw.get("backup_retention_hours", 0),
+            label="storage.backup_retention_hours",
+        ),
+        archive_dir=archive_dir,
+        archive_after_delivery_hours=_strict_non_negative_int(
+            storage_raw.get("archive_after_delivery_hours", 24),
+            label="storage.archive_after_delivery_hours",
+        ),
+        archive_require_mount=_strict_bool(
+            storage_raw.get("archive_require_mount", True),
+            label="storage.archive_require_mount",
+        ),
+    )
+    if archive_dir is not None:
+        download_root = (app.data_dir / "downloads").resolve(strict=False)
+        archive_root = archive_dir.resolve(strict=False)
+        if (
+            archive_root == download_root
+            or archive_root in download_root.parents
+            or download_root in archive_root.parents
+        ):
+            raise ValueError(
+                "storage.archive_dir must be separate from the downloads directory"
+            )
+
     twitch_raw = raw.get("twitch", {})
     client_id_env = str(twitch_raw.get("client_id_env", "TWITCH_CLIENT_ID"))
     access_token_env = str(twitch_raw.get("access_token_env", "TWITCH_ACCESS_TOKEN"))
@@ -484,6 +539,7 @@ def load_config(path: str | Path) -> Config:
         app=app,
         feeds=feeds,
         download=download,
+        storage=storage,
         telegram=telegram,
         control=control,
         sources=sources,
@@ -658,6 +714,24 @@ def _strict_bool(value: object, *, label: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{label} must be true or false")
     return value
+
+
+def _strict_non_negative_int(value: object, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{label} must be a non-negative integer")
+    return value
+
+
+def _optional_archive_dir(value: object, *, label: str) -> Path | None:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be an absolute path or empty")
+    normalized = value.strip()
+    if not normalized:
+        return None
+    path = Path(normalized).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be an absolute path or empty")
+    return path
 
 
 def _optional_api_base(value: object, *, label: str) -> str:

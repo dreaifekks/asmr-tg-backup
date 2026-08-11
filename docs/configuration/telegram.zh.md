@@ -158,4 +158,4 @@ caption 放在第一项。如果文件无法在 `max_upload_parts` 内装下，�
 `{video_id}` 和 `{tag}`。`media_type` 接受 `audio`、`video` 或 `document`；
 `send_as_document = true` 会强制使用 document 投递。
 
-上传失败不会删除本地归档主文件。
+上传失败不会删除本地完整备份文件。

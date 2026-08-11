@@ -9,9 +9,45 @@ import unittest
 from unittest import mock
 
 from ytb_tg_backup import setup
+from ytb_tg_backup.config import load_config
 
 
 class SetupTest(unittest.TestCase):
+    def test_generated_config_uses_process_retention_and_keeps_master(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "config" / "config.toml"
+            answers = setup.SetupAnswers(
+                profile="source-mtproto",
+                upload_transport="mtproto",
+                bot_token="123456:secret",
+                chat_id="@archive",
+                allowed_user_id="12345",
+                mtproto_api_id=12345,
+                mtproto_api_hash="0123456789abcdef0123456789abcdef",
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"XDG_DATA_HOME": str(root / "data")},
+            ):
+                setup._write_setup_config(output, answers)
+                config = load_config(output)
+
+            self.assertIn(
+                "[storage]\nprocess_retention_hours = 24\n"
+                "backup_retention_hours = 0\n"
+                'archive_dir = ""\n'
+                "archive_after_delivery_hours = 24\n"
+                "archive_require_mount = true",
+                output.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(config.storage.process_retention_hours, 24)
+            self.assertEqual(config.storage.backup_retention_hours, 0)
+            self.assertIsNone(config.storage.archive_dir)
+            self.assertEqual(config.storage.archive_after_delivery_hours, 24)
+            self.assertTrue(config.storage.archive_require_mount)
+            self.assertFalse(config.control.allow_disk_delete)
+
     def test_managed_service_inspection_matches_exact_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

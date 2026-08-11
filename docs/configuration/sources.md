@@ -249,8 +249,36 @@ The `[download]` table in `config.toml` controls yt-dlp and ffmpeg.
 Provider-specific tables such as `[download.provider_profiles.twitch]` override
 format and audio extraction for one provider. The default keeps M4A audio. If a
 profile keeps video while Telegram sends audio, the service creates a separate
-delivery derivative without replacing the video master.
+delivery derivative without replacing the complete video backup.
 
-Downloaded masters, thumbnails, delivery derivatives, and live segments remain
+Complete backup files, thumbnails, delivery files, and live segments remain
 under the application data directory. See [Operate](../operations.md) before
-changing that directory or deleting files.
+changing that directory.
+
+## Automatic local retention {#automatic-local-retention}
+
+New setup configs remove temporary recording and Telegram upload files one day
+after a successful delivery. Complete backup files are kept:
+
+```toml
+[storage]
+process_retention_hours = 24
+backup_retention_hours = 0
+archive_dir = ""
+archive_after_delivery_hours = 24
+archive_require_mount = true
+```
+
+`process_retention_hours` controls temporary files. `backup_retention_hours`
+controls complete backup files. A value of `0` keeps that category
+indefinitely.
+
+To move complete backup files instead of keeping them below `downloads`, set
+`archive_dir` to an existing directory on the mounted disk. The move happens
+after `archive_after_delivery_hours`; keep `archive_require_mount = true` for
+mounted storage. The directory may be a subdirectory of the mount.
+
+SQLite records completed deliveries and the current location of each backup;
+the media content remains as normal files in the configured storage. For
+Docker, expose the mounted directory as a bind mount and use its container
+path. Restart the service after changing these settings.

@@ -128,7 +128,7 @@ Docker 部署包含两个持久层：
 在 Compose 项目目录创建 `Dockerfile.extensions`：
 
 ```dockerfile
-ARG CORE_VERSION=0.6.3
+ARG CORE_VERSION=0.6.4
 FROM ghcr.io/dreaifekks/asmr-tg-backup:${CORE_VERSION}
 
 ARG PROXY_ROUTER_VERSION=0.2.0
@@ -143,17 +143,17 @@ RUN python -m pip install --no-cache-dir \
 
 ```bash
 docker build --pull \
-  --build-arg CORE_VERSION=0.6.3 \
+  --build-arg CORE_VERSION=0.6.4 \
   --build-arg PROXY_ROUTER_VERSION=0.2.0 \
   --build-arg NICONICO_ORIGIN_VERSION=0.2.0 \
   -f Dockerfile.extensions \
-  -t asmr-tg-backup:0.6.3-extensions .
+  -t asmr-tg-backup:0.6.4-extensions .
 ```
 
 在 `.env` 中选择这个镜像：
 
 ```dotenv
-ASMR_TG_BACKUP_IMAGE=asmr-tg-backup:0.6.3-extensions
+ASMR_TG_BACKUP_IMAGE=asmr-tg-backup:0.6.4-extensions
 ```
 
 ### 2. 启用已安装的 ID

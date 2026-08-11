@@ -157,5 +157,13 @@ allow_disk_delete = true
 
 Restart after changing this setting. Deletion still requires authorization, a
 current panel session, and resource-specific confirmation. Only exact tracked
-regular files below the download root are eligible; database history and
-existing Telegram messages remain.
+regular files below a configured managed storage root are eligible; this
+includes an enabled mounted `[storage].archive_dir`. Database history and
+existing Telegram messages remain. An unavailable archive mount is shown as an
+unsafe/missing resource and is never treated as permission to delete another
+path.
+
+`allow_disk_delete` controls only deletion started from the Panel. Automatic
+cleanup and mounted storage use `[storage].process_retention_hours`,
+`[storage].backup_retention_hours`, and `archive_dir`. See
+[Automatic local retention](sources.md#automatic-local-retention).

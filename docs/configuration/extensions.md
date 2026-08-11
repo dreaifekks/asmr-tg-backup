@@ -150,7 +150,7 @@ The two trusted extensions use these exact package names and runtime IDs:
 In the Compose checkout, create `Dockerfile.extensions`:
 
 ```dockerfile
-ARG CORE_VERSION=0.6.3
+ARG CORE_VERSION=0.6.4
 FROM ghcr.io/dreaifekks/asmr-tg-backup:${CORE_VERSION}
 
 ARG PROXY_ROUTER_VERSION=0.2.0
@@ -166,17 +166,17 @@ tag so upgrades and rollbacks remain explicit:
 
 ```bash
 docker build --pull \
-  --build-arg CORE_VERSION=0.6.3 \
+  --build-arg CORE_VERSION=0.6.4 \
   --build-arg PROXY_ROUTER_VERSION=0.2.0 \
   --build-arg NICONICO_ORIGIN_VERSION=0.2.0 \
   -f Dockerfile.extensions \
-  -t asmr-tg-backup:0.6.3-extensions .
+  -t asmr-tg-backup:0.6.4-extensions .
 ```
 
 Select that image in `.env`:
 
 ```dotenv
-ASMR_TG_BACKUP_IMAGE=asmr-tg-backup:0.6.3-extensions
+ASMR_TG_BACKUP_IMAGE=asmr-tg-backup:0.6.4-extensions
 ```
 
 ### 2. Enable the installed IDs

@@ -13,7 +13,13 @@ from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
 from ytb_tg_backup.store import LEGACY_SCHEMA, Store, now_iso
 
 
-def candidate(provider: str, external_id: str, *, kind: str = "video") -> MediaCandidate:
+def candidate(
+    provider: str,
+    external_id: str,
+    *,
+    kind: str = "video",
+    metadata: dict[str, object] | None = None,
+) -> MediaCandidate:
     return MediaCandidate(
         provider=provider,
         content_kind=kind,
@@ -21,10 +27,61 @@ def candidate(provider: str, external_id: str, *, kind: str = "video") -> MediaC
         title=f"{provider} {external_id}",
         url=f"https://example.invalid/{provider}/{external_id}",
         published_at=None,
+        metadata=metadata or {},
     )
 
 
 class StoreV2Test(unittest.TestCase):
+    def _complete_download_for_media(
+        self,
+        store: Store,
+        media_id: int,
+        path: Path,
+        *,
+        destination: str | None = None,
+        delivered_at: str | None = None,
+    ) -> int:
+        path.write_bytes(b"audio")
+        job = store.claim_next_job(
+            ("download",),
+            owner=f"download-{media_id}",
+            lease_seconds=60,
+        )
+        self.assertIsNotNone(job)
+        self.assertEqual(job.media_id, media_id)
+        artifact_id = store.complete_download(
+            job,
+            path=path,
+            size_bytes=path.stat().st_size,
+            delivery_targets=((destination,) if destination else ()),
+        )
+        if destination is None:
+            return artifact_id
+        delivery = store.claim_next_job(
+            ("telegram_delivery",),
+            owner=f"delivery-{media_id}",
+            lease_seconds=60,
+        )
+        self.assertIsNotNone(delivery)
+        self.assertEqual(delivery.media_id, media_id)
+        store.complete_delivery(
+            delivery,
+            artifact_id=artifact_id,
+            destination_key=destination,
+            remote_id=str(media_id),
+        )
+        if delivered_at is not None:
+            store.conn.execute(
+                """
+                UPDATE deliveries SET delivered_at=?
+                WHERE media_id=? AND sink='telegram'
+                  AND destination_key=?
+                """,
+                (delivered_at, media_id, destination),
+            )
+            store.conn.commit()
+        return artifact_id
+
     def test_panel_snapshot_is_materialized_and_invalidated_by_relevant_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.db")
@@ -426,6 +483,3020 @@ class StoreV2Test(unittest.TestCase):
             row = store.conn.execute("SELECT state, reason_code FROM jobs WHERE id=?", (delivery.id,)).fetchone()
             self.assertEqual(tuple(row), ("retry", "worker_recovered"))
             self.assertIsNotNone(store.claim_next_job(("telegram_delivery",), owner="other", lease_seconds=60))
+
+    def test_delivery_retention_candidates_require_cutoff_and_terminal_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            now = datetime.now(timezone.utc)
+            delivered_before = (now - timedelta(hours=48)).isoformat()
+            old_delivery = (now - timedelta(hours=72)).isoformat()
+            recent_delivery = (now - timedelta(hours=1)).isoformat()
+
+            old_media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "retention-old"),
+            )
+            old_artifact_id = self._complete_download_for_media(
+                store,
+                old_media_id,
+                root / "retention-old.m4a",
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            recent_media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "retention-recent"),
+            )
+            self._complete_download_for_media(
+                store,
+                recent_media_id,
+                root / "retention-recent.m4a",
+                destination="telegram:@archive",
+                delivered_at=recent_delivery,
+            )
+            undelivered_media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "retention-undelivered"),
+            )
+            self._complete_download_for_media(
+                store,
+                undelivered_media_id,
+                root / "retention-undelivered.m4a",
+            )
+
+            candidates = store.list_delivery_retention_candidates(
+                delivered_before
+            )
+            self.assertEqual(
+                candidates,
+                [
+                    {
+                        "group_key": f"media:{old_media_id}",
+                        "artifact_id": old_artifact_id,
+                        "media_id": old_media_id,
+                        "artifact_state": "ready",
+                        "delivered_at": old_delivery,
+                    }
+                ],
+            )
+
+            extra_job_id = store.ensure_delivery_job(
+                old_media_id,
+                "telegram:@extra",
+            )
+            for state in ("queued", "retry", "running", "blocked", "uncertain"):
+                store.conn.execute(
+                    "UPDATE jobs SET state=? WHERE id=?",
+                    (state, extra_job_id),
+                )
+                store.conn.commit()
+                self.assertEqual(
+                    store.list_delivery_retention_candidates(
+                        delivered_before
+                    ),
+                    [],
+                    state,
+                )
+
+            store.conn.execute(
+                "UPDATE jobs SET state='succeeded' WHERE id=?",
+                (extra_job_id,),
+            )
+            store.conn.execute(
+                """
+                INSERT INTO deliveries(
+                  media_id, artifact_id, sink, destination_key,
+                  remote_id, delivered_at
+                ) VALUES (?, ?, 'telegram', 'telegram:@extra', 'new', ?)
+                """,
+                (old_media_id, old_artifact_id, recent_delivery),
+            )
+            store.conn.commit()
+            self.assertEqual(
+                store.list_delivery_retention_candidates(delivered_before),
+                [],
+            )
+
+            store.conn.execute(
+                """
+                UPDATE deliveries SET delivered_at=?
+                WHERE media_id=? AND destination_key='telegram:@extra'
+                """,
+                (old_delivery, old_media_id),
+            )
+            store.conn.commit()
+            self.assertEqual(
+                store.list_delivery_retention_candidates(
+                    delivered_before,
+                    limit=1,
+                )[0]["artifact_id"],
+                old_artifact_id,
+            )
+
+    def test_master_archive_moves_verified_file_and_keeps_multi_root_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            download_root = Path(tmp) / "downloads"
+            archive_root = Path(tmp) / "mounted-archive"
+            download_root.mkdir()
+            archive_root.mkdir()
+            roots = (download_root, archive_root)
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "archive-master"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_path = download_root / "youtube" / "archive-master.m4a"
+            master_path.parent.mkdir()
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                master_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            segment_path = download_root / "archive-master.segment.ts"
+            segment_path.write_bytes(b"segment")
+            store.record_live_segment(
+                media_id,
+                path=segment_path,
+                size_bytes=segment_path.stat().st_size,
+            )
+
+            self.assertEqual(
+                store.list_master_archive_candidates(cutoff)[0][
+                    "artifact_id"
+                ],
+                master_id,
+            )
+            detail = store.get_disk_resource(master_id, roots)
+            archived = store.archive_master(
+                master_id,
+                download_root,
+                archive_root,
+                expected_revision=str(detail["resource_revision"]),
+                delivered_before=cutoff,
+                require_mount=False,
+            )
+
+            archived_path = archive_root / "youtube" / "archive-master.m4a"
+            self.assertTrue(archived["completed"])
+            self.assertTrue(archived["source_deleted"])
+            self.assertFalse(master_path.exists())
+            self.assertEqual(archived_path.read_bytes(), b"audio")
+            master = store.get_artifact(media_id)
+            self.assertEqual(Path(str(master["path"])), archived_path)
+            archive_metadata = json.loads(str(master["metadata_json"]))[
+                "archive"
+            ]
+            self.assertEqual(
+                archive_metadata["backend"],
+                "mounted_filesystem",
+            )
+            self.assertEqual(
+                archive_metadata["verified_at"],
+                archive_metadata["archived_at"],
+            )
+            self.assertFalse(archive_metadata["source_cleanup_pending"])
+            self.assertEqual(len(archive_metadata["sha256"]), 64)
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT COUNT(*) FROM artifact_archive_moves"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(store.list_master_archive_candidates(cutoff), [])
+
+            process_detail = store.get_disk_resource(master_id, roots)
+            process_result = store.purge_process_artifacts(
+                master_id,
+                roots,
+                expected_revision=str(process_detail["resource_revision"]),
+                delivered_before=cutoff,
+            )
+            self.assertTrue(process_result["completed"])
+            self.assertTrue(archived_path.exists())
+            self.assertFalse(segment_path.exists())
+
+            purge_detail = store.get_disk_resource(master_id, roots)
+            purge_result = store.purge_disk_resource(
+                master_id,
+                roots,
+                expected_revision=str(purge_detail["resource_revision"]),
+            )
+            self.assertTrue(purge_result["completed"])
+            self.assertFalse(archived_path.exists())
+
+    def test_master_archive_requires_mount_and_preserves_target_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            download_root = Path(tmp) / "downloads"
+            archive_root = Path(tmp) / "ordinary-directory"
+            download_root.mkdir()
+            archive_root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "archive-guard"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_path = download_root / "archive-guard.m4a"
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                master_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            roots = (download_root, archive_root)
+            detail = store.get_disk_resource(master_id, roots)
+
+            with (
+                mock.patch.object(
+                    store_module,
+                    "_is_on_nonroot_mount",
+                    return_value=False,
+                ),
+                self.assertRaisesRegex(ValueError, "on a non-root mount"),
+            ):
+                store.archive_master(
+                    master_id,
+                    download_root,
+                    archive_root,
+                    expected_revision=str(detail["resource_revision"]),
+                    delivered_before=cutoff,
+                )
+            self.assertTrue(master_path.exists())
+            self.assertEqual(store.get_artifact(media_id)["path"], str(master_path))
+
+            collision = archive_root / "archive-guard.m4a"
+            collision.write_bytes(b"different archive")
+            with self.assertRaisesRegex(ValueError, "different content"):
+                store.archive_master(
+                    master_id,
+                    download_root,
+                    archive_root,
+                    expected_revision=str(detail["resource_revision"]),
+                    delivered_before=cutoff,
+                    require_mount=False,
+                )
+            self.assertEqual(collision.read_bytes(), b"different archive")
+            self.assertTrue(master_path.exists())
+            self.assertEqual(store.get_artifact(media_id)["path"], str(master_path))
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT state FROM artifact_archive_moves WHERE artifact_id=?",
+                    (master_id,),
+                ).fetchone()[0],
+                "retry",
+            )
+
+            with self.assertRaisesRegex(ValueError, "archive directory"):
+                store.purge_disk_resource(
+                    master_id,
+                    roots,
+                    expected_revision=str(detail["resource_revision"]),
+                )
+            self.assertTrue(master_path.exists())
+            self.assertEqual(collision.read_bytes(), b"different archive")
+
+    def test_master_archive_rejects_target_that_aliases_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            download_root = Path(tmp) / "downloads"
+            archive_root = Path(tmp) / "archive"
+            download_root.mkdir()
+            archive_root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "archive-alias"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_path = download_root / "archive-alias.m4a"
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                master_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            target = archive_root / master_path.name
+            target.hardlink_to(master_path)
+            detail = store.get_disk_resource(
+                master_id,
+                (download_root, archive_root),
+            )
+
+            with self.assertRaisesRegex(ValueError, "aliases the source"):
+                store.archive_master(
+                    master_id,
+                    download_root,
+                    archive_root,
+                    expected_revision=str(detail["resource_revision"]),
+                    delivered_before=cutoff,
+                    require_mount=False,
+                )
+
+            self.assertTrue(master_path.exists())
+            self.assertTrue(target.exists())
+            self.assertEqual(store.get_artifact(media_id)["path"], str(master_path))
+
+    def test_master_archive_retries_source_cleanup_after_interruption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            download_root = Path(tmp) / "downloads"
+            archive_root = Path(tmp) / "archive"
+            download_root.mkdir()
+            archive_root.mkdir()
+            roots = (download_root, archive_root)
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "archive-cleanup"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_path = download_root / "archive-cleanup.m4a"
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                master_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            detail = store.get_disk_resource(master_id, roots)
+            with mock.patch.object(
+                store,
+                "cleanup_archived_master_source",
+                return_value={
+                    "completed": False,
+                    "source_deleted": False,
+                    "errors": ["simulated interruption"],
+                },
+            ):
+                archived = store.archive_master(
+                    master_id,
+                    download_root,
+                    archive_root,
+                    expected_revision=str(detail["resource_revision"]),
+                    delivered_before=cutoff,
+                    require_mount=False,
+                )
+            self.assertTrue(archived["archived"])
+            self.assertFalse(archived["completed"])
+            self.assertTrue(master_path.exists())
+            self.assertEqual(
+                store.list_archive_source_cleanup_candidates(),
+                [master_id],
+            )
+
+            cleanup = Store.cleanup_archived_master_source(
+                store,
+                master_id,
+                roots,
+            )
+            self.assertTrue(cleanup["completed"])
+            self.assertTrue(cleanup["source_deleted"])
+            self.assertFalse(master_path.exists())
+            self.assertEqual(store.list_archive_source_cleanup_candidates(), [])
+
+    def test_master_archive_phase_two_rechecks_job_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            download_root = Path(tmp) / "downloads"
+            archive_root = Path(tmp) / "archive"
+            download_root.mkdir()
+            archive_root.mkdir()
+            roots = (download_root, archive_root)
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "archive-job-race"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_path = download_root / "archive-job-race.m4a"
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                master_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            detail = store.get_disk_resource(master_id, roots)
+            original_copy = store_module._copy_file_to_archive
+
+            def add_job_after_copy(*args, **kwargs):
+                copied = original_copy(*args, **kwargs)
+                store.ensure_delivery_job(media_id, "telegram:@new")
+                return copied
+
+            with mock.patch.object(
+                store_module,
+                "_copy_file_to_archive",
+                side_effect=add_job_after_copy,
+            ):
+                result = store.archive_master(
+                    master_id,
+                    download_root,
+                    archive_root,
+                    expected_revision=str(detail["resource_revision"]),
+                    delivered_before=cutoff,
+                    require_mount=False,
+                )
+
+            self.assertTrue(result["skipped"])
+            self.assertFalse(result["archived"])
+            self.assertTrue(master_path.exists())
+            self.assertEqual(store.get_artifact(media_id)["path"], str(master_path))
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT state FROM artifact_archive_moves WHERE artifact_id=?",
+                    (master_id,),
+                ).fetchone()[0],
+                "retry",
+            )
+
+            store.conn.execute(
+                """
+                UPDATE jobs SET state='cancelled'
+                WHERE media_id=? AND job_type='telegram_delivery'
+                  AND target_key='telegram:@new'
+                """,
+                (media_id,),
+            )
+            store.conn.commit()
+            retry_detail = store.get_disk_resource(master_id, roots)
+            retried = store.archive_master(
+                master_id,
+                download_root,
+                archive_root,
+                expected_revision=str(retry_detail["resource_revision"]),
+                delivered_before=cutoff,
+                require_mount=False,
+            )
+            self.assertTrue(retried["completed"])
+            self.assertTrue(retried["source_deleted"])
+            self.assertFalse(master_path.exists())
+            self.assertEqual(Path(str(retried["path"])).read_bytes(), b"audio")
+
+    def test_master_archive_recovers_dead_copy_claim_as_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            download_root = Path(tmp) / "downloads"
+            archive_root = Path(tmp) / "archive"
+            download_root.mkdir()
+            archive_root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "archive-recovery"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_path = download_root / "archive-recovery.m4a"
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                master_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            detail = store.get_disk_resource(master_id, download_root)
+
+            with (
+                mock.patch.object(
+                    store_module,
+                    "_copy_file_to_archive",
+                    side_effect=SystemExit("simulated process death"),
+                ),
+                self.assertRaises(SystemExit),
+            ):
+                store.archive_master(
+                    master_id,
+                    download_root,
+                    archive_root,
+                    expected_revision=str(detail["resource_revision"]),
+                    delivered_before=cutoff,
+                    require_mount=False,
+                )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT state FROM artifact_archive_moves WHERE artifact_id=?",
+                    (master_id,),
+                ).fetchone()[0],
+                "copying",
+            )
+            store.close()
+
+            recovered = Store(db_path)
+            with mock.patch.object(
+                store_module,
+                "_process_instance_is_alive",
+                return_value=False,
+            ):
+                recovered.initialize()
+            move = recovered.conn.execute(
+                """
+                SELECT state, owner_pid, owner_start_id
+                FROM artifact_archive_moves WHERE artifact_id=?
+                """,
+                (master_id,),
+            ).fetchone()
+            self.assertEqual(tuple(move), ("retry", 0, ""))
+            candidate_row = recovered.list_master_archive_candidates(cutoff)[0]
+            self.assertEqual(candidate_row["artifact_id"], master_id)
+            self.assertEqual(candidate_row["move_state"], "retry")
+            self.assertTrue(master_path.exists())
+
+    def test_master_archive_cleanup_keeps_changed_source_or_target(self):
+        for scenario in ("source-reused", "target-changed"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                download_root = Path(tmp) / "downloads"
+                archive_root = Path(tmp) / "archive"
+                download_root.mkdir()
+                archive_root.mkdir()
+                roots = (download_root, archive_root)
+                store = Store(Path(tmp) / "state.db")
+                store.initialize()
+                store.upsert_origin(
+                    Origin("yt", "youtube", "uploads", "YT", "UC-1")
+                )
+                media_id, _ = store.upsert_discovered(
+                    "yt",
+                    candidate("youtube", f"archive-{scenario}"),
+                )
+                old_delivery = (
+                    datetime.now(timezone.utc) - timedelta(hours=48)
+                ).isoformat()
+                cutoff = (
+                    datetime.now(timezone.utc) - timedelta(hours=24)
+                ).isoformat()
+                master_path = download_root / f"archive-{scenario}.m4a"
+                master_id = self._complete_download_for_media(
+                    store,
+                    media_id,
+                    master_path,
+                    destination="telegram:@archive",
+                    delivered_at=old_delivery,
+                )
+                detail = store.get_disk_resource(master_id, roots)
+                with mock.patch.object(
+                    store,
+                    "cleanup_archived_master_source",
+                    return_value={
+                        "completed": False,
+                        "source_deleted": False,
+                        "errors": ["simulated interruption"],
+                    },
+                ):
+                    archived = store.archive_master(
+                        master_id,
+                        download_root,
+                        archive_root,
+                        expected_revision=str(detail["resource_revision"]),
+                        delivered_before=cutoff,
+                        require_mount=False,
+                    )
+                archived_path = Path(str(archived["path"]))
+
+                if scenario == "source-reused":
+                    master_path.unlink()
+                    master_path.write_bytes(b"unknown replacement")
+                else:
+                    archived_path.write_bytes(b"corrupt archive target")
+                cleanup = Store.cleanup_archived_master_source(
+                    store,
+                    master_id,
+                    roots,
+                )
+
+                self.assertFalse(cleanup["completed"])
+                self.assertFalse(cleanup["source_deleted"])
+                self.assertTrue(master_path.exists())
+                if scenario == "source-reused":
+                    self.assertEqual(
+                        master_path.read_bytes(),
+                        b"unknown replacement",
+                    )
+                    expected_state = "orphaned"
+                else:
+                    self.assertEqual(master_path.read_bytes(), b"audio")
+                    expected_state = "source_cleanup"
+                self.assertEqual(
+                    store.conn.execute(
+                        """
+                        SELECT state FROM artifact_archive_moves
+                        WHERE artifact_id=?
+                        """,
+                        (master_id,),
+                    ).fetchone()[0],
+                    expected_state,
+                )
+
+    def test_master_archive_cleanup_keeps_source_after_mount_is_lost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            download_root = Path(tmp) / "downloads"
+            archive_root = Path(tmp) / "archive"
+            download_root.mkdir()
+            archive_root.mkdir()
+            roots = (download_root, archive_root)
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "archive-mount-lost"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_path = download_root / "archive-mount-lost.m4a"
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                master_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            detail = store.get_disk_resource(master_id, roots)
+            with (
+                mock.patch.object(
+                    store_module,
+                    "_is_on_nonroot_mount",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    store,
+                    "cleanup_archived_master_source",
+                    return_value={
+                        "completed": False,
+                        "source_deleted": False,
+                        "errors": ["simulated interruption"],
+                    },
+                ),
+            ):
+                archived = store.archive_master(
+                    master_id,
+                    download_root,
+                    archive_root,
+                    expected_revision=str(detail["resource_revision"]),
+                    delivered_before=cutoff,
+                )
+            self.assertTrue(archived["archived"])
+            with mock.patch.object(
+                store_module,
+                "_is_on_nonroot_mount",
+                return_value=False,
+            ):
+                cleanup = Store.cleanup_archived_master_source(
+                    store,
+                    master_id,
+                    roots,
+                )
+
+            self.assertFalse(cleanup["completed"])
+            self.assertFalse(cleanup["source_deleted"])
+            self.assertTrue(master_path.exists())
+            self.assertIn("not on a non-root mount", cleanup["errors"][0])
+            move = store.conn.execute(
+                """
+                SELECT state, error FROM artifact_archive_moves
+                WHERE artifact_id=?
+                """,
+                (master_id,),
+            ).fetchone()
+            self.assertEqual(move["state"], "source_cleanup")
+            self.assertIn("not on a non-root mount", move["error"])
+
+    def test_archive_directory_may_be_below_a_nonroot_mount(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount_root = Path(tmp) / "remote-mount"
+            archive_root = mount_root / "asmr-data"
+            archive_root.mkdir(parents=True)
+            mountinfo = (
+                f"1 0 0:1 / {mount_root} rw - fuse.remote remote rw\n"
+            )
+            with mock.patch.object(
+                store_module.Path,
+                "read_text",
+                return_value=mountinfo,
+            ):
+                self.assertTrue(
+                    store_module._is_on_nonroot_mount(archive_root)
+                )
+
+    def test_process_retention_candidates_are_media_local_and_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "TW", "streamer")
+            )
+            now = datetime.now(timezone.utc)
+            cutoff = (now - timedelta(hours=24)).isoformat()
+            old_delivery = (now - timedelta(hours=48)).isoformat()
+            recent_delivery = (now - timedelta(hours=1)).isoformat()
+            stream_id = "process-own-delivery"
+
+            delivered_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "process-delivered",
+                    kind="live_stream",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            delivered_artifact_id = self._complete_download_for_media(
+                store,
+                delivered_media_id,
+                root / "process-delivered.m4a",
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            delivered_segment = root / "process-delivered.segment.ts"
+            delivered_segment.write_bytes(b"segment")
+            store.record_live_segment(
+                delivered_media_id,
+                path=delivered_segment,
+                size_bytes=delivered_segment.stat().st_size,
+            )
+
+            sibling_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "process-undelivered-sibling",
+                    kind="vod",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            self._complete_download_for_media(
+                store,
+                sibling_media_id,
+                root / "process-undelivered-sibling.m4a",
+            )
+            sibling_upload = root / "process-undelivered-sibling.tg.m4a"
+            sibling_upload.write_bytes(b"upload")
+            store.record_artifact(
+                sibling_media_id,
+                role="telegram_upload",
+                path=sibling_upload,
+                size_bytes=sibling_upload.stat().st_size,
+            )
+
+            recent_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate("twitch", "process-recent"),
+            )
+            self._complete_download_for_media(
+                store,
+                recent_media_id,
+                root / "process-recent.m4a",
+                destination="telegram:@archive",
+                delivered_at=recent_delivery,
+            )
+            recent_upload = root / "process-recent.tg.m4a"
+            recent_upload.write_bytes(b"recent")
+            store.record_artifact(
+                recent_media_id,
+                role="telegram_upload",
+                path=recent_upload,
+                size_bytes=recent_upload.stat().st_size,
+            )
+
+            self.assertEqual(
+                store.list_process_retention_candidates(cutoff),
+                [
+                    {
+                        "group_key": f"media:{delivered_media_id}",
+                        "artifact_id": delivered_artifact_id,
+                        "media_id": delivered_media_id,
+                        "artifact_state": "ready",
+                        "delivered_at": old_delivery,
+                    }
+                ],
+            )
+
+            extra_job_id = store.ensure_delivery_job(
+                delivered_media_id,
+                "telegram:@extra",
+            )
+            for state in ("queued", "retry", "running", "blocked", "uncertain"):
+                store.conn.execute(
+                    "UPDATE jobs SET state=? WHERE id=?",
+                    (state, extra_job_id),
+                )
+                store.conn.commit()
+                self.assertEqual(
+                    store.list_process_retention_candidates(cutoff),
+                    [],
+                    state,
+                )
+            store.conn.execute(
+                "UPDATE jobs SET state='cancelled' WHERE id=?",
+                (extra_job_id,),
+            )
+            store.conn.commit()
+            self.assertEqual(
+                store.list_process_retention_candidates(cutoff)[0][
+                    "artifact_id"
+                ],
+                delivered_artifact_id,
+            )
+
+    def test_process_purge_keeps_master_and_allows_derivative_regeneration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "process-purge"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_path = root / "process-purge.m4a"
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                master_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            segment_path = root / "process-purge.segment.ts"
+            upload_path = root / "process-purge.tg.m4a"
+            thumbnail_path = root / "process-purge.tgthumb.jpg"
+            for path, payload in (
+                (segment_path, b"segment"),
+                (upload_path, b"upload"),
+                (thumbnail_path, b"thumbnail"),
+            ):
+                path.write_bytes(payload)
+            segment_part = store.record_live_segment(
+                media_id,
+                path=segment_path,
+                size_bytes=segment_path.stat().st_size,
+            )
+            upload_id = store.record_artifact(
+                media_id,
+                role="telegram_upload",
+                path=upload_path,
+                size_bytes=upload_path.stat().st_size,
+            )
+            thumbnail_id = store.record_artifact(
+                media_id,
+                role="thumbnail",
+                path=thumbnail_path,
+                size_bytes=thumbnail_path.stat().st_size,
+                metadata={"delivery_derivative": True},
+            )
+            segment_id = int(
+                store.conn.execute(
+                    """
+                    SELECT id FROM artifacts
+                    WHERE media_id=? AND role='live_segment' AND part_no=?
+                    """,
+                    (media_id, segment_part),
+                ).fetchone()[0]
+            )
+            detail = store.get_disk_resource(master_id, root)
+
+            result = store.purge_process_artifacts(
+                master_id,
+                root,
+                expected_revision=str(detail["resource_revision"]),
+                delivered_before=cutoff,
+            )
+
+            self.assertTrue(result["completed"])
+            self.assertEqual(result["deleted_files"], 3)
+            self.assertTrue(master_path.exists())
+            self.assertEqual(store.get_artifact(media_id)["state"], "ready")
+            for artifact_id, path in (
+                (segment_id, segment_path),
+                (upload_id, upload_path),
+                (thumbnail_id, thumbnail_path),
+            ):
+                self.assertFalse(path.exists())
+                self.assertEqual(
+                    store.conn.execute(
+                        "SELECT state FROM artifacts WHERE id=?",
+                        (artifact_id,),
+                    ).fetchone()[0],
+                    "purged",
+                )
+            self.assertEqual(
+                store.list_process_retention_candidates(cutoff),
+                [],
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT COUNT(*) FROM purge_path_reservations"
+                ).fetchone()[0],
+                0,
+            )
+
+            upload_path.write_bytes(b"new upload")
+            regenerated_id = store.record_artifact(
+                media_id,
+                role="telegram_upload",
+                path=upload_path,
+                size_bytes=upload_path.stat().st_size,
+            )
+            self.assertEqual(regenerated_id, upload_id)
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT state FROM artifacts WHERE id=?",
+                    (upload_id,),
+                ).fetchone()[0],
+                "ready",
+            )
+            self.assertEqual(
+                store.list_process_retention_candidates(cutoff)[0][
+                    "artifact_id"
+                ],
+                master_id,
+            )
+
+    def test_purged_live_segment_can_be_recorded_again_at_same_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "segment-regeneration"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                root / "segment-regeneration.m4a",
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            segment_path = root / "segment-regeneration.live.ts"
+            segment_path.write_bytes(b"old segment")
+            original_part = store.record_live_segment(
+                media_id,
+                path=segment_path,
+                size_bytes=segment_path.stat().st_size,
+                metadata={"attempt_order": 1},
+            )
+            segment_id = int(
+                store.conn.execute(
+                    """
+                    SELECT id FROM artifacts
+                    WHERE media_id=? AND role='live_segment' AND part_no=?
+                    """,
+                    (media_id, original_part),
+                ).fetchone()[0]
+            )
+            detail = store.get_disk_resource(master_id, root)
+            result = store.purge_process_artifacts(
+                master_id,
+                root,
+                expected_revision=str(detail["resource_revision"]),
+                delivered_before=cutoff,
+            )
+            self.assertTrue(result["completed"])
+            self.assertFalse(segment_path.exists())
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT COUNT(*) FROM purge_path_reservations"
+                ).fetchone()[0],
+                0,
+            )
+
+            segment_path.write_bytes(b"new longer segment")
+            regenerated_part = store.record_live_segment(
+                media_id,
+                path=segment_path,
+                size_bytes=segment_path.stat().st_size,
+                metadata={"attempt_order": 2},
+            )
+
+            self.assertEqual(regenerated_part, original_part)
+            regenerated = store.conn.execute(
+                """
+                SELECT id, state, size_bytes, metadata_json
+                FROM artifacts WHERE id=?
+                """,
+                (segment_id,),
+            ).fetchone()
+            self.assertEqual(int(regenerated["id"]), segment_id)
+            self.assertEqual(str(regenerated["state"]), "ready")
+            self.assertEqual(
+                int(regenerated["size_bytes"]),
+                segment_path.stat().st_size,
+            )
+            self.assertEqual(
+                json.loads(str(regenerated["metadata_json"])),
+                {"attempt_order": 2},
+            )
+            self.assertEqual(
+                store.list_process_retention_candidates(cutoff)[0][
+                    "artifact_id"
+                ],
+                master_id,
+            )
+
+    def test_purge_failed_live_segment_can_be_recorded_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "segment-failed-regeneration"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                root / "segment-failed-regeneration.m4a",
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            segment_path = root / "segment-failed-regeneration.live.ts"
+            segment_path.write_bytes(b"old segment")
+            part_no = store.record_live_segment(
+                media_id,
+                path=segment_path,
+                size_bytes=segment_path.stat().st_size,
+                metadata={"attempt_order": 1},
+            )
+            segment_id = int(
+                store.conn.execute(
+                    """
+                    SELECT id FROM artifacts
+                    WHERE media_id=? AND role='live_segment' AND part_no=?
+                    """,
+                    (media_id, part_no),
+                ).fetchone()[0]
+            )
+            detail = store.get_disk_resource(master_id, root)
+            with mock.patch.object(
+                store_module,
+                "_unlink_tracked_file",
+                side_effect=PermissionError("read-only filesystem"),
+            ):
+                failed = store.purge_process_artifacts(
+                    master_id,
+                    root,
+                    expected_revision=str(detail["resource_revision"]),
+                    delivered_before=cutoff,
+                )
+            self.assertFalse(failed["completed"])
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT state FROM artifacts WHERE id=?",
+                    (segment_id,),
+                ).fetchone()[0],
+                "purge_failed",
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT COUNT(*) FROM purge_path_reservations"
+                ).fetchone()[0],
+                0,
+            )
+
+            segment_path.write_bytes(b"replacement segment")
+            returned_part = store.record_live_segment(
+                media_id,
+                path=segment_path,
+                size_bytes=segment_path.stat().st_size,
+                metadata={"attempt_order": 9},
+            )
+
+            self.assertEqual(returned_part, part_no)
+            regenerated = store.conn.execute(
+                """
+                SELECT state, size_bytes, metadata_json
+                FROM artifacts WHERE id=?
+                """,
+                (segment_id,),
+            ).fetchone()
+            self.assertEqual(str(regenerated["state"]), "ready")
+            self.assertEqual(
+                int(regenerated["size_bytes"]),
+                segment_path.stat().st_size,
+            )
+            self.assertEqual(
+                json.loads(str(regenerated["metadata_json"])),
+                {"attempt_order": 9},
+            )
+
+    def test_process_retention_requires_explicit_thumbnail_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "legacy-thumbnail"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                root / "legacy-thumbnail.m4a",
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            thumbnail_path = root / "legacy-thumbnail.tgthumb.jpg"
+            thumbnail_path.write_bytes(b"legacy")
+            store.record_artifact(
+                media_id,
+                role="thumbnail",
+                path=thumbnail_path,
+                size_bytes=thumbnail_path.stat().st_size,
+            )
+
+            self.assertEqual(
+                store.list_process_retention_candidates(cutoff),
+                [],
+            )
+            detail = store.get_disk_resource(master_id, root)
+            result = store.purge_process_artifacts(
+                master_id,
+                root,
+                expected_revision=str(detail["resource_revision"]),
+                delivered_before=cutoff,
+            )
+            self.assertTrue(result["skipped"])
+            self.assertTrue(thumbnail_path.exists())
+            self.assertEqual(store.get_artifact(media_id)["state"], "ready")
+
+    def test_process_purge_rejects_paths_shared_with_retained_artifacts(self):
+        for shared_with_other_media in (False, True):
+            with self.subTest(shared_with_other_media=shared_with_other_media):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "downloads"
+                    root.mkdir()
+                    store = Store(Path(tmp) / "state.db")
+                    store.initialize()
+                    store.upsert_origin(
+                        Origin("yt", "youtube", "uploads", "YT", "UC-1")
+                    )
+                    media_id, _ = store.upsert_discovered(
+                        "yt",
+                        candidate(
+                            "youtube",
+                            f"process-shared-{shared_with_other_media}",
+                        ),
+                    )
+                    old_delivery = (
+                        datetime.now(timezone.utc) - timedelta(hours=48)
+                    ).isoformat()
+                    cutoff = (
+                        datetime.now(timezone.utc) - timedelta(hours=24)
+                    ).isoformat()
+                    master_path = root / "process-shared-master.m4a"
+                    master_id = self._complete_download_for_media(
+                        store,
+                        media_id,
+                        master_path,
+                        destination="telegram:@archive",
+                        delivered_at=old_delivery,
+                    )
+                    shared_path = master_path
+                    if shared_with_other_media:
+                        other_media_id, _ = store.upsert_discovered(
+                            "yt",
+                            candidate("youtube", "process-shared-other"),
+                        )
+                        shared_path = root / "process-shared-other.m4a"
+                        self._complete_download_for_media(
+                            store,
+                            other_media_id,
+                            shared_path,
+                        )
+                    upload_id = store.record_artifact(
+                        media_id,
+                        role="telegram_upload",
+                        path=shared_path,
+                        size_bytes=shared_path.stat().st_size,
+                    )
+                    detail = store.get_disk_resource(master_id, root)
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "another media item or retained artifact",
+                    ):
+                        store.purge_process_artifacts(
+                            master_id,
+                            root,
+                            expected_revision=str(
+                                detail["resource_revision"]
+                            ),
+                            delivered_before=cutoff,
+                        )
+
+                    self.assertTrue(master_path.exists())
+                    self.assertTrue(shared_path.exists())
+                    self.assertEqual(store.get_artifact(media_id)["state"], "ready")
+                    self.assertEqual(
+                        store.conn.execute(
+                            "SELECT state FROM artifacts WHERE id=?",
+                            (upload_id,),
+                        ).fetchone()[0],
+                        "ready",
+                    )
+                    self.assertEqual(
+                        store.conn.execute(
+                            "SELECT COUNT(*) FROM purge_path_reservations"
+                        ).fetchone()[0],
+                        0,
+                    )
+
+    def test_process_purge_phase_two_rechecks_job_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "process-job-race"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_path = root / "process-job-race.m4a"
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                master_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            upload_path = root / "process-job-race.tg.m4a"
+            upload_path.write_bytes(b"upload")
+            upload_id = store.record_artifact(
+                media_id,
+                role="telegram_upload",
+                path=upload_path,
+                size_bytes=upload_path.stat().st_size,
+            )
+            detail = store.get_disk_resource(master_id, root)
+            contender = Store(db_path)
+            contender.initialize()
+            original_purge = Store._purge_reserved_files
+
+            def queue_delivery_after_reservation(active_store: Store, **kwargs):
+                contender.ensure_delivery_job(media_id, "telegram:@new")
+                return original_purge(active_store, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    Store,
+                    "_purge_reserved_files",
+                    new=queue_delivery_after_reservation,
+                ):
+                    result = store.purge_process_artifacts(
+                        master_id,
+                        root,
+                        expected_revision=str(detail["resource_revision"]),
+                        delivered_before=cutoff,
+                    )
+            finally:
+                contender.close()
+
+            self.assertFalse(result["completed"])
+            self.assertTrue(result["skipped"])
+            self.assertTrue(master_path.exists())
+            self.assertTrue(upload_path.exists())
+            self.assertEqual(store.get_artifact(media_id)["state"], "ready")
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT state FROM artifacts WHERE id=?",
+                    (upload_id,),
+                ).fetchone()[0],
+                "ready",
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT COUNT(*) FROM purge_path_reservations"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_process_purge_phase_one_rechecks_delivery_and_anchor_state(self):
+        for change in ("delivery_deleted", "anchor_staged"):
+            with self.subTest(change=change):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "downloads"
+                    root.mkdir()
+                    store = Store(Path(tmp) / "state.db")
+                    store.initialize()
+                    store.upsert_origin(
+                        Origin("yt", "youtube", "uploads", "YT", "UC-1")
+                    )
+                    media_id, _ = store.upsert_discovered(
+                        "yt",
+                        candidate("youtube", f"process-phase-one-{change}"),
+                    )
+                    old_delivery = (
+                        datetime.now(timezone.utc) - timedelta(hours=48)
+                    ).isoformat()
+                    cutoff = (
+                        datetime.now(timezone.utc) - timedelta(hours=24)
+                    ).isoformat()
+                    master_path = root / f"process-phase-one-{change}.m4a"
+                    master_id = self._complete_download_for_media(
+                        store,
+                        media_id,
+                        master_path,
+                        destination="telegram:@archive",
+                        delivered_at=old_delivery,
+                    )
+                    upload_path = root / f"process-phase-one-{change}.tg.m4a"
+                    upload_path.write_bytes(b"upload")
+                    upload_id = store.record_artifact(
+                        media_id,
+                        role="telegram_upload",
+                        path=upload_path,
+                        size_bytes=upload_path.stat().st_size,
+                    )
+                    detail = store.get_disk_resource(master_id, root)
+                    if change == "delivery_deleted":
+                        store.conn.execute(
+                            "DELETE FROM deliveries WHERE media_id=?",
+                            (media_id,),
+                        )
+                    else:
+                        store.conn.execute(
+                            "UPDATE artifacts SET state='staged' WHERE id=?",
+                            (master_id,),
+                        )
+                    store.conn.commit()
+
+                    result = store.purge_process_artifacts(
+                        master_id,
+                        root,
+                        expected_revision=str(detail["resource_revision"]),
+                        delivered_before=cutoff,
+                    )
+
+                    self.assertFalse(result["completed"])
+                    self.assertTrue(result["skipped"])
+                    self.assertTrue(master_path.exists())
+                    self.assertTrue(upload_path.exists())
+                    self.assertEqual(
+                        store.conn.execute(
+                            "SELECT state FROM artifacts WHERE id=?",
+                            (upload_id,),
+                        ).fetchone()[0],
+                        "ready",
+                    )
+                    self.assertEqual(
+                        store.conn.execute(
+                            "SELECT COUNT(*) FROM purge_path_reservations"
+                        ).fetchone()[0],
+                        0,
+                    )
+
+    def test_process_retention_keeps_process_files_without_usable_master(self):
+        for master_condition in (
+            "purged",
+            "missing",
+            "unsafe",
+            "truncated",
+            "zero",
+        ):
+            with self.subTest(master_condition=master_condition):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "downloads"
+                    root.mkdir()
+                    store = Store(Path(tmp) / "state.db")
+                    store.initialize()
+                    store.upsert_origin(
+                        Origin("yt", "youtube", "uploads", "YT", "UC-1")
+                    )
+                    media_id, _ = store.upsert_discovered(
+                        "yt",
+                        candidate(
+                            "youtube",
+                            f"process-master-{master_condition}",
+                        ),
+                    )
+                    old_delivery = (
+                        datetime.now(timezone.utc) - timedelta(hours=48)
+                    ).isoformat()
+                    cutoff = (
+                        datetime.now(timezone.utc) - timedelta(hours=24)
+                    ).isoformat()
+                    master_path = (
+                        Path(tmp) / "outside-master.m4a"
+                        if master_condition == "unsafe"
+                        else root / f"process-master-{master_condition}.m4a"
+                    )
+                    master_id = self._complete_download_for_media(
+                        store,
+                        media_id,
+                        master_path,
+                        destination="telegram:@archive",
+                        delivered_at=old_delivery,
+                    )
+                    segment_path = (
+                        root / f"process-master-{master_condition}.segment.ts"
+                    )
+                    segment_path.write_bytes(b"only recoverable segment")
+                    store.record_live_segment(
+                        media_id,
+                        path=segment_path,
+                        size_bytes=segment_path.stat().st_size,
+                    )
+                    if master_condition == "purged":
+                        store.conn.execute(
+                            "UPDATE artifacts SET state='purged' WHERE id=?",
+                            (master_id,),
+                        )
+                        store.conn.commit()
+                        self.assertEqual(
+                            store.list_process_retention_candidates(cutoff),
+                            [],
+                        )
+                        process_anchor = int(
+                            store.list_disk_resources(root)["items"][0][
+                                "artifact_id"
+                            ]
+                        )
+                    else:
+                        if master_condition == "missing":
+                            master_path.unlink()
+                        elif master_condition == "truncated":
+                            master_path.write_bytes(b"a")
+                        elif master_condition == "zero":
+                            master_path.write_bytes(b"")
+                            store.conn.execute(
+                                "UPDATE artifacts SET size_bytes=0 WHERE id=?",
+                                (master_id,),
+                            )
+                            store.conn.commit()
+                        self.assertEqual(
+                            store.list_process_retention_candidates(cutoff)[0][
+                                "artifact_id"
+                            ],
+                            master_id,
+                        )
+                        process_anchor = master_id
+                    detail = store.get_disk_resource(process_anchor, root)
+
+                    result = store.purge_process_artifacts(
+                        process_anchor,
+                        root,
+                        expected_revision=str(detail["resource_revision"]),
+                        delivered_before=cutoff,
+                    )
+
+                    self.assertFalse(result["completed"])
+                    self.assertTrue(result["skipped"])
+                    self.assertTrue(segment_path.exists())
+                    self.assertEqual(
+                        store.conn.execute(
+                            """
+                            SELECT state FROM artifacts
+                            WHERE media_id=? AND role='live_segment'
+                            """,
+                            (media_id,),
+                        ).fetchone()[0],
+                        "ready",
+                    )
+                    self.assertEqual(
+                        store.conn.execute(
+                            "SELECT COUNT(*) FROM purge_path_reservations"
+                        ).fetchone()[0],
+                        0,
+                    )
+
+    def test_process_purge_stops_if_master_disappears_after_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "process-master-race"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_path = root / "process-master-race.m4a"
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                master_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            segment_path = root / "process-master-race.segment.ts"
+            segment_path.write_bytes(b"recoverable segment")
+            part_no = store.record_live_segment(
+                media_id,
+                path=segment_path,
+                size_bytes=segment_path.stat().st_size,
+            )
+            segment_id = int(
+                store.conn.execute(
+                    """
+                    SELECT id FROM artifacts
+                    WHERE media_id=? AND role='live_segment' AND part_no=?
+                    """,
+                    (media_id, part_no),
+                ).fetchone()[0]
+            )
+            detail = store.get_disk_resource(master_id, root)
+            original_purge = Store._purge_reserved_files
+
+            def remove_master_after_reservation(active_store: Store, **kwargs):
+                master_path.unlink()
+                return original_purge(active_store, **kwargs)
+
+            with mock.patch.object(
+                Store,
+                "_purge_reserved_files",
+                new=remove_master_after_reservation,
+            ):
+                result = store.purge_process_artifacts(
+                    master_id,
+                    root,
+                    expected_revision=str(detail["resource_revision"]),
+                    delivered_before=cutoff,
+                )
+
+            self.assertFalse(result["completed"])
+            self.assertFalse(result["skipped"])
+            self.assertTrue(segment_path.exists())
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT state FROM artifacts WHERE id=?",
+                    (segment_id,),
+                ).fetchone()[0],
+                "purge_failed",
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT COUNT(*) FROM purge_path_reservations"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_process_purge_crash_recovery_releases_missing_path_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "process-crash"),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            master_path = root / "process-crash.m4a"
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                master_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            upload_path = root / "process-crash.tg.m4a"
+            upload_path.write_bytes(b"upload")
+            upload_id = store.record_artifact(
+                media_id,
+                role="telegram_upload",
+                path=upload_path,
+                size_bytes=upload_path.stat().st_size,
+            )
+            detail = store.get_disk_resource(master_id, root)
+
+            with mock.patch.object(
+                store,
+                "_purge_reserved_files",
+                side_effect=RuntimeError("simulated process death"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "process death"):
+                    store.purge_process_artifacts(
+                        master_id,
+                        root,
+                        expected_revision=str(detail["resource_revision"]),
+                        delivered_before=cutoff,
+                    )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT state FROM artifacts WHERE id=?",
+                    (upload_id,),
+                ).fetchone()[0],
+                "purging",
+            )
+            upload_path.unlink()
+
+            recovered = Store(db_path)
+            try:
+                with mock.patch.object(
+                    store_module,
+                    "_process_instance_is_alive",
+                    return_value=False,
+                ):
+                    recovered.initialize()
+                self.assertEqual(
+                    recovered.conn.execute(
+                        "SELECT state FROM artifacts WHERE id=?",
+                        (upload_id,),
+                    ).fetchone()[0],
+                    "purged",
+                )
+                self.assertEqual(
+                    recovered.conn.execute(
+                        "SELECT COUNT(*) FROM purge_path_reservations"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    recovered.get_artifact(media_id)["state"],
+                    "ready",
+                )
+                self.assertTrue(master_path.exists())
+                self.assertEqual(
+                    recovered.list_process_retention_candidates(cutoff),
+                    [],
+                )
+            finally:
+                recovered.close()
+
+    def test_process_purge_does_not_pin_twitch_fallback_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "TW", "streamer")
+            )
+            stream_id = "process-no-pin"
+            vod_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "process-no-pin-vod",
+                    kind="vod",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            self._complete_download_for_media(
+                store,
+                vod_media_id,
+                root / "process-no-pin-vod.m4a",
+            )
+            live_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "process-no-pin-live",
+                    kind="live_stream",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            live_master_path = root / "process-no-pin-live.m4a"
+            live_master_id = self._complete_download_for_media(
+                store,
+                live_media_id,
+                live_master_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            segment_path = root / "process-no-pin-live.segment.ts"
+            segment_path.write_bytes(b"segment")
+            store.record_live_segment(
+                live_media_id,
+                path=segment_path,
+                size_bytes=segment_path.stat().st_size,
+            )
+            fallback_before = store.conn.execute(
+                """
+                SELECT state, reason_code FROM jobs
+                WHERE media_id=? AND job_type='download'
+                """,
+                (vod_media_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(fallback_before),
+                ("cancelled", "live_recording_exists"),
+            )
+            detail = store.get_disk_resource(live_master_id, root)
+
+            result = store.purge_process_artifacts(
+                live_master_id,
+                root,
+                expected_revision=str(detail["resource_revision"]),
+                delivered_before=cutoff,
+            )
+
+            self.assertTrue(result["completed"])
+            self.assertFalse(segment_path.exists())
+            self.assertTrue(live_master_path.exists())
+            fallback_after = store.conn.execute(
+                """
+                SELECT state, reason_code FROM jobs
+                WHERE media_id=? AND job_type='download'
+                """,
+                (vod_media_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(fallback_after),
+                ("cancelled", "live_recording_exists"),
+            )
+
+    def test_twitch_retention_group_uses_latest_delivery_and_suppressed_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "TW", "streamer")
+            )
+            stream_id = "retention-stream"
+            vod_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-vod",
+                    kind="vod",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            vod_artifact_id = self._complete_download_for_media(
+                store,
+                vod_media_id,
+                root / "retention-vod.m4a",
+            )
+            live_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-live",
+                    kind="live_stream",
+                    metadata={
+                        "stream_id": stream_id,
+                        "recording_mode": "live",
+                    },
+                ),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=72)
+            ).isoformat()
+            live_artifact_id = self._complete_download_for_media(
+                store,
+                live_media_id,
+                root / "retention-live.m4a",
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+
+            candidates = store.list_delivery_retention_candidates(cutoff)
+            self.assertEqual(
+                [item["artifact_id"] for item in candidates],
+                [vod_artifact_id, live_artifact_id],
+            )
+            self.assertEqual(
+                [item["artifact_state"] for item in candidates],
+                ["suppressed", "ready"],
+            )
+            self.assertEqual(
+                {item["group_key"] for item in candidates},
+                {f"twitch:stream:{stream_id}"},
+            )
+            self.assertEqual(
+                {item["delivered_at"] for item in candidates},
+                {old_delivery},
+            )
+
+            recent_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=1)
+            ).isoformat()
+            store.conn.execute(
+                """
+                INSERT INTO deliveries(
+                  media_id, artifact_id, sink, destination_key,
+                  remote_id, delivered_at
+                ) VALUES (?, ?, 'telegram', 'telegram:@other', 'new', ?)
+                """,
+                (vod_media_id, vod_artifact_id, recent_delivery),
+            )
+            store.conn.commit()
+            self.assertEqual(
+                store.list_delivery_retention_candidates(cutoff),
+                [],
+            )
+
+            store.conn.execute(
+                "DELETE FROM deliveries WHERE destination_key='telegram:@other'"
+            )
+            store.conn.execute(
+                """
+                UPDATE jobs SET state='retry'
+                WHERE media_id=? AND job_type='download'
+                """,
+                (vod_media_id,),
+            )
+            store.conn.commit()
+            self.assertEqual(
+                store.list_delivery_retention_candidates(cutoff),
+                [],
+            )
+
+    def test_retention_group_only_lends_delivery_to_suppressed_fallbacks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "TW", "streamer")
+            )
+            stream_id = "retention-resource-gate"
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=72)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+
+            live_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-gate-live",
+                    kind="live_stream",
+                    metadata={
+                        "stream_id": stream_id,
+                        "recording_mode": "live",
+                    },
+                ),
+            )
+            live_artifact_id = self._complete_download_for_media(
+                store,
+                live_media_id,
+                root / "retention-gate-live.m4a",
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            highlight_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-gate-highlight",
+                    kind="highlight",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            highlight_artifact_id = self._complete_download_for_media(
+                store,
+                highlight_media_id,
+                root / "retention-gate-highlight.m4a",
+            )
+            vod_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-gate-vod",
+                    kind="vod",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            vod_artifact_id = self._complete_download_for_media(
+                store,
+                vod_media_id,
+                root / "retention-gate-vod.m4a",
+            )
+
+            initial = store.list_delivery_retention_candidates(cutoff)
+            self.assertEqual(
+                [item["artifact_id"] for item in initial],
+                [vod_artifact_id, live_artifact_id],
+            )
+            self.assertNotIn(
+                highlight_artifact_id,
+                [item["artifact_id"] for item in initial],
+            )
+            stale_detail = store.get_disk_resource(vod_artifact_id, root)
+            store.conn.execute(
+                "UPDATE artifacts SET state='ready', updated_at=? WHERE id=?",
+                (now_iso(), vod_artifact_id),
+            )
+            store.conn.commit()
+
+            candidates = store.list_delivery_retention_candidates(cutoff)
+            self.assertEqual(
+                [item["artifact_id"] for item in candidates],
+                [live_artifact_id],
+            )
+            vod_result = store.purge_disk_resource(
+                vod_artifact_id,
+                root,
+                expected_revision=str(stale_detail["resource_revision"]),
+                source="delivery_retention",
+                delivery_retention_before=cutoff,
+            )
+            self.assertFalse(vod_result["completed"])
+            self.assertTrue(vod_result["skipped"])
+            self.assertTrue((root / "retention-gate-vod.m4a").exists())
+
+            highlight_detail = store.get_disk_resource(
+                highlight_artifact_id,
+                root,
+            )
+            highlight_result = store.purge_disk_resource(
+                highlight_artifact_id,
+                root,
+                expected_revision=str(
+                    highlight_detail["resource_revision"]
+                ),
+                source="delivery_retention",
+                delivery_retention_before=cutoff,
+            )
+            self.assertFalse(highlight_result["completed"])
+            self.assertTrue(highlight_result["skipped"])
+            self.assertTrue(
+                (root / "retention-gate-highlight.m4a").exists()
+            )
+
+    def test_retention_phase_two_rechecks_resource_own_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "TW", "streamer")
+            )
+            stream_id = "retention-own-delivery-race"
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=72)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            live_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-own-live",
+                    kind="live_stream",
+                    metadata={
+                        "stream_id": stream_id,
+                        "recording_mode": "live",
+                    },
+                ),
+            )
+            live_path = root / "retention-own-live.m4a"
+            live_artifact_id = self._complete_download_for_media(
+                store,
+                live_media_id,
+                live_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            vod_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-own-vod",
+                    kind="vod",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            vod_artifact_id = self._complete_download_for_media(
+                store,
+                vod_media_id,
+                root / "retention-own-vod.m4a",
+            )
+            store.conn.execute(
+                """
+                INSERT INTO deliveries(
+                  media_id, artifact_id, sink, destination_key,
+                  remote_id, delivered_at
+                ) VALUES (?, ?, 'telegram', 'telegram:@fallback', 'vod', ?)
+                """,
+                (vod_media_id, vod_artifact_id, old_delivery),
+            )
+            store.conn.commit()
+            detail = store.get_disk_resource(live_artifact_id, root)
+            second = Store(db_path)
+            second.initialize()
+            original_purge = Store._purge_reserved_files
+
+            def remove_own_delivery_after_reservation(
+                active_store: Store,
+                **kwargs,
+            ):
+                second.conn.execute(
+                    "DELETE FROM deliveries WHERE media_id=?",
+                    (live_media_id,),
+                )
+                second.conn.commit()
+                return original_purge(active_store, **kwargs)
+
+            with mock.patch.object(
+                Store,
+                "_purge_reserved_files",
+                new=remove_own_delivery_after_reservation,
+            ):
+                result = store.purge_disk_resource(
+                    live_artifact_id,
+                    root,
+                    expected_revision=str(detail["resource_revision"]),
+                    source="delivery_retention",
+                    delivery_retention_before=cutoff,
+                )
+
+            self.assertFalse(result["completed"])
+            self.assertTrue(result["skipped"])
+            self.assertTrue(live_path.exists())
+            self.assertEqual(
+                store.get_artifact(live_media_id)["state"],
+                "ready",
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT COUNT(*) FROM purge_path_reservations"
+                ).fetchone()[0],
+                0,
+            )
+
+            refreshed = store.get_disk_resource(live_artifact_id, root)
+            phase_one_skip = store.purge_disk_resource(
+                live_artifact_id,
+                root,
+                expected_revision=str(refreshed["resource_revision"]),
+                source="delivery_retention",
+                delivery_retention_before=cutoff,
+            )
+            self.assertFalse(phase_one_skip["completed"])
+            self.assertTrue(phase_one_skip["skipped"])
+            self.assertTrue(live_path.exists())
+            second.close()
+
+    def test_failed_suppressed_twitch_resource_stays_before_delivered_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "TW", "streamer")
+            )
+            stream_id = "retention-retry-order"
+            vod_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-delivered-vod",
+                    kind="vod",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            vod_path = root / "retention-delivered-vod.m4a"
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=72)
+            ).isoformat()
+            vod_artifact_id = self._complete_download_for_media(
+                store,
+                vod_media_id,
+                vod_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            live_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-suppressed-live",
+                    kind="live_stream",
+                    metadata={
+                        "stream_id": stream_id,
+                        "recording_mode": "live",
+                    },
+                ),
+            )
+            live_path = root / "retention-suppressed-live.m4a"
+            live_artifact_id = self._complete_download_for_media(
+                store,
+                live_media_id,
+                live_path,
+            )
+            self.assertGreater(live_artifact_id, vod_artifact_id)
+            self.assertEqual(
+                store.get_artifact(live_media_id)["state"],
+                "suppressed",
+            )
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            initial = store.list_delivery_retention_candidates(cutoff)
+            self.assertEqual(
+                [item["artifact_id"] for item in initial],
+                [live_artifact_id, vod_artifact_id],
+            )
+            detail = store.get_disk_resource(live_artifact_id, root)
+
+            with mock.patch.object(
+                store_module,
+                "_unlink_tracked_file",
+                side_effect=PermissionError("read-only filesystem"),
+            ):
+                failed = store.purge_disk_resource(
+                    live_artifact_id,
+                    root,
+                    expected_revision=str(detail["resource_revision"]),
+                    source="delivery_retention",
+                    delivery_retention_before=cutoff,
+                )
+
+            self.assertFalse(failed["completed"])
+            self.assertEqual(
+                store.get_artifact(live_media_id)["state"],
+                "purge_failed",
+            )
+            retried = store.list_delivery_retention_candidates(cutoff)
+            self.assertEqual(
+                [item["artifact_id"] for item in retried],
+                [live_artifact_id, vod_artifact_id],
+            )
+            self.assertEqual(
+                [item["artifact_state"] for item in retried],
+                ["purge_failed", "ready"],
+            )
+
+            retry_detail = store.get_disk_resource(live_artifact_id, root)
+            with mock.patch.object(
+                store_module,
+                "_unlink_tracked_file",
+                side_effect=PermissionError("still read-only"),
+            ):
+                failed_again = store.purge_disk_resource(
+                    live_artifact_id,
+                    root,
+                    expected_revision=str(
+                        retry_detail["resource_revision"]
+                    ),
+                    source="delivery_retention",
+                    delivery_retention_before=cutoff,
+                )
+
+            self.assertFalse(failed_again["completed"])
+            failed_metadata = json.loads(
+                str(store.get_artifact(live_media_id)["metadata_json"])
+            )["local_purge"]
+            self.assertEqual(
+                failed_metadata["previous_state"],
+                "purge_failed",
+            )
+            self.assertTrue(failed_metadata["retention_fallback"])
+            retried_again = store.list_delivery_retention_candidates(cutoff)
+            self.assertEqual(
+                [item["artifact_id"] for item in retried_again],
+                [live_artifact_id, vod_artifact_id],
+            )
+
+    def test_retention_purge_pins_cancelled_twitch_download_before_deleting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "TW", "streamer")
+            )
+            stream_id = "retention-pin-stream"
+            vod_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-pin-vod",
+                    kind="vod",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            vod_path = root / "retention-pin-vod.m4a"
+            vod_artifact_id = self._complete_download_for_media(
+                store,
+                vod_media_id,
+                vod_path,
+            )
+            live_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-pin-live",
+                    kind="live_stream",
+                    metadata={
+                        "stream_id": stream_id,
+                        "recording_mode": "live",
+                    },
+                ),
+            )
+            live_path = root / "retention-pin-live.m4a"
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=72)
+            ).isoformat()
+            self._complete_download_for_media(
+                store,
+                live_media_id,
+                live_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            detail = store.get_disk_resource(vod_artifact_id, root)
+
+            result = store.purge_disk_resource(
+                vod_artifact_id,
+                root,
+                expected_revision=str(detail["resource_revision"]),
+                source="delivery_retention",
+                delivery_retention_before=cutoff,
+            )
+
+            self.assertTrue(result["completed"])
+            self.assertFalse(result["skipped"])
+            self.assertFalse(vod_path.exists())
+            self.assertTrue(live_path.exists())
+            self.assertEqual(
+                store.get_artifact(vod_media_id)["state"],
+                "purged",
+            )
+            pinned = store.conn.execute(
+                """
+                SELECT state, reason_code
+                FROM jobs
+                WHERE media_id=? AND job_type='download'
+                """,
+                (vod_media_id,),
+            ).fetchone()
+            self.assertEqual(tuple(pinned), ("cancelled", "resource_purged"))
+            purge_metadata = json.loads(
+                str(store.get_artifact(vod_media_id)["metadata_json"])
+            )["local_purge"]
+            self.assertEqual(purge_metadata["source"], "delivery_retention")
+            self.assertEqual(
+                purge_metadata["retention_group_key"],
+                f"twitch:stream:{stream_id}",
+            )
+
+    def test_retention_recovery_repairs_pin_after_unlink_crash(self):
+        class SimulatedCrash(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "TW", "streamer")
+            )
+            stream_id = "retention-crash-pin"
+            vod_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-crash-vod",
+                    kind="vod",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            vod_path = root / "retention-crash-vod.m4a"
+            vod_artifact_id = self._complete_download_for_media(
+                store,
+                vod_media_id,
+                vod_path,
+            )
+            live_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-crash-live",
+                    kind="live_stream",
+                    metadata={
+                        "stream_id": stream_id,
+                        "recording_mode": "live",
+                    },
+                ),
+            )
+            live_path = root / "retention-crash-live.m4a"
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=72)
+            ).isoformat()
+            self._complete_download_for_media(
+                store,
+                live_media_id,
+                live_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            detail = store.get_disk_resource(vod_artifact_id, root)
+            original_unlink = store_module._unlink_tracked_file
+
+            def unlink_then_crash(*args, **kwargs):
+                original_unlink(*args, **kwargs)
+                raise SimulatedCrash("process stopped after unlink")
+
+            with mock.patch.object(
+                store_module,
+                "_unlink_tracked_file",
+                new=unlink_then_crash,
+            ):
+                with self.assertRaises(SimulatedCrash):
+                    store.purge_disk_resource(
+                        vod_artifact_id,
+                        root,
+                        expected_revision=str(detail["resource_revision"]),
+                        source="delivery_retention",
+                        delivery_retention_before=cutoff,
+                    )
+
+            self.assertFalse(vod_path.exists())
+            store.close()
+            raw = sqlite3.connect(db_path)
+            raw.execute(
+                """
+                UPDATE purge_path_reservations
+                SET owner_pid=0, owner_start_id=''
+                WHERE state='active'
+                """
+            )
+            raw.commit()
+            raw.close()
+
+            recovered = Store(db_path)
+            recovered.initialize()
+            pinned = recovered.conn.execute(
+                """
+                SELECT state, reason_code
+                FROM jobs
+                WHERE media_id=? AND job_type='download'
+                """,
+                (vod_media_id,),
+            ).fetchone()
+            self.assertEqual(tuple(pinned), ("cancelled", "resource_purged"))
+            recovered_artifact = recovered.get_artifact(vod_media_id)
+            self.assertEqual(recovered_artifact["state"], "purge_failed")
+            recovered_metadata = json.loads(
+                str(recovered_artifact["metadata_json"])
+            )["local_purge"]
+            self.assertTrue(recovered_metadata["path_existed"])
+            self.assertEqual(recovered_metadata["result"], "interrupted")
+            self.assertEqual(
+                recovered.conn.execute(
+                    """
+                    SELECT state FROM purge_path_reservations
+                    WHERE media_id=?
+                    """,
+                    (vod_media_id,),
+                ).fetchone()[0],
+                "purged",
+            )
+
+            live_path.unlink()
+            recovered.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-crash-vod",
+                    kind="vod",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            still_pinned = recovered.conn.execute(
+                """
+                SELECT state, reason_code
+                FROM jobs
+                WHERE media_id=? AND job_type='download'
+                """,
+                (vod_media_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(still_pinned),
+                ("cancelled", "resource_purged"),
+            )
+            recovered.close()
+
+    def test_live_retention_crash_pins_matching_vod_without_artifact(self):
+        class SimulatedCrash(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "TW", "streamer")
+            )
+            stream_id = "retention-live-crash-no-vod-artifact"
+            vod_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-no-artifact-vod",
+                    kind="vod",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            vod_job = store.claim_next_job(
+                ("download",),
+                owner="vod-cancel",
+                lease_seconds=60,
+            )
+            store.cancel_job(
+                vod_job,
+                reason_code="live_recording_exists",
+                error="matching Twitch live stream was already archived",
+            )
+            self.assertIsNone(store.get_artifact(vod_media_id))
+
+            live_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-live-crash-target",
+                    kind="live_stream",
+                    metadata={
+                        "stream_id": stream_id,
+                        "recording_mode": "live",
+                    },
+                ),
+            )
+            live_path = root / "retention-live-crash-target.m4a"
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=72)
+            ).isoformat()
+            live_artifact_id = self._complete_download_for_media(
+                store,
+                live_media_id,
+                live_path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            detail = store.get_disk_resource(live_artifact_id, root)
+            original_unlink = store_module._unlink_tracked_file
+
+            def unlink_then_crash(*args, **kwargs):
+                original_unlink(*args, **kwargs)
+                raise SimulatedCrash("process stopped after live unlink")
+
+            with mock.patch.object(
+                store_module,
+                "_unlink_tracked_file",
+                new=unlink_then_crash,
+            ):
+                with self.assertRaises(SimulatedCrash):
+                    store.purge_disk_resource(
+                        live_artifact_id,
+                        root,
+                        expected_revision=str(detail["resource_revision"]),
+                        source="delivery_retention",
+                        delivery_retention_before=cutoff,
+                    )
+
+            store.close()
+            raw = sqlite3.connect(db_path)
+            raw.execute(
+                """
+                UPDATE purge_path_reservations
+                SET owner_pid=0, owner_start_id=''
+                WHERE state='active'
+                """
+            )
+            raw.commit()
+            raw.close()
+            recovered = Store(db_path)
+            recovered.initialize()
+
+            vod_download = recovered.conn.execute(
+                """
+                SELECT state, reason_code
+                FROM jobs
+                WHERE media_id=? AND job_type='download'
+                """,
+                (vod_media_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(vod_download),
+                ("cancelled", "resource_purged"),
+            )
+            self.assertIsNone(recovered.get_artifact(vod_media_id))
+            recovered.close()
+
+    def test_retention_pin_preserves_same_stream_source_filter_cancel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "TW", "streamer")
+            )
+            stream_id = "retention-source-filter-stream"
+            vod_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-source-filter-vod",
+                    kind="vod",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            vod_job = store.claim_next_job(
+                ("download",),
+                owner="source-filter",
+                lease_seconds=60,
+            )
+            store.cancel_job(
+                vod_job,
+                reason_code="source_filter",
+                error="excluded by source filter",
+            )
+            live_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-source-filter-live",
+                    kind="live_stream",
+                    metadata={
+                        "stream_id": stream_id,
+                        "recording_mode": "live",
+                    },
+                ),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=72)
+            ).isoformat()
+            live_artifact_id = self._complete_download_for_media(
+                store,
+                live_media_id,
+                root / "retention-source-filter-live.m4a",
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            detail = store.get_disk_resource(live_artifact_id, root)
+
+            result = store.purge_disk_resource(
+                live_artifact_id,
+                root,
+                expected_revision=str(detail["resource_revision"]),
+                source="delivery_retention",
+                delivery_retention_before=cutoff,
+            )
+
+            self.assertTrue(result["completed"])
+            vod_download = store.conn.execute(
+                """
+                SELECT state, reason_code
+                FROM jobs
+                WHERE media_id=? AND job_type='download'
+                """,
+                (vod_media_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(vod_download),
+                ("cancelled", "source_filter"),
+            )
+
+    def test_non_twitch_retention_crash_preserves_source_filter_cancel(self):
+        class SimulatedCrash(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "retention-non-twitch-source-filter"),
+            )
+            path = root / "retention-non-twitch-source-filter.m4a"
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=72)
+            ).isoformat()
+            artifact_id = self._complete_download_for_media(
+                store,
+                media_id,
+                path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            store.conn.execute(
+                """
+                UPDATE jobs
+                SET state='cancelled', reason_code='source_filter'
+                WHERE media_id=? AND job_type='download'
+                """,
+                (media_id,),
+            )
+            store.conn.commit()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            detail = store.get_disk_resource(artifact_id, root)
+            original_unlink = store_module._unlink_tracked_file
+
+            def unlink_then_crash(*args, **kwargs):
+                original_unlink(*args, **kwargs)
+                raise SimulatedCrash("process stopped after YouTube unlink")
+
+            with mock.patch.object(
+                store_module,
+                "_unlink_tracked_file",
+                new=unlink_then_crash,
+            ):
+                with self.assertRaises(SimulatedCrash):
+                    store.purge_disk_resource(
+                        artifact_id,
+                        root,
+                        expected_revision=str(detail["resource_revision"]),
+                        source="delivery_retention",
+                        delivery_retention_before=cutoff,
+                    )
+
+            store.close()
+            raw = sqlite3.connect(db_path)
+            raw.execute(
+                """
+                UPDATE purge_path_reservations
+                SET owner_pid=0, owner_start_id=''
+                WHERE state='active'
+                """
+            )
+            raw.commit()
+            raw.close()
+            recovered = Store(db_path)
+            recovered.initialize()
+
+            download = recovered.conn.execute(
+                """
+                SELECT state, reason_code
+                FROM jobs
+                WHERE media_id=? AND job_type='download'
+                """,
+                (media_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(download),
+                ("cancelled", "source_filter"),
+            )
+            recovered.close()
+
+    def test_retention_recovery_does_not_pin_path_missing_at_reservation(self):
+        class SimulatedCrash(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "TW", "streamer")
+            )
+            stream_id = "retention-missing-before-reserve"
+            vod_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-missing-vod",
+                    kind="vod",
+                    metadata={"stream_id": stream_id},
+                ),
+            )
+            vod_path = root / "retention-missing-vod.m4a"
+            vod_artifact_id = self._complete_download_for_media(
+                store,
+                vod_media_id,
+                vod_path,
+            )
+            live_media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "retention-missing-live",
+                    kind="live_stream",
+                    metadata={
+                        "stream_id": stream_id,
+                        "recording_mode": "live",
+                    },
+                ),
+            )
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=72)
+            ).isoformat()
+            self._complete_download_for_media(
+                store,
+                live_media_id,
+                root / "retention-missing-live.m4a",
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            vod_path.unlink()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            detail = store.get_disk_resource(vod_artifact_id, root)
+
+            with mock.patch.object(
+                Store,
+                "_purge_reserved_files",
+                side_effect=SimulatedCrash("before phase two"),
+            ):
+                with self.assertRaises(SimulatedCrash):
+                    store.purge_disk_resource(
+                        vod_artifact_id,
+                        root,
+                        expected_revision=str(detail["resource_revision"]),
+                        source="delivery_retention",
+                        delivery_retention_before=cutoff,
+                    )
+
+            store.close()
+            raw = sqlite3.connect(db_path)
+            raw.execute(
+                """
+                UPDATE purge_path_reservations
+                SET owner_pid=0, owner_start_id=''
+                WHERE state='active'
+                """
+            )
+            raw.commit()
+            raw.close()
+            recovered = Store(db_path)
+            recovered.initialize()
+
+            job = recovered.conn.execute(
+                """
+                SELECT state, reason_code
+                FROM jobs
+                WHERE media_id=? AND job_type='download'
+                """,
+                (vod_media_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(job),
+                ("cancelled", "live_recording_exists"),
+            )
+            artifact = recovered.get_artifact(vod_media_id)
+            self.assertEqual(artifact["state"], "purge_failed")
+            self.assertFalse(
+                json.loads(str(artifact["metadata_json"]))["local_purge"][
+                    "path_existed"
+                ]
+            )
+            recovered.close()
+
+    def test_retention_purge_skips_and_restores_when_group_job_appears(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            db_path = Path(tmp) / "state.db"
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "YT", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                candidate("youtube", "retention-race"),
+            )
+            path = root / "retention-race.m4a"
+            old_delivery = (
+                datetime.now(timezone.utc) - timedelta(hours=72)
+            ).isoformat()
+            artifact_id = self._complete_download_for_media(
+                store,
+                media_id,
+                path,
+                destination="telegram:@archive",
+                delivered_at=old_delivery,
+            )
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            detail = store.get_disk_resource(artifact_id, root)
+            second = Store(db_path)
+            second.initialize()
+            original_purge = Store._purge_reserved_files
+
+            def add_job_after_reservation(active_store: Store, **kwargs):
+                second.ensure_delivery_job(media_id, "telegram:@late")
+                return original_purge(active_store, **kwargs)
+
+            with mock.patch.object(
+                Store,
+                "_purge_reserved_files",
+                new=add_job_after_reservation,
+            ):
+                result = store.purge_disk_resource(
+                    artifact_id,
+                    root,
+                    expected_revision=str(detail["resource_revision"]),
+                    source="delivery_retention",
+                    delivery_retention_before=cutoff,
+                )
+
+            self.assertFalse(result["completed"])
+            self.assertTrue(result["skipped"])
+            self.assertTrue(path.exists())
+            artifact = store.get_artifact(media_id)
+            self.assertEqual(artifact["state"], "ready")
+            self.assertEqual(
+                json.loads(str(artifact["metadata_json"]))["local_purge"][
+                    "result"
+                ],
+                "skipped",
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT COUNT(*) FROM purge_path_reservations"
+                ).fetchone()[0],
+                0,
+            )
+            late_job = store.conn.execute(
+                """
+                SELECT state, reason_code
+                FROM jobs
+                WHERE media_id=? AND target_key='telegram:@late'
+                """,
+                (media_id,),
+            ).fetchone()
+            self.assertEqual(tuple(late_job), ("queued", None))
+
+            refreshed = store.get_disk_resource(artifact_id, root)
+            phase_one_skip = store.purge_disk_resource(
+                artifact_id,
+                root,
+                expected_revision=str(refreshed["resource_revision"]),
+                source="delivery_retention",
+                delivery_retention_before=cutoff,
+            )
+            self.assertFalse(phase_one_skip["completed"])
+            self.assertTrue(phase_one_skip["skipped"])
+            self.assertEqual(store.get_artifact(media_id)["state"], "ready")
+            self.assertTrue(path.exists())
+            second.close()
 
     def test_disk_resource_library_search_detail_and_purge(self):
         with tempfile.TemporaryDirectory() as tmp:

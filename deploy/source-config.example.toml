@@ -11,6 +11,17 @@ worker_poll_interval_seconds = 2
 job_lease_seconds = 900
 log_level = "INFO"
 
+[storage]
+# Delete temporary recording and Telegram upload files after delivery.
+process_retention_hours = 24
+# Keep complete backup files. Set a positive number to expire them.
+backup_retention_hours = 0
+# Optional: move complete backup files to a mounted storage directory.
+archive_dir = ""
+archive_after_delivery_hours = 24
+# Leave enabled when archive_dir is on a mounted disk.
+archive_require_mount = true
+
 [sources]
 path = "/home/your-user/.config/asmr-tg-backup/sources.toml"
 
@@ -41,7 +52,7 @@ download_timeout_seconds = 21600
 ffmpeg_timeout_seconds = 7200
 extra_args = []
 
-# Twitch keeps audio only; no source video master is retained.
+# Twitch keeps audio only; no complete source video file is retained.
 [download.provider_profiles.twitch]
 format = "bestaudio/best"
 merge_output_format = ""

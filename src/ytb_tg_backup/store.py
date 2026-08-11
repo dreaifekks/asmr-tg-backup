@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import errno
 import hashlib
 import json
 import os
@@ -13,6 +14,9 @@ import uuid
 
 from .feed import FeedEntry
 from .models import ClaimedJob, MediaCandidate, Origin
+
+
+StorageRoots = Path | Sequence[Path]
 
 
 LEGACY_SCHEMA = """
@@ -183,6 +187,24 @@ ON purge_path_reservations(operation_id);
 CREATE INDEX IF NOT EXISTS idx_purge_path_reservations_state
 ON purge_path_reservations(state, operation_id);
 
+CREATE TABLE IF NOT EXISTS artifact_archive_moves (
+  artifact_id INTEGER PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+  media_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
+  operation_id TEXT NOT NULL UNIQUE,
+  source_path TEXT NOT NULL UNIQUE,
+  target_path TEXT NOT NULL UNIQUE,
+  source_identity_json TEXT NOT NULL,
+  state TEXT NOT NULL,
+  owner_pid INTEGER NOT NULL,
+  owner_start_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifact_archive_moves_state
+ON artifact_archive_moves(state, updated_at, artifact_id);
+
 CREATE TABLE IF NOT EXISTS deliveries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   media_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
@@ -193,6 +215,9 @@ CREATE TABLE IF NOT EXISTS deliveries (
   delivered_at TEXT NOT NULL,
   UNIQUE(media_id, sink, destination_key)
 );
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_retention
+ON deliveries(sink, delivered_at, media_id);
 
 CREATE TABLE IF NOT EXISTS bot_state (
   key TEXT PRIMARY KEY,
@@ -317,6 +342,35 @@ resources AS (
 )
 """
 
+DELIVERY_RETENTION_MEDIA_CTE = """
+media_groups AS (
+  SELECT
+    mi.id AS media_id,
+    CASE
+      WHEN mi.provider='twitch'
+        AND mi.content_kind IN ('vod', 'live_stream')
+        AND json_valid(mi.metadata_json)
+        AND trim(
+          COALESCE(
+            CAST(json_extract(mi.metadata_json, '$.stream_id') AS TEXT),
+            ''
+          )
+        )!=''
+      THEN 'twitch:stream:' || trim(
+        CAST(json_extract(mi.metadata_json, '$.stream_id') AS TEXT)
+      )
+      ELSE 'media:' || CAST(mi.id AS TEXT)
+    END AS group_key
+  FROM media_items mi
+)
+"""
+
+
+DELIVERY_PROCESS_RETENTION_SOURCE = "delivery_process_retention"
+DELIVERY_PROCESS_ARTIFACT_ROLES = frozenset(
+    {"live_segment", "telegram_upload"}
+)
+
 
 @dataclass(frozen=True)
 class Subscription:
@@ -373,6 +427,7 @@ class Store:
             self.conn.executescript(V2_SCHEMA)
             self._ensure_panel_snapshot_support()
             self._recover_incomplete_disk_purges()
+            self._recover_incomplete_archive_moves()
             self._ensure_compatibility_views()
             self.conn.commit()
             return
@@ -385,6 +440,7 @@ class Store:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             self._recover_incomplete_disk_purges()
+            self._recover_incomplete_archive_moves()
             if has_v1:
                 self._migrate_v1_rows()
                 if self._table_exists("videos"):
@@ -402,7 +458,7 @@ class Store:
             raise
 
     def _recover_incomplete_disk_purges(self) -> None:
-        """Make interrupted panel purges visible and retryable after restart."""
+        """Make interrupted disk purges visible and retryable after restart."""
 
         recovered_at = now_iso()
         reservation_rows = self.conn.execute(
@@ -422,21 +478,78 @@ class Store:
         }
         rows = self.conn.execute(
             """
-            SELECT id, metadata_json
+            SELECT id, path, metadata_json
             FROM artifacts
             WHERE state='purging'
             """
         ).fetchall()
+        process_operations = {
+            str(purge_metadata.get("operation_id") or "")
+            for row in rows
+            for metadata in [_json_object(row["metadata_json"])]
+            for purge_metadata in [_json_object(metadata.get("local_purge"))]
+            if purge_metadata.get("source")
+            == DELIVERY_PROCESS_RETENTION_SOURCE
+            and purge_metadata.get("operation_id")
+        }
+        reserved_paths_by_operation: dict[str, set[str]] = {}
+        for reservation in reservation_rows:
+            operation_id = str(reservation["operation_id"])
+            reserved_paths_by_operation.setdefault(operation_id, set()).add(
+                str(reservation["storage_key"])
+            )
+
+        # A retention purge pins cancelled Twitch fallbacks in phase two, in
+        # the same transaction that records the unlink result.  Filesystem
+        # deletion cannot roll back, though, so a process death after unlink
+        # and before commit would otherwise lose that pin.  Repair only the
+        # provable crash window: this operation is dead, this exact path was
+        # present when reserved, and its active reservation is now missing.
+        interrupted_retention_groups: set[str] = set()
+        for row in rows:
+            metadata = _json_object(row["metadata_json"])
+            purge_metadata = _json_object(metadata.get("local_purge"))
+            operation_id = str(purge_metadata.get("operation_id") or "")
+            if not operation_id or operation_id in live_operations:
+                continue
+            if purge_metadata.get("source") != "delivery_retention":
+                continue
+            if purge_metadata.get("path_existed") is not True:
+                continue
+            group_key = str(
+                purge_metadata.get("retention_group_key") or ""
+            )
+            storage_key = _storage_key(Path(str(row["path"])))
+            if (
+                group_key
+                and storage_key
+                in reserved_paths_by_operation.get(operation_id, set())
+                and not _path_entry_exists(Path(storage_key))
+            ):
+                interrupted_retention_groups.add(group_key)
+        for group_key in sorted(interrupted_retention_groups):
+            self._pin_retention_cancelled_downloads(
+                group_key,
+                recovered_at,
+            )
+
         for row in rows:
             metadata = _json_object(row["metadata_json"])
             purge_metadata = _json_object(metadata.get("local_purge"))
             operation_id = str(purge_metadata.get("operation_id") or "")
             if operation_id and operation_id in live_operations:
                 continue
+            process_path_deleted = (
+                purge_metadata.get("source")
+                == DELIVERY_PROCESS_RETENTION_SOURCE
+                and not _path_entry_exists(Path(str(row["path"])))
+            )
             purge_metadata.update(
                 {
                     "finished_at": recovered_at,
-                    "result": "interrupted",
+                    "result": (
+                        "deleted" if process_path_deleted else "interrupted"
+                    ),
                     "error": "service stopped before local deletion completed",
                 }
             )
@@ -444,10 +557,11 @@ class Store:
             self.conn.execute(
                 """
                 UPDATE artifacts
-                SET state='purge_failed', metadata_json=?, updated_at=?
+                SET state=?, metadata_json=?, updated_at=?
                 WHERE id=?
                 """,
                 (
+                    "purged" if process_path_deleted else "purge_failed",
                     json.dumps(metadata, ensure_ascii=False, sort_keys=True),
                     recovered_at,
                     int(row["id"]),
@@ -458,7 +572,10 @@ class Store:
             if operation_id in live_operations:
                 continue
             storage_key = str(reservation["storage_key"])
-            if _path_entry_exists(Path(storage_key)):
+            if (
+                operation_id in process_operations
+                or _path_entry_exists(Path(storage_key))
+            ):
                 self.conn.execute(
                     """
                     DELETE FROM purge_path_reservations
@@ -476,6 +593,43 @@ class Store:
                     """,
                     (recovered_at, storage_key),
                 )
+
+    def _recover_incomplete_archive_moves(self) -> None:
+        """Release archive copy claims left by a dead process."""
+
+        recovered_at = now_iso()
+        rows = self.conn.execute(
+            """
+            SELECT artifact_id, state, owner_pid, owner_start_id
+            FROM artifact_archive_moves
+            WHERE state IN ('copying', 'source_cleanup')
+            """
+        ).fetchall()
+        for row in rows:
+            if _process_instance_is_alive(
+                int(row["owner_pid"]),
+                str(row["owner_start_id"]),
+            ):
+                continue
+            state = str(row["state"])
+            self.conn.execute(
+                """
+                UPDATE artifact_archive_moves
+                SET state=?, owner_pid=0, owner_start_id='', updated_at=?,
+                  error=CASE
+                    WHEN state='copying'
+                    THEN 'archive copy was interrupted and will be retried'
+                    ELSE error
+                  END
+                WHERE artifact_id=? AND state=?
+                """,
+                (
+                    "retry" if state == "copying" else "source_cleanup",
+                    recovered_at,
+                    int(row["artifact_id"]),
+                    state,
+                ),
+            )
 
     def _ensure_panel_snapshot_support(self) -> None:
         """Keep the materialized panel row dirty when its source data changes."""
@@ -851,9 +1005,294 @@ class Store:
             )
         }
 
+    def list_delivery_retention_candidates(
+        self,
+        delivered_before: str,
+        *,
+        limit: int = 25,
+    ) -> list[dict[str, object]]:
+        """List tracked resources whose Telegram delivery group may be purged.
+
+        Ordinary media items form one-item groups. Twitch VOD and live rows with
+        the same non-empty ``stream_id`` form one group so a successfully
+        delivered counterpart can make a suppressed duplicate eligible. The
+        newest Telegram delivery in the group controls the retention clock, and
+        every job in the group must already be terminal.
+        """
+
+        page_limit = max(1, min(100, int(limit)))
+        rows = self.conn.execute(
+            f"""
+            {DISK_RESOURCE_CTE},
+            {DELIVERY_RETENTION_MEDIA_CTE},
+            blocked_groups AS (
+              SELECT DISTINCT member.group_key
+              FROM media_groups member
+              JOIN jobs j ON j.media_id=member.media_id
+              WHERE j.state NOT IN ('succeeded', 'cancelled')
+            ),
+            eligible_groups AS (
+              SELECT
+                member.group_key,
+                MAX(d.delivered_at) AS delivered_at
+              FROM media_groups member
+              JOIN deliveries d
+                ON d.media_id=member.media_id AND d.sink='telegram'
+              WHERE NOT EXISTS (
+                SELECT 1
+                FROM blocked_groups blocked
+                WHERE blocked.group_key=member.group_key
+              )
+              GROUP BY member.group_key
+              HAVING MAX(d.delivered_at) <= ?
+            )
+            SELECT
+              eligible.group_key,
+              resources.artifact_id,
+              resources.media_id,
+              resources.master_state AS artifact_state,
+              eligible.delivered_at
+            FROM resources
+            JOIN artifacts retention_artifact
+              ON retention_artifact.id=resources.artifact_id
+            JOIN media_groups member ON member.media_id=resources.media_id
+            JOIN eligible_groups eligible
+              ON eligible.group_key=member.group_key
+            WHERE resources.master_state IN (
+              'ready', 'suppressed', 'purge_failed'
+            )
+              AND (
+                EXISTS (
+                  SELECT 1
+                  FROM deliveries own_delivery
+                  WHERE own_delivery.media_id=resources.media_id
+                    AND own_delivery.sink='telegram'
+                )
+                OR resources.master_state='suppressed'
+                OR (
+                  resources.master_state='purge_failed'
+                  AND (
+                    json_extract(
+                      retention_artifact.metadata_json,
+                      '$.local_purge.retention_fallback'
+                    )=1
+                    OR (
+                      json_extract(
+                        retention_artifact.metadata_json,
+                        '$.local_purge.source'
+                      )='delivery_retention'
+                      AND json_extract(
+                        retention_artifact.metadata_json,
+                        '$.local_purge.previous_state'
+                      )='suppressed'
+                    )
+                  )
+                )
+              )
+            ORDER BY
+              eligible.delivered_at,
+              eligible.group_key,
+              CASE resources.master_state
+                WHEN 'suppressed' THEN 0
+                WHEN 'purge_failed' THEN 1
+                ELSE 2
+              END,
+              resources.artifact_id
+            LIMIT ?
+            """,
+            (str(delivered_before), page_limit),
+        ).fetchall()
+        return [
+            {
+                "group_key": str(row["group_key"]),
+                "artifact_id": int(row["artifact_id"]),
+                "media_id": int(row["media_id"]),
+                "artifact_state": str(row["artifact_state"]),
+                "delivered_at": str(row["delivered_at"]),
+            }
+            for row in rows
+        ]
+
+    def list_process_retention_candidates(
+        self,
+        delivered_before: str,
+        *,
+        limit: int = 25,
+    ) -> list[dict[str, object]]:
+        """List delivered media with explicit process artifacts to remove.
+
+        Unlike full-resource retention, process retention is deliberately
+        media-local: a Twitch sibling's delivery never makes another media
+        item's process files eligible. Thumbnails are eligible only when their
+        metadata explicitly identifies them as Telegram delivery derivatives.
+        """
+
+        page_limit = max(1, min(100, int(limit)))
+        rows = self.conn.execute(
+            f"""
+            {DISK_RESOURCE_CTE},
+            own_delivery AS (
+              SELECT media_id, MAX(delivered_at) AS delivered_at
+              FROM deliveries
+              WHERE sink='telegram'
+              GROUP BY media_id
+            )
+            SELECT
+              'media:' || CAST(resources.media_id AS TEXT) AS group_key,
+              resources.artifact_id,
+              resources.media_id,
+              resources.master_state AS artifact_state,
+              own_delivery.delivered_at
+            FROM resources
+            JOIN own_delivery ON own_delivery.media_id=resources.media_id
+            WHERE own_delivery.delivered_at <= ?
+              AND resources.anchor_role='master'
+              AND resources.master_state='ready'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM jobs j
+                WHERE j.media_id=resources.media_id
+                  AND j.state NOT IN ('succeeded', 'cancelled')
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM artifacts process_artifact
+                WHERE process_artifact.media_id=resources.media_id
+                  AND process_artifact.state IN ('ready', 'purge_failed')
+                  AND (
+                    process_artifact.role IN (
+                      'live_segment', 'telegram_upload'
+                    )
+                    OR (
+                      process_artifact.role='thumbnail'
+                      AND json_valid(process_artifact.metadata_json)
+                      AND json_type(
+                        process_artifact.metadata_json,
+                        '$.delivery_derivative'
+                      )='true'
+                    )
+                  )
+              )
+            ORDER BY own_delivery.delivered_at, resources.artifact_id
+            LIMIT ?
+            """,
+            (str(delivered_before), page_limit),
+        ).fetchall()
+        return [
+            {
+                "group_key": str(row["group_key"]),
+                "artifact_id": int(row["artifact_id"]),
+                "media_id": int(row["media_id"]),
+                "artifact_state": str(row["artifact_state"]),
+                "delivered_at": str(row["delivered_at"]),
+            }
+            for row in rows
+        ]
+
+    def list_master_archive_candidates(
+        self,
+        delivered_before: str,
+        *,
+        limit: int = 25,
+    ) -> list[dict[str, object]]:
+        """List delivered canonical masters ready for mounted-disk archival."""
+
+        page_limit = max(1, min(100, int(limit)))
+        rows = self.conn.execute(
+            f"""
+            {DISK_RESOURCE_CTE},
+            own_delivery AS (
+              SELECT media_id, MAX(delivered_at) AS delivered_at
+              FROM deliveries
+              WHERE sink='telegram'
+              GROUP BY media_id
+            )
+            SELECT
+              'media:' || CAST(resources.media_id AS TEXT) AS group_key,
+              resources.artifact_id,
+              resources.media_id,
+              resources.master_state AS artifact_state,
+              own_delivery.delivered_at,
+              archive_move.state AS move_state
+            FROM resources
+            JOIN own_delivery ON own_delivery.media_id=resources.media_id
+            JOIN artifacts master ON master.id=resources.artifact_id
+            LEFT JOIN artifact_archive_moves archive_move
+              ON archive_move.artifact_id=resources.artifact_id
+            WHERE own_delivery.delivered_at <= ?
+              AND resources.anchor_role='master'
+              AND resources.master_state='ready'
+              AND json_type(master.metadata_json, '$.archive.archived_at')
+                IS NULL
+              AND (
+                archive_move.artifact_id IS NULL
+                OR archive_move.state='retry'
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM jobs j
+                WHERE j.media_id=resources.media_id
+                  AND j.state NOT IN ('succeeded', 'cancelled')
+              )
+            ORDER BY own_delivery.delivered_at, resources.artifact_id
+            LIMIT ?
+            """,
+            (str(delivered_before), page_limit),
+        ).fetchall()
+        return [
+            {
+                "group_key": str(row["group_key"]),
+                "artifact_id": int(row["artifact_id"]),
+                "media_id": int(row["media_id"]),
+                "artifact_state": str(row["artifact_state"]),
+                "delivered_at": str(row["delivered_at"]),
+                "move_state": (
+                    str(row["move_state"])
+                    if row["move_state"] is not None
+                    else None
+                ),
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def validate_archive_destination(
+        download_root: Path,
+        archive_root: Path,
+        *,
+        require_mount: bool = True,
+    ) -> None:
+        """Fail closed when the configured archive filesystem is unavailable."""
+
+        _validate_archive_root(
+            download_root,
+            archive_root,
+            require_mount=require_mount,
+        )
+
+    def list_archive_source_cleanup_candidates(
+        self,
+        *,
+        limit: int = 25,
+    ) -> list[int]:
+        page_limit = max(1, min(100, int(limit)))
+        return [
+            int(row["artifact_id"])
+            for row in self.conn.execute(
+                """
+                SELECT artifact_id
+                FROM artifact_archive_moves
+                WHERE state='source_cleanup'
+                ORDER BY updated_at, artifact_id
+                LIMIT ?
+                """,
+                (page_limit,),
+            ).fetchall()
+        ]
+
     def list_disk_resources(
         self,
-        download_root: Path,
+        download_root: StorageRoots,
         *,
         limit: int = 6,
         offset: int = 0,
@@ -913,7 +1352,7 @@ class Store:
     def get_disk_resource(
         self,
         artifact_id: int,
-        download_root: Path,
+        download_root: StorageRoots,
     ) -> dict[str, object] | None:
         row = self.conn.execute(
             f"""
@@ -999,24 +1438,913 @@ class Store:
         )
         return resource
 
+    def _delivery_retention_group_status(
+        self,
+        media_id: int,
+        delivered_before: str,
+    ) -> dict[str, object] | None:
+        row = self.conn.execute(
+            f"""
+            WITH
+            {DELIVERY_RETENTION_MEDIA_CTE},
+            target_group AS (
+              SELECT group_key
+              FROM media_groups
+              WHERE media_id=?
+            ),
+            group_delivery AS (
+              SELECT
+                target.group_key,
+                MAX(d.delivered_at) AS delivered_at
+              FROM target_group target
+              JOIN media_groups member
+                ON member.group_key=target.group_key
+              JOIN deliveries d
+                ON d.media_id=member.media_id AND d.sink='telegram'
+              GROUP BY target.group_key
+            )
+            SELECT
+              delivery.group_key,
+              delivery.delivered_at,
+              EXISTS (
+                SELECT 1
+                FROM deliveries own_delivery
+                WHERE own_delivery.media_id=?
+                  AND own_delivery.sink='telegram'
+              ) AS media_delivered
+            FROM group_delivery delivery
+            WHERE delivery.delivered_at <= ?
+              AND NOT EXISTS (
+                SELECT 1
+                FROM media_groups member
+                JOIN jobs j ON j.media_id=member.media_id
+                WHERE member.group_key=delivery.group_key
+                  AND j.state NOT IN ('succeeded', 'cancelled')
+              )
+            """,
+            (int(media_id), int(media_id), str(delivered_before)),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "group_key": str(row["group_key"]),
+            "delivered_at": str(row["delivered_at"]),
+            "media_delivered": bool(row["media_delivered"]),
+        }
+
+    def _delivery_process_retention_status(
+        self,
+        media_id: int,
+        delivered_before: str,
+        *,
+        include_purging: bool = False,
+    ) -> dict[str, object] | None:
+        eligible_states = (
+            "'ready', 'purge_failed', 'purging'"
+            if include_purging
+            else "'ready', 'purge_failed'"
+        )
+        row = self.conn.execute(
+            f"""
+            SELECT
+              MAX(d.delivered_at) AS delivered_at
+            FROM deliveries d
+            WHERE d.media_id=? AND d.sink='telegram'
+            HAVING MAX(d.delivered_at) <= ?
+              AND NOT EXISTS (
+                SELECT 1
+                FROM jobs j
+                WHERE j.media_id=?
+                  AND j.state NOT IN ('succeeded', 'cancelled')
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM artifacts process_artifact
+                WHERE process_artifact.media_id=?
+                  AND process_artifact.state IN ({eligible_states})
+                  AND (
+                    process_artifact.role IN (
+                      'live_segment', 'telegram_upload'
+                    )
+                    OR (
+                      process_artifact.role='thumbnail'
+                      AND json_valid(process_artifact.metadata_json)
+                      AND json_type(
+                        process_artifact.metadata_json,
+                        '$.delivery_derivative'
+                      )='true'
+                    )
+                  )
+              )
+            """,
+            (
+                int(media_id),
+                str(delivered_before),
+                int(media_id),
+                int(media_id),
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "group_key": f"media:{int(media_id)}",
+            "delivered_at": str(row["delivered_at"]),
+        }
+
+    def _delivery_archive_status(
+        self,
+        media_id: int,
+        delivered_before: str,
+    ) -> dict[str, object] | None:
+        row = self.conn.execute(
+            """
+            SELECT MAX(d.delivered_at) AS delivered_at
+            FROM deliveries d
+            WHERE d.media_id=? AND d.sink='telegram'
+            HAVING MAX(d.delivered_at) <= ?
+              AND NOT EXISTS (
+                SELECT 1
+                FROM jobs j
+                WHERE j.media_id=?
+                  AND j.state NOT IN ('succeeded', 'cancelled')
+              )
+            """,
+            (int(media_id), str(delivered_before), int(media_id)),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "group_key": f"media:{int(media_id)}",
+            "delivered_at": str(row["delivered_at"]),
+        }
+
+    @staticmethod
+    def _is_delivery_process_artifact(artifact: sqlite3.Row) -> bool:
+        role = str(artifact["role"])
+        if role in DELIVERY_PROCESS_ARTIFACT_ROLES:
+            return True
+        if role != "thumbnail":
+            return False
+        metadata = _json_object(artifact["metadata_json"])
+        return metadata.get("delivery_derivative") is True
+
+    @staticmethod
+    def _delivery_retention_artifact_is_eligible(
+        artifact: sqlite3.Row,
+        retention_status: dict[str, object],
+    ) -> bool:
+        if bool(retention_status["media_delivered"]):
+            return True
+        return Store._delivery_retention_fallback_artifact(artifact)
+
+    @staticmethod
+    def _delivery_retention_fallback_artifact(
+        artifact: sqlite3.Row,
+    ) -> bool:
+        state = str(artifact["state"])
+        if state == "suppressed":
+            return True
+        if state != "purge_failed":
+            return False
+        metadata = _json_object(artifact["metadata_json"])
+        purge_metadata = _json_object(metadata.get("local_purge"))
+        return (
+            purge_metadata.get("retention_fallback") is True
+            or (
+                purge_metadata.get("source") == "delivery_retention"
+                and purge_metadata.get("previous_state") == "suppressed"
+            )
+        )
+
+    def _pin_retention_cancelled_downloads(
+        self,
+        group_key: str,
+        changed_at: str,
+    ) -> None:
+        if not str(group_key).startswith("twitch:stream:"):
+            return
+        self.conn.execute(
+            f"""
+            WITH
+            {DELIVERY_RETENTION_MEDIA_CTE}
+            UPDATE jobs
+            SET reason_code='resource_purged',
+              last_error=(
+                'local archive was deleted after Telegram delivery retention elapsed'
+              ),
+              finished_at=COALESCE(finished_at, ?),
+              updated_at=?
+            WHERE job_type='download'
+              AND state='cancelled'
+              AND reason_code='live_recording_exists'
+              AND media_id IN (
+                SELECT media_id
+                FROM media_groups
+                WHERE group_key=?
+              )
+            """,
+            (changed_at, changed_at, str(group_key)),
+        )
+
+    @staticmethod
+    def _retention_skip_result(
+        *,
+        artifact_id: int,
+        media_id: int,
+        title: str,
+        updated_at: str,
+        resource_revision: str,
+        reason: str,
+    ) -> dict[str, object]:
+        return {
+            "artifact_id": artifact_id,
+            "media_id": media_id,
+            "title": title,
+            "completed": False,
+            "skipped": True,
+            "skip_reason": reason,
+            "deleted_files": 0,
+            "missing_files": 0,
+            "failed_files": 0,
+            "freed_bytes": 0,
+            "errors": [],
+            "updated_at": updated_at,
+            "resource_revision": resource_revision,
+        }
+
     def purge_disk_resource(
         self,
         artifact_id: int,
-        download_root: Path,
+        download_root: StorageRoots,
         *,
         expected_revision: str,
+        source: str = "telegram_panel",
+        delivery_retention_before: str | None = None,
+    ) -> dict[str, object]:
+        return self._purge_disk_artifacts(
+            artifact_id,
+            download_root,
+            expected_revision=expected_revision,
+            source=source,
+            delivery_retention_before=delivery_retention_before,
+            process_retention_before=None,
+        )
+
+    def purge_process_artifacts(
+        self,
+        artifact_id: int,
+        download_root: StorageRoots,
+        *,
+        expected_revision: str,
+        delivered_before: str,
+    ) -> dict[str, object]:
+        """Purge only explicitly tracked delivery-process artifacts."""
+
+        return self._purge_disk_artifacts(
+            artifact_id,
+            download_root,
+            expected_revision=expected_revision,
+            source=DELIVERY_PROCESS_RETENTION_SOURCE,
+            delivery_retention_before=None,
+            process_retention_before=delivered_before,
+        )
+
+    def archive_master(
+        self,
+        artifact_id: int,
+        download_root: Path,
+        archive_root: Path,
+        *,
+        expected_revision: str,
+        delivered_before: str,
+        require_mount: bool = True,
+    ) -> dict[str, object]:
+        """Move one delivered master to a user-mounted archive filesystem."""
+
+        source_root, destination_root = _validate_archive_root(
+            download_root,
+            archive_root,
+            require_mount=require_mount,
+        )
+        storage_roots = (source_root, destination_root)
+        target_id = int(artifact_id)
+        operation_id = uuid.uuid4().hex
+        claimed_at = now_iso()
+        source_path: Path
+        target_path: Path
+        source_inspection: dict[str, object]
+        media_id: int
+        title: str
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            anchor = self.conn.execute(
+                f"""
+                {DISK_RESOURCE_CTE}
+                SELECT a.*, resources.title AS media_title
+                FROM resources
+                JOIN artifacts a ON a.id=resources.artifact_id
+                WHERE resources.artifact_id=?
+                """,
+                (target_id,),
+            ).fetchone()
+            if anchor is None:
+                raise ValueError("resource no longer exists in the local library")
+            media_id = int(anchor["media_id"])
+            title = str(anchor["media_title"])
+            archive_status = self._delivery_archive_status(
+                media_id,
+                delivered_before,
+            )
+            metadata = _json_object(anchor["metadata_json"])
+            if (
+                archive_status is None
+                or str(anchor["role"]) != "master"
+                or int(anchor["part_no"]) != 0
+                or str(anchor["state"]) != "ready"
+                or _json_object(metadata.get("archive")).get("archived_at")
+            ):
+                self.conn.commit()
+                return {
+                    "artifact_id": target_id,
+                    "media_id": media_id,
+                    "title": title,
+                    "completed": False,
+                    "archived": False,
+                    "skipped": True,
+                    "copied_bytes": 0,
+                    "source_deleted": False,
+                    "errors": ["archive eligibility changed before transfer"],
+                }
+
+            resource_rows = self.conn.execute(
+                """
+                SELECT id, role, part_no, path, size_bytes, state,
+                  metadata_json, updated_at
+                FROM artifacts
+                WHERE media_id=? AND state!='purged'
+                ORDER BY CASE role WHEN 'master' THEN 1 ELSE 0 END, id
+                """,
+                (media_id,),
+            ).fetchall()
+            inspected_by_id = {
+                int(row["id"]): _inspect_storage_path(
+                    Path(str(row["path"])),
+                    storage_roots,
+                )
+                for row in resource_rows
+            }
+            if (
+                _artifact_set_revision(resource_rows, inspected_by_id)
+                != str(expected_revision)
+            ):
+                raise ValueError(
+                    "resource changed after archive selection; review it again"
+                )
+            source_inspection = inspected_by_id[target_id]
+            source_path = Path(str(anchor["path"]))
+            if (
+                not bool(source_inspection["safe"])
+                or not bool(source_inspection["exists"])
+                or source_inspection.get("storage_root") != str(source_root)
+                or int(anchor["size_bytes"]) <= 0
+                or int(source_inspection["actual_bytes"])
+                != int(anchor["size_bytes"])
+            ):
+                raise ValueError(
+                    "master is missing, incomplete, or already outside downloads"
+                )
+            relative = Path(str(source_inspection["relative_path"]))
+            target_path = destination_root / relative
+            existing_move = self.conn.execute(
+                """
+                SELECT state, owner_pid, owner_start_id, operation_id,
+                  source_path, target_path
+                FROM artifact_archive_moves
+                WHERE artifact_id=?
+                """,
+                (target_id,),
+            ).fetchone()
+            if existing_move is not None and str(existing_move["state"]) in {
+                "copying",
+                "source_cleanup",
+            }:
+                if _process_instance_is_alive(
+                    int(existing_move["owner_pid"]),
+                    str(existing_move["owner_start_id"]),
+                ):
+                    self.conn.commit()
+                    return {
+                        "artifact_id": target_id,
+                        "media_id": media_id,
+                        "title": title,
+                        "completed": False,
+                        "archived": False,
+                        "skipped": True,
+                        "copied_bytes": 0,
+                        "source_deleted": False,
+                        "errors": ["another archive transfer owns this master"],
+                    }
+            if (
+                existing_move is not None
+                and str(existing_move["state"]) == "retry"
+                and str(existing_move["source_path"])
+                == str(source_inspection["normalized_path"])
+                and str(existing_move["target_path"]) == str(target_path)
+            ):
+                operation_id = str(existing_move["operation_id"])
+            self.conn.execute(
+                """
+                INSERT INTO artifact_archive_moves(
+                  artifact_id, media_id, operation_id, source_path,
+                  target_path, source_identity_json, state, owner_pid,
+                  owner_start_id, created_at, updated_at, error
+                ) VALUES (?, ?, ?, ?, ?, ?, 'copying', ?, ?, ?, ?, NULL)
+                ON CONFLICT(artifact_id) DO UPDATE SET
+                  media_id=excluded.media_id,
+                  operation_id=excluded.operation_id,
+                  source_path=excluded.source_path,
+                  target_path=excluded.target_path,
+                  source_identity_json=excluded.source_identity_json,
+                  state='copying',
+                  owner_pid=excluded.owner_pid,
+                  owner_start_id=excluded.owner_start_id,
+                  updated_at=excluded.updated_at,
+                  error=NULL
+                """,
+                (
+                    target_id,
+                    media_id,
+                    operation_id,
+                    str(source_inspection["normalized_path"]),
+                    str(target_path),
+                    json.dumps(
+                        _storage_identity_payload(source_inspection),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    os.getpid(),
+                    _process_start_id(os.getpid()),
+                    claimed_at,
+                    claimed_at,
+                ),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+        try:
+            target_inspection, source_digest, _created = (
+                _copy_file_to_archive(
+                    source_path,
+                    target_path,
+                    source_inspection=source_inspection,
+                    source_root=source_root,
+                    archive_root=destination_root,
+                    operation_id=operation_id,
+                    require_mount=require_mount,
+                )
+            )
+        except Exception as exc:
+            self._mark_archive_move_retry(target_id, operation_id, str(exc))
+            raise
+
+        archived_at = now_iso()
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            move = self.conn.execute(
+                """
+                SELECT state FROM artifact_archive_moves
+                WHERE artifact_id=? AND operation_id=?
+                """,
+                (target_id, operation_id),
+            ).fetchone()
+            anchor = self.conn.execute(
+                """
+                SELECT a.*, mi.title AS media_title
+                FROM artifacts a
+                JOIN media_items mi ON mi.id=a.media_id
+                WHERE a.id=?
+                """,
+                (target_id,),
+            ).fetchone()
+            if (
+                move is None
+                or str(move["state"]) != "copying"
+                or anchor is None
+                or str(anchor["path"]) != str(source_path)
+                or str(anchor["state"]) != "ready"
+                or self._delivery_archive_status(media_id, delivered_before)
+                is None
+            ):
+                self.conn.rollback()
+                self._mark_archive_move_retry(
+                    target_id,
+                    operation_id,
+                    "archive eligibility changed after copy",
+                )
+                return {
+                    "artifact_id": target_id,
+                    "media_id": media_id,
+                    "title": title,
+                    "completed": False,
+                    "archived": False,
+                    "skipped": True,
+                    "copied_bytes": int(source_inspection["actual_bytes"]),
+                    "source_deleted": False,
+                    "errors": ["archive eligibility changed after copy"],
+                }
+            resource_rows = self.conn.execute(
+                """
+                SELECT id, role, part_no, path, size_bytes, state,
+                  metadata_json, updated_at
+                FROM artifacts
+                WHERE media_id=? AND state!='purged'
+                ORDER BY CASE role WHEN 'master' THEN 1 ELSE 0 END, id
+                """,
+                (media_id,),
+            ).fetchall()
+            current_inspections = {
+                int(row["id"]): _inspect_storage_path(
+                    Path(str(row["path"])),
+                    storage_roots,
+                )
+                for row in resource_rows
+            }
+            current_source = current_inspections.get(target_id)
+            current_target = _inspect_storage_path(
+                target_path,
+                (destination_root,),
+            )
+            _validate_archive_root(
+                source_root,
+                destination_root,
+                require_mount=require_mount,
+            )
+            if (
+                current_source is None
+                or not _storage_identity_matches(
+                    current_source,
+                    source_inspection,
+                )
+                or _artifact_set_revision(resource_rows, current_inspections)
+                != str(expected_revision)
+                or not _storage_identity_matches(
+                    current_target,
+                    target_inspection,
+                )
+            ):
+                raise ValueError(
+                    "master or archive target changed before path commit"
+                )
+            metadata = _json_object(anchor["metadata_json"])
+            metadata["archive"] = {
+                "backend": "mounted_filesystem",
+                "root": str(destination_root),
+                "relative_path": str(target_path.relative_to(destination_root)),
+                "source_path": str(source_inspection["normalized_path"]),
+                "archived_at": archived_at,
+                "verified_at": archived_at,
+                "sha256": source_digest,
+                "require_mount": bool(require_mount),
+                "source_cleanup_pending": True,
+            }
+            self.conn.execute(
+                """
+                UPDATE artifacts
+                SET path=?, metadata_json=?, updated_at=?
+                WHERE id=? AND path=? AND state='ready'
+                """,
+                (
+                    str(target_path),
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                    archived_at,
+                    target_id,
+                    str(source_path),
+                ),
+            )
+            self.conn.execute(
+                """
+                UPDATE artifact_archive_moves
+                SET state='source_cleanup', owner_pid=?, owner_start_id=?,
+                  updated_at=?, error=NULL
+                WHERE artifact_id=? AND operation_id=? AND state='copying'
+                """,
+                (
+                    os.getpid(),
+                    _process_start_id(os.getpid()),
+                    archived_at,
+                    target_id,
+                    operation_id,
+                ),
+            )
+            self.conn.commit()
+        except Exception as exc:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            self._mark_archive_move_retry(target_id, operation_id, str(exc))
+            raise
+
+        cleanup = self.cleanup_archived_master_source(
+            target_id,
+            storage_roots,
+        )
+        return {
+            "artifact_id": target_id,
+            "media_id": media_id,
+            "title": title,
+            "completed": bool(cleanup["completed"]),
+            "archived": True,
+            "skipped": False,
+            "copied_bytes": int(source_inspection["actual_bytes"]),
+            "source_deleted": bool(cleanup["source_deleted"]),
+            "errors": list(cleanup["errors"]),
+            "path": str(target_path),
+        }
+
+    def _mark_archive_move_retry(
+        self,
+        artifact_id: int,
+        operation_id: str,
+        error: str,
+    ) -> None:
+        changed_at = now_iso()
+        if self.conn.in_transaction:
+            self.conn.rollback()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                """
+                UPDATE artifact_archive_moves
+                SET state='retry', owner_pid=0, owner_start_id='',
+                  updated_at=?, error=?
+                WHERE artifact_id=? AND operation_id=? AND state='copying'
+                """,
+                (
+                    changed_at,
+                    str(error)[:500],
+                    int(artifact_id),
+                    str(operation_id),
+                ),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def cleanup_archived_master_source(
+        self,
+        artifact_id: int,
+        storage_roots: StorageRoots,
+    ) -> dict[str, object]:
+        """Remove the verified source duplicate after the DB points at archive."""
+
+        target_id = int(artifact_id)
+        roots = _normalized_storage_roots(storage_roots)
+        move = self.conn.execute(
+            """
+            SELECT * FROM artifact_archive_moves
+            WHERE artifact_id=? AND state='source_cleanup'
+            """,
+            (target_id,),
+        ).fetchone()
+        artifact = self.conn.execute(
+            "SELECT * FROM artifacts WHERE id=?",
+            (target_id,),
+        ).fetchone()
+        if move is None:
+            return {
+                "completed": True,
+                "source_deleted": False,
+                "errors": [],
+            }
+        if artifact is None:
+            self.conn.execute(
+                "DELETE FROM artifact_archive_moves WHERE artifact_id=?",
+                (target_id,),
+            )
+            self.conn.commit()
+            return {
+                "completed": True,
+                "source_deleted": False,
+                "errors": [],
+            }
+        metadata = _json_object(artifact["metadata_json"])
+        archive_metadata = _json_object(metadata.get("archive"))
+        source_expected = _json_object(move["source_identity_json"])
+        source_path = Path(str(move["source_path"]))
+        target_path = Path(str(move["target_path"]))
+        source_now = _inspect_storage_path(source_path, roots)
+        target_now = _inspect_storage_path(target_path, roots)
+        expected_digest = str(archive_metadata.get("sha256") or "")
+        archive_root = Path(str(archive_metadata.get("root") or ""))
+        source_root = Path(str(source_expected.get("storage_root") or ""))
+        require_mount = archive_metadata.get("require_mount") is not False
+        archive_root_error = ""
+        try:
+            _validated_source, validated_archive = _validate_archive_root(
+                source_root,
+                archive_root,
+                require_mount=require_mount,
+            )
+        except (OSError, ValueError) as exc:
+            archive_root_error = str(exc)
+            validated_archive = archive_root
+        if (
+            str(artifact["path"]) != str(target_path)
+            or bool(archive_root_error)
+            or not bool(source_now["safe"])
+            or not bool(target_now["safe"])
+            or not bool(target_now["exists"])
+            or target_now.get("storage_root") != str(validated_archive)
+            or int(target_now["actual_bytes"]) != int(artifact["size_bytes"])
+            or _storage_identities_alias(target_now, source_now)
+            or not expected_digest
+        ):
+            detail = f": {archive_root_error}" if archive_root_error else ""
+            error = (
+                "archived master is unavailable; source duplicate was kept"
+                f"{detail}"
+            )
+            self.conn.execute(
+                """
+                UPDATE artifact_archive_moves
+                SET owner_pid=0, owner_start_id='', updated_at=?, error=?
+                WHERE artifact_id=? AND state='source_cleanup'
+                """,
+                (now_iso(), error, target_id),
+            )
+            self.conn.commit()
+            return {
+                "completed": False,
+                "source_deleted": False,
+                "errors": [error],
+            }
+        try:
+            target_digest = _hash_storage_file(target_path, target_now)
+        except (OSError, ValueError) as exc:
+            target_digest = ""
+            verification_error = str(exc)
+        else:
+            verification_error = ""
+        if target_digest != expected_digest:
+            detail = f": {verification_error}" if verification_error else ""
+            error = (
+                "archived master checksum changed; source duplicate was kept"
+                f"{detail}"
+            )
+            self.conn.execute(
+                """
+                UPDATE artifact_archive_moves
+                SET owner_pid=0, owner_start_id='', updated_at=?, error=?
+                WHERE artifact_id=? AND state='source_cleanup'
+                """,
+                (now_iso(), error, target_id),
+            )
+            self.conn.commit()
+            return {
+                "completed": False,
+                "source_deleted": False,
+                "errors": [error],
+            }
+        if bool(source_now["exists"]) and not _storage_identity_matches(
+            source_now,
+            source_expected,
+        ):
+            error = "source path was reused; unknown file was not deleted"
+            self.conn.execute(
+                """
+                UPDATE artifact_archive_moves
+                SET state='orphaned', owner_pid=0, owner_start_id='',
+                  updated_at=?, error=?
+                WHERE artifact_id=? AND state='source_cleanup'
+                """,
+                (now_iso(), error, target_id),
+            )
+            self.conn.commit()
+            return {
+                "completed": False,
+                "source_deleted": False,
+                "errors": [error],
+            }
+
+        deleted = False
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            current_move = self.conn.execute(
+                """
+                SELECT state FROM artifact_archive_moves
+                WHERE artifact_id=?
+                """,
+                (target_id,),
+            ).fetchone()
+            current_artifact = self.conn.execute(
+                "SELECT path, metadata_json FROM artifacts WHERE id=?",
+                (target_id,),
+            ).fetchone()
+            _validate_archive_root(
+                source_root,
+                archive_root,
+                require_mount=require_mount,
+            )
+            current_source = _inspect_storage_path(source_path, roots)
+            current_target = _inspect_storage_path(target_path, roots)
+            if (
+                current_move is None
+                or str(current_move["state"]) != "source_cleanup"
+                or current_artifact is None
+                or str(current_artifact["path"]) != str(target_path)
+                or not _storage_identity_matches(current_target, target_now)
+            ):
+                raise ValueError("archive cleanup state changed before unlink")
+            if bool(current_source["exists"]):
+                if not _storage_identity_matches(current_source, source_expected):
+                    raise ValueError("source path changed before archive cleanup")
+                _unlink_tracked_file(source_path, roots, source_expected)
+                deleted = True
+            finished_at = now_iso()
+            current_metadata = _json_object(current_artifact["metadata_json"])
+            current_archive = _json_object(current_metadata.get("archive"))
+            current_archive.update(
+                {
+                    "source_cleanup_pending": False,
+                    "source_deleted_at": finished_at,
+                }
+            )
+            current_metadata["archive"] = current_archive
+            self.conn.execute(
+                """
+                UPDATE artifacts SET metadata_json=?, updated_at=? WHERE id=?
+                """,
+                (
+                    json.dumps(
+                        current_metadata,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    finished_at,
+                    target_id,
+                ),
+            )
+            self.conn.execute(
+                "DELETE FROM artifact_archive_moves WHERE artifact_id=?",
+                (target_id,),
+            )
+            self.conn.commit()
+        except Exception as exc:
+            self.conn.rollback()
+            error = str(exc)
+            self.conn.execute(
+                """
+                UPDATE artifact_archive_moves
+                SET owner_pid=0, owner_start_id='', updated_at=?, error=?
+                WHERE artifact_id=? AND state='source_cleanup'
+                """,
+                (now_iso(), error[:500], target_id),
+            )
+            self.conn.commit()
+            return {
+                "completed": False,
+                "source_deleted": False,
+                "errors": [error],
+            }
+        return {
+            "completed": True,
+            "source_deleted": deleted,
+            "errors": [],
+        }
+
+    def _purge_disk_artifacts(
+        self,
+        artifact_id: int,
+        download_root: StorageRoots,
+        *,
+        expected_revision: str,
+        source: str,
+        delivery_retention_before: str | None,
+        process_retention_before: str | None,
     ) -> dict[str, object]:
         """Purge exact tracked files while retaining media and delivery history.
 
         A short ``purging`` tombstone phase keeps workers from treating an
-        intentional deletion as an accidental missing artifact. Related
-        queued/retry/blocked jobs are cancelled before unlinking starts.
+        intentional deletion as an accidental missing artifact. Panel deletes
+        cancel related pending jobs. Retention deletes instead fail closed if
+        any job in the delivery group is no longer terminal.
         """
 
         target_id = int(artifact_id)
-        root = Path(download_root).expanduser()
+        storage_roots = _normalized_storage_roots(download_root)
         operation_id = uuid.uuid4().hex
         requested_at = now_iso()
+        purge_source = str(source).strip() or "telegram_panel"
+        if (
+            delivery_retention_before is not None
+            and process_retention_before is not None
+        ):
+            raise ValueError("full and process retention are mutually exclusive")
+        process_cleanup = process_retention_before is not None
+        retention_group_key: str | None = None
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             anchor = self.conn.execute(
@@ -1033,6 +2361,81 @@ class Store:
                 raise ValueError("resource no longer exists in the local library")
 
             media_id = int(anchor["media_id"])
+            archive_move = self.conn.execute(
+                """
+                SELECT state FROM artifact_archive_moves
+                WHERE media_id=?
+                  AND state IN ('copying', 'retry', 'source_cleanup')
+                LIMIT 1
+                """,
+                (media_id,),
+            ).fetchone()
+            if archive_move is not None and process_retention_before is None:
+                if delivery_retention_before is not None:
+                    self.conn.commit()
+                    return self._retention_skip_result(
+                        artifact_id=target_id,
+                        media_id=media_id,
+                        title=str(anchor["media_title"]),
+                        updated_at=str(anchor["updated_at"]),
+                        resource_revision=str(expected_revision),
+                        reason="master archive transfer is still being finalized",
+                    )
+                raise ValueError(
+                    "resource is being transferred to the archive directory"
+                )
+            if delivery_retention_before is not None:
+                retention_status = self._delivery_retention_group_status(
+                    media_id,
+                    delivery_retention_before,
+                )
+                if (
+                    retention_status is None
+                    or str(anchor["state"])
+                    not in {"ready", "suppressed", "purge_failed"}
+                    or not self._delivery_retention_artifact_is_eligible(
+                        anchor,
+                        retention_status,
+                    )
+                ):
+                    self.conn.commit()
+                    return self._retention_skip_result(
+                        artifact_id=target_id,
+                        media_id=media_id,
+                        title=str(anchor["media_title"]),
+                        updated_at=str(anchor["updated_at"]),
+                        resource_revision=str(expected_revision),
+                        reason=(
+                            "delivery retention eligibility changed before "
+                            "deletion was reserved"
+                        ),
+                    )
+                retention_group_key = str(retention_status["group_key"])
+            elif process_retention_before is not None:
+                process_status = self._delivery_process_retention_status(
+                    media_id,
+                    process_retention_before,
+                )
+                if (
+                    process_status is None
+                    or str(anchor["role"]) != "master"
+                    or int(anchor["part_no"]) != 0
+                    or str(anchor["state"]) != "ready"
+                ):
+                    self.conn.commit()
+                    return self._retention_skip_result(
+                        artifact_id=target_id,
+                        media_id=media_id,
+                        title=str(anchor["media_title"]),
+                        updated_at=str(anchor["updated_at"]),
+                        resource_revision=str(expected_revision),
+                        reason=(
+                            "process retention eligibility changed before "
+                            "deletion was reserved"
+                        ),
+                    )
+                retention_group_key = str(process_status["group_key"])
+
             running = self.conn.execute(
                 """
                 SELECT job_type
@@ -1043,12 +2446,16 @@ class Store:
                 """,
                 (media_id,),
             ).fetchone()
-            if running is not None:
+            if (
+                delivery_retention_before is None
+                and process_retention_before is None
+                and running is not None
+            ):
                 raise ValueError(
                     "resource is currently being downloaded or delivered; try again later"
                 )
 
-            artifact_rows = self.conn.execute(
+            resource_rows = self.conn.execute(
                 """
                 SELECT id, role, part_no, path, size_bytes, state,
                   metadata_json, updated_at
@@ -1058,23 +2465,94 @@ class Store:
                 """,
                 (media_id,),
             ).fetchall()
+            artifact_rows = (
+                [
+                    artifact
+                    for artifact in resource_rows
+                    if self._is_delivery_process_artifact(artifact)
+                    and str(artifact["state"])
+                    in {"ready", "purge_failed"}
+                ]
+                if process_cleanup
+                else list(resource_rows)
+            )
+            if not artifact_rows:
+                self.conn.commit()
+                return self._retention_skip_result(
+                    artifact_id=target_id,
+                    media_id=media_id,
+                    title=str(anchor["media_title"]),
+                    updated_at=str(anchor["updated_at"]),
+                    resource_revision=str(expected_revision),
+                    reason="no eligible process artifacts remain",
+                )
             inspected_by_id: dict[int, dict[str, object]] = {}
             normalized_paths: set[str] = set()
-            for artifact in artifact_rows:
+            selected_ids = {int(artifact["id"]) for artifact in artifact_rows}
+            for artifact in resource_rows:
                 inspected = _inspect_storage_path(
                     Path(str(artifact["path"])),
-                    root,
+                    storage_roots,
                 )
-                if not bool(inspected["safe"]):
+                artifact_row_id = int(artifact["id"])
+                if (
+                    artifact_row_id in selected_ids
+                    and not bool(inspected["safe"])
+                ):
                     raise ValueError(
                         "refusing to delete an unsafe tracked path: "
                         f"{inspected['unsafe_reason']}"
                     )
-                artifact_row_id = int(artifact["id"])
                 inspected_by_id[artifact_row_id] = inspected
-                normalized_paths.add(str(inspected["normalized_path"]))
+                if artifact_row_id in selected_ids:
+                    normalized_paths.add(str(inspected["normalized_path"]))
+            if process_cleanup:
+                retained_master = next(
+                    (
+                        artifact
+                        for artifact in resource_rows
+                        if str(artifact["role"]) == "master"
+                        and int(artifact["part_no"]) == 0
+                        and str(artifact["state"]) == "ready"
+                    ),
+                    None,
+                )
+                master_inspection = (
+                    inspected_by_id[int(retained_master["id"])]
+                    if retained_master is not None
+                    else None
+                )
+                master_recorded_bytes = (
+                    int(retained_master["size_bytes"])
+                    if retained_master is not None
+                    else 0
+                )
+                if (
+                    master_inspection is None
+                    or not bool(master_inspection["safe"])
+                    or not bool(master_inspection["exists"])
+                    or master_recorded_bytes <= 0
+                    or int(master_inspection["actual_bytes"])
+                    != master_recorded_bytes
+                ):
+                    current_revision = _artifact_set_revision(
+                        resource_rows,
+                        inspected_by_id,
+                    )
+                    self.conn.commit()
+                    return self._retention_skip_result(
+                        artifact_id=target_id,
+                        media_id=media_id,
+                        title=str(anchor["media_title"]),
+                        updated_at=str(anchor["updated_at"]),
+                        resource_revision=current_revision,
+                        reason=(
+                            "retained master is missing, unsafe, or incomplete; "
+                            "process artifacts were kept"
+                        ),
+                    )
             if (
-                _artifact_set_revision(artifact_rows, inspected_by_id)
+                _artifact_set_revision(resource_rows, inspected_by_id)
                 != str(expected_revision)
             ):
                 raise ValueError(
@@ -1082,12 +2560,13 @@ class Store:
                 )
 
             if self._find_shared_resource_path(
-                media_id,
+                selected_ids,
                 normalized_paths,
-                root,
+                storage_roots,
             ) is not None:
                 raise ValueError(
-                    "refusing to delete a file referenced by another media item"
+                    "refusing to delete a file referenced by another media item "
+                    "or retained artifact"
                 )
 
             for storage_key in sorted(normalized_paths):
@@ -1166,14 +2645,45 @@ class Store:
                         "one of the tracked files is already reserved for deletion"
                     ) from exc
 
+            retention_fallback = (
+                delivery_retention_before is not None
+                and self._delivery_retention_fallback_artifact(anchor)
+            )
             for artifact in artifact_rows:
                 metadata = _json_object(artifact["metadata_json"])
-                metadata["local_purge"] = {
+                purge_metadata: dict[str, object] = {
                     "operation_id": operation_id,
                     "requested_at": requested_at,
                     "previous_state": str(artifact["state"]),
-                    "source": "telegram_panel",
+                    "source": purge_source,
                 }
+                if delivery_retention_before is not None:
+                    purge_metadata.update(
+                        {
+                            "delivery_retention_before": str(
+                                delivery_retention_before
+                            ),
+                            "retention_group_key": retention_group_key,
+                            "retention_fallback": retention_fallback,
+                            "path_existed": bool(
+                                inspected_by_id[int(artifact["id"])]["exists"]
+                            ),
+                        }
+                    )
+                elif process_retention_before is not None:
+                    purge_metadata.update(
+                        {
+                            "delivery_retention_before": str(
+                                process_retention_before
+                            ),
+                            "retention_group_key": retention_group_key,
+                            "retention_scope": "process",
+                            "path_existed": bool(
+                                inspected_by_id[int(artifact["id"])]["exists"]
+                            ),
+                        }
+                    )
+                metadata["local_purge"] = purge_metadata
                 self.conn.execute(
                     """
                     UPDATE artifacts
@@ -1186,22 +2696,29 @@ class Store:
                         int(artifact["id"]),
                     ),
                 )
-            self.conn.execute(
-                """
-                UPDATE jobs
-                SET state='cancelled',
-                  reason_code='resource_purged',
-                  last_error='local archive was deleted from the Telegram panel',
-                  lease_owner=NULL,
-                  lease_token=NULL,
-                  lease_until=NULL,
-                  available_at=?,
-                  finished_at=?,
-                  updated_at=?
-                WHERE media_id=? AND state IN ('queued', 'retry', 'blocked')
-                """,
-                (requested_at, requested_at, requested_at, media_id),
-            )
+            if (
+                delivery_retention_before is None
+                and process_retention_before is None
+            ):
+                self.conn.execute(
+                    """
+                    UPDATE jobs
+                    SET state='cancelled',
+                      reason_code='resource_purged',
+                      last_error=(
+                        'local archive was deleted from the Telegram panel'
+                      ),
+                      lease_owner=NULL,
+                      lease_token=NULL,
+                      lease_until=NULL,
+                      available_at=?,
+                      finished_at=?,
+                      updated_at=?
+                    WHERE media_id=?
+                      AND state IN ('queued', 'retry', 'blocked')
+                    """,
+                    (requested_at, requested_at, requested_at, media_id),
+                )
             self.conn.commit()
         except Exception:
             self.conn.rollback()
@@ -1212,25 +2729,34 @@ class Store:
             target_id=target_id,
             title=str(anchor["media_title"]),
             artifact_rows=artifact_rows,
+            resource_rows=resource_rows,
             inspected_by_id=inspected_by_id,
-            root=root,
+            root=storage_roots,
             operation_id=operation_id,
             requested_at=requested_at,
+            source=purge_source,
+            delivery_retention_before=delivery_retention_before,
+            process_retention_before=process_retention_before,
+            retention_group_key=retention_group_key,
         )
 
     def _find_shared_resource_path(
         self,
-        media_id: int,
+        selected_artifact_ids: set[int],
         normalized_paths: set[str],
-        root: Path,
+        root: StorageRoots,
     ) -> str | None:
+        if not selected_artifact_ids:
+            return None
+        placeholders = ",".join("?" for _ in selected_artifact_ids)
         other_paths = self.conn.execute(
-            """
+            f"""
             SELECT path
             FROM artifacts
-            WHERE media_id!=? AND state!='purged'
+            WHERE state!='purged'
+              AND id NOT IN ({placeholders})
             """,
-            (media_id,),
+            tuple(sorted(selected_artifact_ids)),
         ).fetchall()
         for other in other_paths:
             inspected = _inspect_storage_path(
@@ -1249,10 +2775,15 @@ class Store:
         target_id: int,
         title: str,
         artifact_rows: list[sqlite3.Row],
+        resource_rows: list[sqlite3.Row],
         inspected_by_id: dict[int, dict[str, object]],
-        root: Path,
+        root: StorageRoots,
         operation_id: str,
         requested_at: str,
+        source: str,
+        delivery_retention_before: str | None,
+        process_retention_before: str | None,
+        retention_group_key: str | None,
     ) -> dict[str, object]:
         path_groups: dict[str, dict[str, object]] = {}
         for artifact in artifact_rows:
@@ -1302,7 +2833,7 @@ class Store:
                     str(row["path"]),
                     int(row["size_bytes"]),
                 )
-                for row in artifact_rows
+                for row in resource_rows
             ]
             current_shape = [
                 (
@@ -1314,9 +2845,22 @@ class Store:
                 )
                 for row in current_rows
             ]
+            selected_ids = {int(row["id"]) for row in artifact_rows}
+            original_by_id = {
+                int(row["id"]): row for row in resource_rows
+            }
             validation_error: str | None = None
             if current_shape != expected_shape or any(
-                str(row["state"]) != "purging" for row in current_rows
+                (
+                    str(row["state"]) != "purging"
+                    if int(row["id"]) in selected_ids
+                    else (
+                        int(row["id"]) not in original_by_id
+                        or str(row["state"])
+                        != str(original_by_id[int(row["id"])]["state"])
+                    )
+                )
+                for row in current_rows
             ):
                 validation_error = (
                     "resource changed after deletion was reserved"
@@ -1336,6 +2880,132 @@ class Store:
             expected_paths = set(path_groups)
             if validation_error is None and reserved_paths != expected_paths:
                 validation_error = "local deletion reservation was lost"
+
+            retention_skip_reason: str | None = None
+            if delivery_retention_before is not None:
+                retention_status = self._delivery_retention_group_status(
+                    media_id,
+                    delivery_retention_before,
+                )
+                target_artifact = next(
+                    (
+                        row
+                        for row in resource_rows
+                        if int(row["id"]) == target_id
+                    ),
+                    None,
+                )
+                if (
+                    retention_status is None
+                    or str(retention_status["group_key"])
+                    != str(retention_group_key)
+                    or target_artifact is None
+                    or not self._delivery_retention_artifact_is_eligible(
+                        target_artifact,
+                        retention_status,
+                    )
+                ):
+                    retention_skip_reason = (
+                        "delivery retention eligibility changed after deletion "
+                        "was reserved"
+                    )
+            elif process_retention_before is not None:
+                process_status = self._delivery_process_retention_status(
+                    media_id,
+                    process_retention_before,
+                    include_purging=True,
+                )
+                if (
+                    process_status is None
+                    or str(process_status["group_key"])
+                    != str(retention_group_key)
+                ):
+                    retention_skip_reason = (
+                        "process retention eligibility changed after deletion "
+                        "was reserved"
+                    )
+
+            if retention_skip_reason is not None:
+                skipped_at = now_iso()
+                original_by_id = {
+                    int(row["id"]): row for row in artifact_rows
+                }
+                for current in current_rows:
+                    artifact_row_id = int(current["id"])
+                    original = original_by_id.get(artifact_row_id)
+                    if original is None:
+                        continue
+                    metadata = _json_object(current["metadata_json"])
+                    purge_metadata = _json_object(metadata.get("local_purge"))
+                    purge_metadata.update(
+                        {
+                            "finished_at": skipped_at,
+                            "result": "skipped",
+                            "error": retention_skip_reason,
+                        }
+                    )
+                    metadata["local_purge"] = purge_metadata
+                    self.conn.execute(
+                        """
+                        UPDATE artifacts
+                        SET state=?, metadata_json=?, updated_at=?
+                        WHERE id=? AND state='purging'
+                        """,
+                        (
+                            str(original["state"]),
+                            json.dumps(
+                                metadata,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            skipped_at,
+                            artifact_row_id,
+                        ),
+                    )
+                self.conn.execute(
+                    """
+                    DELETE FROM purge_path_reservations
+                    WHERE operation_id=? AND state='active'
+                    """,
+                    (operation_id,),
+                )
+                self.conn.commit()
+                remaining_rows = self.conn.execute(
+                    """
+                    SELECT id, role, part_no, path, size_bytes, state,
+                      metadata_json, updated_at
+                    FROM artifacts
+                    WHERE media_id=? AND state!='purged'
+                    ORDER BY CASE role WHEN 'master' THEN 1 ELSE 0 END, id
+                    """,
+                    (media_id,),
+                ).fetchall()
+                remaining_inspections = {
+                    int(row["id"]): _inspect_storage_path(
+                        Path(str(row["path"])),
+                        root,
+                    )
+                    for row in remaining_rows
+                }
+                anchor_row = self.conn.execute(
+                    "SELECT updated_at FROM artifacts WHERE id=?",
+                    (target_id,),
+                ).fetchone()
+                return self._retention_skip_result(
+                    artifact_id=target_id,
+                    media_id=media_id,
+                    title=title,
+                    updated_at=(
+                        str(anchor_row["updated_at"])
+                        if anchor_row is not None
+                        else skipped_at
+                    ),
+                    resource_revision=_artifact_set_revision(
+                        remaining_rows,
+                        remaining_inspections,
+                    ),
+                    reason=retention_skip_reason,
+                )
 
             running = self.conn.execute(
                 """
@@ -1359,7 +3029,10 @@ class Store:
                         root,
                     )
                     initial = inspected_by_id[artifact_row_id]
-                    if not bool(current["safe"]):
+                    if (
+                        artifact_row_id in selected_ids
+                        and not bool(current["safe"])
+                    ):
                         validation_error = (
                             "refusing to delete an unsafe tracked path: "
                             f"{current['unsafe_reason']}"
@@ -1374,7 +3047,7 @@ class Store:
             if (
                 validation_error is None
                 and self._find_shared_resource_path(
-                    media_id,
+                    selected_ids,
                     expected_paths,
                     root,
                 )
@@ -1394,30 +3067,43 @@ class Store:
                     for artifact_row_id in group["artifact_ids"]:
                         result_by_id[int(artifact_row_id)] = result
             else:
-                self.conn.execute(
-                    """
-                    UPDATE jobs
-                    SET state='cancelled',
-                      reason_code='resource_purged',
-                      last_error=(
-                        'local archive was deleted from the Telegram panel'
-                      ),
-                      lease_owner=NULL,
-                      lease_token=NULL,
-                      lease_until=NULL,
-                      available_at=?,
-                      finished_at=?,
-                      updated_at=?
-                    WHERE media_id=?
-                      AND state IN ('queued', 'retry', 'blocked')
-                    """,
-                    (
+                if (
+                    delivery_retention_before is None
+                    and process_retention_before is None
+                ):
+                    self.conn.execute(
+                        """
+                        UPDATE jobs
+                        SET state='cancelled',
+                          reason_code='resource_purged',
+                          last_error=(
+                            'local archive was deleted from the Telegram panel'
+                          ),
+                          lease_owner=NULL,
+                          lease_token=NULL,
+                          lease_until=NULL,
+                          available_at=?,
+                          finished_at=?,
+                          updated_at=?
+                        WHERE media_id=?
+                          AND state IN ('queued', 'retry', 'blocked')
+                        """,
+                        (
+                            requested_at,
+                            requested_at,
+                            requested_at,
+                            media_id,
+                        ),
+                    )
+                elif delivery_retention_before is not None:
+                    if retention_group_key is None:
+                        raise RuntimeError(
+                            "delivery retention group was lost before deletion"
+                        )
+                    self._pin_retention_cancelled_downloads(
+                        retention_group_key,
                         requested_at,
-                        requested_at,
-                        requested_at,
-                        media_id,
-                    ),
-                )
+                    )
                 failure_seen = False
                 for group in ordered_groups:
                     artifact_ids = [
@@ -1483,9 +3169,39 @@ class Store:
                     "requested_at": requested_at,
                     "finished_at": finished_at,
                     "previous_state": str(artifact["state"]),
-                    "source": "telegram_panel",
+                    "source": source,
                     "result": str(outcome["status"]),
                 }
+                if delivery_retention_before is not None:
+                    purge_metadata.update(
+                        {
+                            "delivery_retention_before": str(
+                                delivery_retention_before
+                            ),
+                            "retention_group_key": retention_group_key,
+                            "retention_fallback": (
+                                self._delivery_retention_fallback_artifact(
+                                    artifact
+                                )
+                            ),
+                            "path_existed": bool(
+                                inspected_by_id[artifact_row_id]["exists"]
+                            ),
+                        }
+                    )
+                elif process_retention_before is not None:
+                    purge_metadata.update(
+                        {
+                            "delivery_retention_before": str(
+                                process_retention_before
+                            ),
+                            "retention_group_key": retention_group_key,
+                            "retention_scope": "process",
+                            "path_existed": bool(
+                                inspected_by_id[artifact_row_id]["exists"]
+                            ),
+                        }
+                    )
                 if outcome["error"]:
                     purge_metadata["error"] = str(outcome["error"])[:500]
                 metadata["local_purge"] = purge_metadata
@@ -1519,6 +3235,16 @@ class Store:
             for normalized, group in path_groups.items():
                 first_artifact_id = int(group["artifact_ids"][0])
                 outcome = result_by_id[first_artifact_id]
+                if process_retention_before is not None:
+                    self.conn.execute(
+                        """
+                        DELETE FROM purge_path_reservations
+                        WHERE storage_key=? AND operation_id=?
+                          AND state='active'
+                        """,
+                        (normalized, operation_id),
+                    )
+                    continue
                 if (
                     outcome["status"] in {"deleted", "missing"}
                     or not _path_entry_exists(Path(normalized))
@@ -1550,6 +3276,9 @@ class Store:
                 self._abort_reserved_disk_purge(
                     operation_id,
                     artifact_rows,
+                    release_reservations=(
+                        process_retention_before is not None
+                    ),
                 )
             except Exception:
                 # Startup recovery keeps the durable reservation retryable.
@@ -1582,6 +3311,7 @@ class Store:
             "media_id": media_id,
             "title": title,
             "completed": not failed_paths,
+            "skipped": False,
             "deleted_files": deleted_files,
             "missing_files": missing_files,
             "failed_files": len(failed_paths),
@@ -1602,6 +3332,8 @@ class Store:
         self,
         operation_id: str,
         artifact_rows: list[sqlite3.Row],
+        *,
+        release_reservations: bool = False,
     ) -> None:
         aborted_at = now_iso()
         self.conn.execute("BEGIN IMMEDIATE")
@@ -1643,7 +3375,9 @@ class Store:
             ).fetchall()
             for reservation in reservation_rows:
                 storage_key = str(reservation["storage_key"])
-                if _path_entry_exists(Path(storage_key)):
+                if release_reservations or _path_entry_exists(
+                    Path(storage_key)
+                ):
                     self.conn.execute(
                         """
                         DELETE FROM purge_path_reservations
@@ -2017,6 +3751,19 @@ class Store:
             raise RuntimeError(
                 "artifact path is reserved for deletion from the local library"
             )
+        archive_row = self.conn.execute(
+            """
+            SELECT artifact_id
+            FROM artifact_archive_moves
+            WHERE state IN ('copying', 'source_cleanup')
+              AND (source_path=? OR target_path=?)
+            """,
+            (storage_key, storage_key),
+        ).fetchone()
+        if archive_row is not None:
+            raise RuntimeError(
+                "artifact path is reserved for transfer to the archive directory"
+            )
 
     def ensure_delivery_job(self, media_id: int, destination_key: str, *, max_failures: int = 5) -> int:
         job_id = self._ensure_job(
@@ -2257,6 +4004,23 @@ class Store:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             self._assert_lease(job)
+            active_archive = self.conn.execute(
+                """
+                SELECT move.state
+                FROM artifacts master
+                JOIN artifact_archive_moves move
+                  ON move.artifact_id=master.id
+                WHERE master.media_id=? AND master.role='master'
+                  AND master.part_no=0
+                  AND move.state IN ('copying', 'source_cleanup')
+                LIMIT 1
+                """,
+                (job.media_id,),
+            ).fetchone()
+            if active_archive is not None:
+                raise RuntimeError(
+                    "canonical master archive transfer is still being finalized"
+                )
             self._assert_artifact_path_not_reserved(path)
             media = self.conn.execute(
                 "SELECT provider, content_kind, metadata_json FROM media_items WHERE id=?",
@@ -2289,7 +4053,12 @@ class Store:
                 VALUES (?, 'master', 0, ?, ?, ?, ?, ?)
                 ON CONFLICT(media_id, role, part_no) DO UPDATE SET
                   path=excluded.path, size_bytes=excluded.size_bytes,
-                  state=excluded.state, updated_at=excluded.updated_at
+                  state=excluded.state,
+                  metadata_json=json_remove(
+                    artifacts.metadata_json,
+                    '$.archive'
+                  ),
+                  updated_at=excluded.updated_at
                 """,
                 (job.media_id, str(path), size_bytes, artifact_state, now, now),
             )
@@ -2298,6 +4067,13 @@ class Store:
                     "SELECT id FROM artifacts WHERE media_id=? AND role='master' AND part_no=0",
                     (job.media_id,),
                 ).fetchone()[0]
+            )
+            self.conn.execute(
+                """
+                DELETE FROM artifact_archive_moves
+                WHERE artifact_id=? AND state IN ('retry', 'orphaned')
+                """,
+                (artifact_id,),
             )
             if linked_live_state in {"ready", "pending"}:
                 state = "cancelled" if linked_live_state == "ready" else "retry"
@@ -2501,12 +4277,27 @@ class Store:
             self._assert_artifact_path_not_reserved(path)
             existing = self.conn.execute(
                 """
-                SELECT part_no FROM artifacts
+                SELECT id, part_no, state FROM artifacts
                 WHERE media_id=? AND role='live_segment' AND path=?
                 """,
                 (media_id, str(path)),
             ).fetchone()
             if existing is not None:
+                if str(existing["state"]) in {"purged", "purge_failed"}:
+                    self.conn.execute(
+                        """
+                        UPDATE artifacts
+                        SET size_bytes=?, state='ready', metadata_json=?,
+                          updated_at=?
+                        WHERE id=? AND state IN ('purged', 'purge_failed')
+                        """,
+                        (
+                            int(size_bytes),
+                            json.dumps(metadata or {}, sort_keys=True),
+                            now,
+                            int(existing["id"]),
+                        ),
+                    )
                 self.conn.commit()
                 return int(existing["part_no"])
             part_no = int(
@@ -2640,8 +4431,31 @@ class Store:
         ).fetchone()
 
     def has_ready_twitch_live_recording(self, stream_id: str) -> bool:
+        """Return whether a live backup already supersedes its Twitch VOD.
+
+        A confirmed Telegram delivery is durable workflow state and must not
+        regress merely because a local or mounted replica is temporarily
+        unavailable. Before delivery, an existing ready master still protects
+        the in-flight live recording from duplicate VOD work.
+        """
+
         if not stream_id:
             return False
+        delivered = self.conn.execute(
+            """
+            SELECT 1
+            FROM media_items mi
+            JOIN deliveries d
+              ON d.media_id=mi.id AND d.sink='telegram'
+            WHERE mi.provider='twitch'
+              AND mi.content_kind='live_stream'
+              AND json_extract(mi.metadata_json, '$.stream_id')=?
+            LIMIT 1
+            """,
+            (stream_id,),
+        ).fetchone()
+        if delivered is not None:
+            return True
         rows = self.conn.execute(
             """
             SELECT a.path
@@ -3472,6 +5286,7 @@ def _artifact_set_revision(
             bool(inspected["safe"]),
             int(inspected["actual_bytes"]),
             str(inspected["normalized_path"]),
+            inspected.get("storage_root"),
             inspected["device"],
             inspected["inode"],
             inspected["mtime_ns"],
@@ -3490,11 +5305,11 @@ def _artifact_set_revision(
 
 def _disk_resource_from_row(
     row: sqlite3.Row,
-    download_root: Path,
+    storage_roots: StorageRoots,
 ) -> dict[str, object]:
     inspected = _inspect_storage_path(
         Path(str(row["master_path"])),
-        download_root,
+        storage_roots,
     )
     return {
         "artifact_id": int(row["artifact_id"]),
@@ -3527,16 +5342,32 @@ def _disk_resource_from_row(
         "master_exists": bool(inspected["exists"]),
         "master_safe": bool(inspected["safe"]),
         "master_actual_bytes": int(inspected["actual_bytes"]),
+        "master_storage_root": inspected["storage_root"],
         "relative_path": str(inspected["relative_path"]),
         "unsafe_reason": inspected["unsafe_reason"],
     }
 
 
+def _normalized_storage_roots(storage_roots: StorageRoots) -> tuple[Path, ...]:
+    if isinstance(storage_roots, (str, os.PathLike)):
+        values = (Path(storage_roots),)
+    else:
+        values = tuple(Path(value) for value in storage_roots)
+    normalized: list[Path] = []
+    for value in values:
+        root = value.expanduser().resolve(strict=False)
+        if root not in normalized:
+            normalized.append(root)
+    if not normalized:
+        raise ValueError("at least one managed storage root is required")
+    return tuple(normalized)
+
+
 def _inspect_storage_path(
     path: Path,
-    download_root: Path,
+    storage_roots: StorageRoots,
 ) -> dict[str, object]:
-    root = Path(download_root).expanduser().resolve(strict=False)
+    roots = _normalized_storage_roots(storage_roots)
     candidate = path.expanduser()
     if not candidate.is_absolute():
         return {
@@ -3545,6 +5376,7 @@ def _inspect_storage_path(
             "actual_bytes": 0,
             "relative_path": candidate.name,
             "normalized_path": candidate,
+            "storage_root": None,
             "unsafe_reason": "relative paths are not managed",
             "device": None,
             "inode": None,
@@ -3552,16 +5384,52 @@ def _inspect_storage_path(
             "ctime_ns": None,
         }
     normalized = candidate.resolve(strict=False)
-    try:
-        relative = normalized.relative_to(root)
-    except ValueError:
+    matches: list[tuple[Path, Path]] = []
+    for root in roots:
+        try:
+            matches.append((root, normalized.relative_to(root)))
+        except ValueError:
+            continue
+    if not matches:
         return {
             "exists": candidate.exists() or candidate.is_symlink(),
             "safe": False,
             "actual_bytes": 0,
             "relative_path": candidate.name,
             "normalized_path": normalized,
-            "unsafe_reason": "path is outside the configured downloads directory",
+            "storage_root": None,
+            "unsafe_reason": "path is outside the configured storage roots",
+            "device": None,
+            "inode": None,
+            "mtime_ns": None,
+            "ctime_ns": None,
+        }
+    root, relative = max(matches, key=lambda item: len(item[0].parts))
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        return {
+            "exists": candidate.exists() or candidate.is_symlink(),
+            "safe": False,
+            "actual_bytes": 0,
+            "relative_path": str(relative),
+            "normalized_path": normalized,
+            "storage_root": str(root),
+            "unsafe_reason": f"configured storage root is unavailable: {exc}",
+            "device": None,
+            "inode": None,
+            "mtime_ns": None,
+            "ctime_ns": None,
+        }
+    if not stat.S_ISDIR(root_stat.st_mode):
+        return {
+            "exists": candidate.exists() or candidate.is_symlink(),
+            "safe": False,
+            "actual_bytes": 0,
+            "relative_path": str(relative),
+            "normalized_path": normalized,
+            "storage_root": str(root),
+            "unsafe_reason": "configured storage root is not a directory",
             "device": None,
             "inode": None,
             "mtime_ns": None,
@@ -3574,7 +5442,8 @@ def _inspect_storage_path(
             "actual_bytes": 0,
             "relative_path": ".",
             "normalized_path": normalized,
-            "unsafe_reason": "the downloads directory itself is not a resource file",
+            "storage_root": str(root),
+            "unsafe_reason": "a configured storage root is not a resource file",
             "device": None,
             "inode": None,
             "mtime_ns": None,
@@ -3589,6 +5458,7 @@ def _inspect_storage_path(
             "actual_bytes": 0,
             "relative_path": str(relative),
             "normalized_path": normalized,
+            "storage_root": str(root),
             "unsafe_reason": None,
             "device": None,
             "inode": None,
@@ -3602,6 +5472,7 @@ def _inspect_storage_path(
             "actual_bytes": 0,
             "relative_path": str(relative),
             "normalized_path": normalized,
+            "storage_root": str(root),
             "unsafe_reason": f"cannot inspect tracked path: {exc}",
             "device": None,
             "inode": None,
@@ -3615,6 +5486,7 @@ def _inspect_storage_path(
             "actual_bytes": 0,
             "relative_path": str(relative),
             "normalized_path": normalized,
+            "storage_root": str(root),
             "unsafe_reason": "symbolic links are not deleted from the panel",
             "device": int(file_stat.st_dev),
             "inode": int(file_stat.st_ino),
@@ -3628,6 +5500,7 @@ def _inspect_storage_path(
             "actual_bytes": 0,
             "relative_path": str(relative),
             "normalized_path": normalized,
+            "storage_root": str(root),
             "unsafe_reason": "tracked path is not a regular file",
             "device": int(file_stat.st_dev),
             "inode": int(file_stat.st_ino),
@@ -3640,6 +5513,7 @@ def _inspect_storage_path(
         "actual_bytes": int(file_stat.st_size),
         "relative_path": str(relative),
         "normalized_path": normalized,
+        "storage_root": str(root),
         "unsafe_reason": None,
         "device": int(file_stat.st_dev),
         "inode": int(file_stat.st_ino),
@@ -3700,6 +5574,7 @@ def _storage_identity_matches(
         bool(current["safe"]) != bool(expected["safe"])
         or bool(current["exists"]) != bool(expected["exists"])
         or str(current["normalized_path"]) != str(expected["normalized_path"])
+        or current.get("storage_root") != expected.get("storage_root")
     ):
         return False
     if not bool(expected["exists"]):
@@ -3716,23 +5591,445 @@ def _storage_identity_matches(
     )
 
 
+def _storage_identities_alias(
+    left: dict[str, object],
+    right: dict[str, object],
+) -> bool:
+    return (
+        bool(left.get("exists"))
+        and bool(right.get("exists"))
+        and left.get("device") is not None
+        and left.get("device") == right.get("device")
+        and left.get("inode") == right.get("inode")
+    )
+
+
+def _storage_identity_payload(
+    inspection: dict[str, object],
+) -> dict[str, object]:
+    return {
+        key: inspection.get(key)
+        for key in (
+            "exists",
+            "safe",
+            "actual_bytes",
+            "normalized_path",
+            "storage_root",
+            "device",
+            "inode",
+            "mtime_ns",
+            "ctime_ns",
+        )
+    } | {
+        "normalized_path": str(inspection["normalized_path"]),
+    }
+
+
+def _decode_mountinfo_path(value: str) -> str:
+    return (
+        value.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+    )
+
+
+def _is_on_nonroot_mount(path: Path) -> bool:
+    resolved = path.resolve(strict=True)
+    mountinfo = Path("/proc/self/mountinfo")
+    try:
+        lines = mountinfo.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 6:
+            continue
+        mount_point = Path(_decode_mountinfo_path(fields[4])).resolve(
+            strict=False
+        )
+        if mount_point == Path("/"):
+            continue
+        if resolved == mount_point or mount_point in resolved.parents:
+            return True
+    return resolved != Path("/") and resolved.is_mount()
+
+
+def _validate_archive_root(
+    download_root: Path,
+    archive_root: Path,
+    *,
+    require_mount: bool,
+) -> tuple[Path, Path]:
+    source_root = Path(download_root).expanduser().resolve(strict=False)
+    configured_archive = Path(archive_root).expanduser()
+    if not configured_archive.is_absolute():
+        raise ValueError("archive directory must be an absolute path")
+    try:
+        configured_stat = configured_archive.lstat()
+    except OSError as exc:
+        raise ValueError(
+            f"archive directory is unavailable; source was kept: {exc}"
+        ) from exc
+    if stat.S_ISLNK(configured_stat.st_mode):
+        raise ValueError("archive directory must not be a symbolic link")
+    if not stat.S_ISDIR(configured_stat.st_mode):
+        raise ValueError("archive directory is not a directory")
+    resolved_archive = configured_archive.resolve(strict=True)
+    if (
+        resolved_archive == source_root
+        or resolved_archive in source_root.parents
+        or source_root in resolved_archive.parents
+    ):
+        raise ValueError(
+            "archive directory must be separate from the downloads directory"
+        )
+    if require_mount and not _is_on_nonroot_mount(resolved_archive):
+        raise ValueError(
+            "archive directory is not on a non-root mount; source was kept"
+        )
+    return source_root, resolved_archive
+
+
+def _hash_storage_file(
+    path: Path,
+    expected: dict[str, object],
+) -> str:
+    normalized = Path(path).expanduser().resolve(strict=False)
+    if str(normalized) != str(expected["normalized_path"]):
+        raise ValueError("tracked file path changed before it could be hashed")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, os.O_RDONLY | nofollow | cloexec)
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or int(opened.st_dev) != expected["device"]
+            or int(opened.st_ino) != expected["inode"]
+            or int(opened.st_size) != expected["actual_bytes"]
+            or int(opened.st_mtime_ns) != expected["mtime_ns"]
+            or int(opened.st_ctime_ns) != expected["ctime_ns"]
+        ):
+            raise ValueError("tracked file changed before it could be hashed")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(fd)
+        if (
+            int(after.st_size) != expected["actual_bytes"]
+            or int(after.st_mtime_ns) != expected["mtime_ns"]
+            or int(after.st_ctime_ns) != expected["ctime_ns"]
+        ):
+            raise ValueError("tracked file changed while it was being hashed")
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def _ensure_archive_parent(archive_root: Path, relative: Path) -> Path:
+    current = archive_root
+    for component in relative.parts:
+        if component in {"", ".", ".."}:
+            raise ValueError("archive path contains an unsafe component")
+        current = current / component
+        try:
+            current_stat = current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            current_stat = current.lstat()
+        if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISDIR(
+            current_stat.st_mode
+        ):
+            raise ValueError("archive parent is not a safe directory")
+    return current
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a directory mutation when the backing filesystem supports it."""
+
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, os.O_RDONLY | directory | cloexec)
+    except OSError as exc:
+        if exc.errno in {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+            return
+        raise
+    try:
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            if exc.errno not in {
+                errno.EINVAL,
+                errno.ENOTSUP,
+                errno.EOPNOTSUPP,
+            }:
+                raise
+    finally:
+        os.close(fd)
+
+
+def _archive_target_matches(
+    target: Path,
+    archive_root: Path,
+    *,
+    size_bytes: int,
+    sha256: str,
+) -> dict[str, object] | None:
+    inspected = _inspect_storage_path(target, (archive_root,))
+    if not bool(inspected["exists"]):
+        if not bool(inspected["safe"]):
+            raise ValueError(
+                f"archive target path is unsafe: {inspected['unsafe_reason']}"
+            )
+        return None
+    if (
+        not bool(inspected["safe"])
+        or int(inspected["actual_bytes"]) != int(size_bytes)
+        or _hash_storage_file(target, inspected) != sha256
+    ):
+        raise ValueError("archive target already exists with different content")
+    return inspected
+
+
+def _publish_archive_temp(
+    temp_path: Path,
+    target: Path,
+    archive_root: Path,
+    *,
+    size_bytes: int,
+    sha256: str,
+) -> bool:
+    """Publish a verified temp file without replacing an existing target."""
+
+    existing = _archive_target_matches(
+        target,
+        archive_root,
+        size_bytes=size_bytes,
+        sha256=sha256,
+    )
+    if existing is not None:
+        temp_path.unlink()
+        _fsync_directory(target.parent)
+        return False
+
+    try:
+        # Temp and target share a directory, so a hard link gives us atomic
+        # no-clobber publication on filesystems that implement it.
+        os.link(temp_path, target, follow_symlinks=False)
+    except FileExistsError:
+        _archive_target_matches(
+            target,
+            archive_root,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        )
+        temp_path.unlink()
+        _fsync_directory(target.parent)
+        return False
+    except OSError as exc:
+        if exc.errno not in {
+            errno.EPERM,
+            errno.EXDEV,
+            errno.ENOSYS,
+            errno.ENOTSUP,
+            errno.EOPNOTSUPP,
+        }:
+            raise
+        # Some FUSE/object-storage mounts support atomic rename but not hard
+        # links. Recheck immediately before rename; this root is expected to be
+        # dedicated to the service, and phase two verifies the published inode.
+        if _archive_target_matches(
+            target,
+            archive_root,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        ) is not None:
+            temp_path.unlink()
+            _fsync_directory(target.parent)
+            return False
+        os.replace(temp_path, target)
+    else:
+        temp_path.unlink()
+    _fsync_directory(target.parent)
+    return True
+
+
+def _copy_file_to_archive(
+    source: Path,
+    target: Path,
+    *,
+    source_inspection: dict[str, object],
+    source_root: Path,
+    archive_root: Path,
+    operation_id: str,
+    require_mount: bool,
+) -> tuple[dict[str, object], str, bool]:
+    if _storage_key(source) != str(source_inspection["normalized_path"]):
+        raise ValueError("master path changed before archive copy started")
+    _validate_archive_root(
+        source_root,
+        archive_root,
+        require_mount=require_mount,
+    )
+    relative_target = target.relative_to(archive_root)
+    parent = _ensure_archive_parent(archive_root, relative_target.parent)
+    temp_path = parent / f".{target.name}.archive-{operation_id}.part"
+    if _path_entry_exists(temp_path):
+        temp_stat = temp_path.lstat()
+        if not stat.S_ISREG(temp_stat.st_mode):
+            raise ValueError("archive temporary path is not a regular file")
+        temp_path.unlink()
+
+    existing_target = _inspect_storage_path(target, (archive_root,))
+    if bool(existing_target["exists"]):
+        source_digest = _hash_storage_file(source, source_inspection)
+        matched_target = _archive_target_matches(
+            target,
+            archive_root,
+            size_bytes=int(source_inspection["actual_bytes"]),
+            sha256=source_digest,
+        )
+        _validate_archive_root(
+            source_root,
+            archive_root,
+            require_mount=require_mount,
+        )
+        if matched_target is None:
+            raise RuntimeError("archive target disappeared during verification")
+        if _storage_identities_alias(matched_target, source_inspection):
+            raise ValueError("archive target aliases the source master")
+        return matched_target, source_digest, False
+    if not bool(existing_target["safe"]):
+        raise ValueError(
+            f"archive target path is unsafe: {existing_target['unsafe_reason']}"
+        )
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    source_fd = os.open(source, os.O_RDONLY | nofollow | cloexec)
+    temp_fd: int | None = None
+    created = False
+    try:
+        opened = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or int(opened.st_dev) != source_inspection["device"]
+            or int(opened.st_ino) != source_inspection["inode"]
+            or int(opened.st_size) != source_inspection["actual_bytes"]
+            or int(opened.st_mtime_ns) != source_inspection["mtime_ns"]
+            or int(opened.st_ctime_ns) != source_inspection["ctime_ns"]
+        ):
+            raise ValueError("master changed before archive copy started")
+        digest = hashlib.sha256()
+        temp_fd = os.open(
+            temp_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec,
+            0o600,
+        )
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(temp_fd, chunk[offset:])
+                if written <= 0:
+                    raise OSError("archive copy stopped before the chunk was written")
+                offset += written
+        os.fsync(temp_fd)
+        copied_stat = os.fstat(temp_fd)
+        source_after = os.fstat(source_fd)
+        if int(copied_stat.st_size) != source_inspection["actual_bytes"]:
+            raise OSError("archive copy size does not match the master")
+        if (
+            int(source_after.st_size) != source_inspection["actual_bytes"]
+            or int(source_after.st_mtime_ns) != source_inspection["mtime_ns"]
+            or int(source_after.st_ctime_ns) != source_inspection["ctime_ns"]
+        ):
+            raise ValueError("master changed while it was copied")
+        source_digest = digest.hexdigest()
+    except Exception:
+        if temp_fd is not None:
+            os.close(temp_fd)
+            temp_fd = None
+        if _path_entry_exists(temp_path):
+            temp_path.unlink()
+        raise
+    finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        os.close(source_fd)
+
+    _validate_archive_root(
+        source_root,
+        archive_root,
+        require_mount=require_mount,
+    )
+    try:
+        created = _publish_archive_temp(
+            temp_path,
+            target,
+            archive_root,
+            size_bytes=int(source_inspection["actual_bytes"]),
+            sha256=source_digest,
+        )
+    except Exception:
+        if _path_entry_exists(temp_path):
+            temp_path.unlink()
+        raise
+    _validate_archive_root(
+        source_root,
+        archive_root,
+        require_mount=require_mount,
+    )
+    target_inspection = _inspect_storage_path(target, (archive_root,))
+    if (
+        not bool(target_inspection["safe"])
+        or not bool(target_inspection["exists"])
+        or int(target_inspection["actual_bytes"])
+        != int(source_inspection["actual_bytes"])
+        or _hash_storage_file(target, target_inspection) != source_digest
+    ):
+        raise OSError("archive target could not be verified after copy")
+    if _storage_identities_alias(target_inspection, source_inspection):
+        raise ValueError("archive target aliases the source master")
+    return target_inspection, source_digest, created
+
+
 def _unlink_tracked_file(
     path: Path,
-    download_root: Path,
+    storage_roots: StorageRoots,
     expected: dict[str, object],
 ) -> int:
     """Unlink a confirmed regular file without following swapped path links."""
 
-    root = Path(download_root).expanduser().resolve(strict=True)
+    expected_root = str(expected.get("storage_root") or "")
+    roots = _normalized_storage_roots(storage_roots)
+    configured_root = next(
+        (root for root in roots if str(root) == expected_root),
+        None,
+    )
+    if configured_root is None:
+        raise ValueError("tracked file storage root is no longer configured")
+    root = configured_root.resolve(strict=True)
     normalized = Path(str(expected["normalized_path"]))
     try:
         relative = normalized.relative_to(root)
     except ValueError as exc:
         raise ValueError(
-            "tracked file moved outside the configured downloads directory"
+            "tracked file moved outside its configured storage root"
         ) from exc
     if relative == Path(".") or not relative.parts:
-        raise ValueError("the downloads directory itself cannot be deleted")
+        raise ValueError("a configured storage root cannot be deleted")
     if any(part in {"", ".", ".."} for part in relative.parts):
         raise ValueError("tracked file path contains an unsafe component")
 

@@ -21,6 +21,12 @@ Panel / 来源 CLI
 Telegram 返回结果不明确，任务会进入 `uncertain`，不会自动重试，因为消息可能已经
 被 Telegram 接收。
 
+## 存储状态与副本
+
+SQLite 记录备份流程、已确认的 Telegram 投递和当前存储位置，媒体内容仍以普通文件
+保存在配置的存储中。文件在本地目录与挂载存储之间移动时，只更新数据库中的位置，
+不会改变已经完成的投递状态。
+
 ## 模块划分
 
 | 模块 | 职责 |
@@ -91,6 +97,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
 
 - 每组数据库和 MTProto session 只能由一个应用进程使用。
 - 发现、下载和投递状态必须能在重启后继续使用。
+- 逻辑备份与存储生命周期必须保存在 SQLite 中，不能根据某条文件路径推断投递状态。
 - `sources.toml` 是来源和过滤器的用户配置真源；SQLite 只保留运行镜像与状态。
 - 扩展不得拥有 SQLite、任务或投递状态；进程只导入配置中显式启用的扩展 ID。
 - 每个请求、子进程、上传或 client connection 必须固定一条 route，只能在安全的
@@ -98,7 +105,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
 - 不得自动重试 `uncertain` 状态的 Telegram 投递。
 - token、application 凭据、Twitch 凭据、私密配置、数据库、下载文件和 session 不得
   进入日志、命令行参数、测试数据、源码构建包或提交记录。
-- 本地资源删除必须由用户显式开启，并且只能处理下载根目录下、SQLite 精确记录的
+- 本地资源删除必须由用户显式开启，并且只能处理受管存储根目录下、SQLite 精确记录的
   普通文件。
 
 提交修改前请阅读[参与贡献](contributing.md)中的完整流程和检查清单。

@@ -73,12 +73,18 @@ MTProto session.
 | `[extensions."id"]` | Required flag, private config path, and inline extension options |
 | `[download]` | yt-dlp, ffmpeg, formats, paths, timeout, sidecars |
 | `[download.provider_profiles.*]` | Per-provider download overrides |
+| `[storage]` | Temporary-file cleanup, complete-backup retention, and mounted storage |
 | `[telegram]` | Enablement, token, destination, transport, media, caption |
 | `[telegram.mtproto]` | Application pair, session path, MTProto size limit |
 | `[telegram.bot_api]` | Endpoint, Bot API size limit, playable splitting |
 | `[control]` | Telegram panel endpoint, permissions, and polling |
 | `[twitch]` | Helix credentials and VOD/live behavior |
 | `[live]` | Provider-neutral live polling, retry, worker count, and recording timeout |
+
+New setup configs write `[storage].process_retention_hours = 24`,
+`[storage].backup_retention_hours = 0`, and an empty `archive_dir`. See
+[Automatic local retention](configuration/sources.md#automatic-local-retention)
+for the available storage settings.
 
 `config.toml` is process configuration. Source rows and the global source
 filter live in `sources.toml`; Panel changes therefore do not rewrite

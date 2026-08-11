@@ -2245,6 +2245,86 @@ class TwitchLiveServiceTest(unittest.TestCase):
             self.assertIsNotNone(service.store.get_artifact(live_media_id))
             service.store.close()
 
+    def test_delivered_live_backup_does_not_regress_when_file_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            service = self._service(
+                tmp_path,
+                include_vod_origin=True,
+                download_delay_seconds=0,
+            )
+            live_media_id, _ = service.store.upsert_discovered(
+                "twitch-live",
+                _live_candidate(),
+                job_payload={
+                    "download_lane": "live",
+                    "recording_mode": "live",
+                },
+            )
+            vod_media_id, _ = service.store.upsert_discovered(
+                "twitch-vod",
+                _vod_candidate(),
+            )
+            live_job = service.store.claim_next_job(
+                ("download",),
+                owner="live-worker",
+                lease_seconds=60,
+                download_lane="live",
+            )
+            vod_job = service.store.claim_next_job(
+                ("download",),
+                owner="standard-worker",
+                lease_seconds=60,
+                download_lane="standard",
+            )
+            live_path = tmp_path / "delivered-live.mp4"
+            vod_path = tmp_path / "suppressed-vod.mp4"
+            live_path.write_bytes(b"live")
+            vod_path.write_bytes(b"vod")
+            service.store.complete_download(
+                vod_job,
+                path=vod_path,
+                size_bytes=vod_path.stat().st_size,
+            )
+            live_artifact_id = service.store.complete_download(
+                live_job,
+                path=live_path,
+                size_bytes=live_path.stat().st_size,
+            )
+            service.store.conn.execute(
+                """
+                INSERT INTO deliveries(
+                  media_id, artifact_id, sink, destination_key,
+                  remote_id, delivered_at
+                ) VALUES (?, ?, 'telegram', 'telegram:@archive', '42', ?)
+                """,
+                (
+                    live_media_id,
+                    live_artifact_id,
+                    "2026-08-11T12:00:00+00:00",
+                ),
+            )
+            service.store.conn.commit()
+            live_path.unlink()
+
+            service.store.upsert_discovered(
+                "twitch-vod",
+                _vod_candidate(),
+            )
+
+            vod_job_state = service.store.conn.execute(
+                "SELECT state, reason_code FROM jobs WHERE media_id=?",
+                (vod_media_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(vod_job_state),
+                ("cancelled", "live_recording_exists"),
+            )
+            self.assertTrue(
+                service.store.has_ready_twitch_live_recording("98765")
+            )
+            service.store.close()
+
     def test_process_pending_leaves_live_lane_job_queued(self):
         with tempfile.TemporaryDirectory() as tmp:
             service = self._service(Path(tmp))

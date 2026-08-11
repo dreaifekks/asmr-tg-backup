@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.6.4 - 2026-08-11
+
+- Add automatic cleanup for temporary recording and Telegram upload files. New
+  setup configs clean these files after 24 hours and keep complete backup files.
+- Add `backup_retention_hours` for users who also want complete backup files to
+  expire.
+- Add `archive_dir` to move delivered backup files to mounted storage after 24
+  hours. SQLite records the completed delivery and current file location.
+
 ## 0.6.3 - 2026-08-11
 
 - Add an optional `control.api_base` override so Telegram command polling,
@@ -101,9 +110,9 @@
 
 ## 0.3.2 - 2026-08-02
 
-- Preserve compatible source audio when preparing Telegram audio from a video
-  master, avoiding an unnecessary low-bitrate AAC transcode for Twitch live
-  recordings and other retained-video profiles.
+- Preserve compatible source audio when preparing Telegram audio from a
+  complete video backup, avoiding an unnecessary low-bitrate AAC transcode for
+  Twitch live recordings and other retained-video profiles.
 - Raise the adaptive AAC fallback ceiling from 64 kbps to 256 kbps when the
   upload limit permits, while retaining lower bitrate candidates for genuinely
   constrained deliveries.

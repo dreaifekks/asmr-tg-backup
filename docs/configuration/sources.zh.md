@@ -217,7 +217,32 @@ TWITCH_CLIENT_SECRET=replace-with-client-secret
 `config.toml` 的 `[download]` 控制 yt-dlp 与 ffmpeg；
 `[download.provider_profiles.twitch]` 等区块可以覆盖单个提供方的格式和音频提取行为。
 默认保留 M4A 音频。若本地配置保留视频而 Telegram 发送音频，服务会另建投递文件，
-不会替换视频主文件。
+不会替换完整的视频备份文件。
 
-下载主文件、缩略图、投递派生文件和直播分段都在应用数据目录中。修改目录或删除文件前，
-请阅读[运行与维护](../operations.md)。
+完整备份文件、缩略图、投递文件和直播分段都在应用数据目录中。修改目录前请阅读
+[运行与维护](../operations.md)。
+
+## 本地文件自动保留策略 {#automatic-local-retention}
+
+新生成的 setup 配置会在成功投递一天后清理录制与 Telegram 上传产生的过程文件，并
+继续保留完整备份文件：
+
+```toml
+[storage]
+process_retention_hours = 24
+backup_retention_hours = 0
+archive_dir = ""
+archive_after_delivery_hours = 24
+archive_require_mount = true
+```
+
+`process_retention_hours` 控制过程文件，`backup_retention_hours` 控制完整备份文件。
+任一字段设为 `0` 都表示一直保留对应文件。
+
+如果要把完整备份文件转移到挂载磁盘，把 `archive_dir` 设为磁盘中已经存在的目录。
+文件会在 `archive_after_delivery_hours` 到期后移动；挂载存储保持
+`archive_require_mount = true` 即可，目录可以位于挂载点的下级。
+
+SQLite 记录已完成的投递和每份备份当前所在的位置，媒体内容仍以普通文件保存在配置的
+存储中。Docker 部署时，把挂载目录作为 bind mount 暴露给容器并填写容器内路径。修改
+这些设置后重启服务。

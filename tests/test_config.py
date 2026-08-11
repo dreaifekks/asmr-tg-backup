@@ -48,6 +48,15 @@ enabled = true
         self.assertEqual(config.telegram.mtproto.max_upload_bytes, 1_990_000_000)
         self.assertTrue(config.telegram.bot_api.split_large_audio)
         self.assertEqual(config.telegram.bot_api.max_upload_parts, 10)
+        self.assertEqual(config.storage.process_retention_hours, 0)
+        self.assertEqual(config.storage.backup_retention_hours, 0)
+        self.assertIsNone(config.storage.archive_dir)
+        self.assertEqual(config.storage.archive_after_delivery_hours, 24)
+        self.assertTrue(config.storage.archive_require_mount)
+        self.assertEqual(
+            config.managed_storage_roots,
+            (config.download_dir,),
+        )
         self.assertEqual(
             config.telegram.mtproto.session_path,
             config.app.data_dir / "telegram-mtproto.session",
@@ -115,6 +124,128 @@ allow_disk_delete = "false"
                 "control.allow_disk_delete must be true or false",
             ):
                 load_config(invalid_path)
+
+    def test_storage_retention_requires_non_negative_integer_hours(self):
+        for field, raw_value, expected in (
+            ("process_retention_hours", "0", 0),
+            ("process_retention_hours", "24", 24),
+            ("backup_retention_hours", "0", 0),
+            ("backup_retention_hours", "720", 720),
+            ("archive_after_delivery_hours", "0", 0),
+            ("archive_after_delivery_hours", "24", 24),
+        ):
+            with (
+                self.subTest(field=field, raw_value=raw_value),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                path = Path(tmp) / "config.toml"
+                path.write_text(
+                    "[storage]\n"
+                    f"{field} = {raw_value}\n"
+                )
+
+                config = load_config(path)
+
+                self.assertEqual(getattr(config.storage, field), expected)
+                self.assertFalse(config.control.allow_disk_delete)
+
+        for field in (
+            "process_retention_hours",
+            "backup_retention_hours",
+            "archive_after_delivery_hours",
+        ):
+            for raw_value in ("true", '"24"', "-1"):
+                with (
+                    self.subTest(field=field, raw_value=raw_value),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    path = Path(tmp) / "config.toml"
+                    path.write_text(
+                        "[storage]\n"
+                        f"{field} = {raw_value}\n"
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        f"storage.{field} must be a non-negative integer",
+                    ):
+                        load_config(path)
+
+    def test_storage_retention_fields_load_independently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                "[storage]\n"
+                "process_retention_hours = 24\n"
+                "backup_retention_hours = 168\n"
+            )
+
+            config = load_config(path)
+
+        self.assertEqual(config.storage.process_retention_hours, 24)
+        self.assertEqual(config.storage.backup_retention_hours, 168)
+
+    def test_storage_archive_directory_is_absolute_separate_and_optional(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            archive_dir = Path(tmp) / "mounted" / "asmr"
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                f'''[app]
+data_dir = "{data_dir}"
+
+[storage]
+archive_dir = "{archive_dir}"
+archive_after_delivery_hours = 12
+archive_require_mount = false
+'''
+            )
+
+            config = load_config(path)
+
+        self.assertEqual(config.storage.archive_dir, archive_dir)
+        self.assertEqual(config.storage.archive_after_delivery_hours, 12)
+        self.assertFalse(config.storage.archive_require_mount)
+        self.assertEqual(
+            config.managed_storage_roots,
+            (data_dir / "downloads", archive_dir),
+        )
+
+        for raw_value, error in (
+            ('"relative/archive"', "absolute path"),
+            ("123", "absolute path"),
+        ):
+            with self.subTest(raw_value=raw_value), tempfile.TemporaryDirectory() as tmp:
+                invalid = Path(tmp) / "config.toml"
+                invalid.write_text(
+                    f"[storage]\narchive_dir = {raw_value}\n"
+                )
+                with self.assertRaisesRegex(ValueError, error):
+                    load_config(invalid)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            invalid = Path(tmp) / "config.toml"
+            invalid.write_text(
+                f'''[app]
+data_dir = "{data_dir}"
+
+[storage]
+archive_dir = "{data_dir / 'downloads' / 'archive'}"
+'''
+            )
+            with self.assertRaisesRegex(ValueError, "must be separate"):
+                load_config(invalid)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            invalid = Path(tmp) / "config.toml"
+            invalid.write_text(
+                '[storage]\narchive_require_mount = "true"\n'
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "storage.archive_require_mount must be true or false",
+            ):
+                load_config(invalid)
 
     def test_twitch_credentials_load_from_default_environment_variables(self):
         with tempfile.TemporaryDirectory() as tmp:

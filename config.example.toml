@@ -12,6 +12,17 @@ worker_poll_interval_seconds = 2
 job_lease_seconds = 900
 log_level = "INFO"
 
+[storage]
+# Delete temporary recording and Telegram upload files after delivery.
+process_retention_hours = 24
+# Keep complete backup files. Set a positive number to expire them.
+backup_retention_hours = 0
+# Optional: move complete backup files to a mounted storage directory.
+archive_dir = ""
+archive_after_delivery_hours = 24
+# Leave enabled when archive_dir is on a mounted disk.
+archive_require_mount = true
+
 # The Telegram panel is the easiest way to manage sources. It writes this
 # catalog atomically; advanced users can edit the file and run `sources apply`.
 [sources]

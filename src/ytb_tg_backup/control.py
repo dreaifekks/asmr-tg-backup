@@ -617,7 +617,7 @@ class ControlBot:
             if action == "resource":
                 resource = self.store.get_disk_resource(
                     artifact_id,
-                    self.config.download_dir,
+                    self.config.managed_storage_roots,
                 )
                 if resource is None:
                     raise ValueError("resource no longer exists")
@@ -635,7 +635,7 @@ class ControlBot:
                 )
             resource = self.store.get_disk_resource(
                 artifact_id,
-                self.config.download_dir,
+                self.config.managed_storage_roots,
             )
             if resource is None:
                 raise ValueError("resource no longer exists")
@@ -643,7 +643,7 @@ class ControlBot:
                 if bool(resource["running"]):
                     raise ValueError("资源正在下载或投递，请稍后再试")
                 if int(resource["unsafe_file_count"]) > 0:
-                    raise ValueError("资源包含 downloads 目录外或不安全的路径")
+                    raise ValueError("资源包含受管存储目录外或不安全的路径")
                 state.update(
                     {
                         "view": "resource_delete_confirm",
@@ -664,7 +664,7 @@ class ControlBot:
                 raise ValueError("delete confirmation has expired")
             result = self.store.purge_disk_resource(
                 artifact_id,
-                self.config.download_dir,
+                self.config.managed_storage_roots,
                 expected_revision=expected_revision,
             )
             if bool(result["completed"]):
@@ -1307,7 +1307,7 @@ class ControlBot:
         query = str(state.get("resource_query") or "").strip()
         page = max(0, int(state.get("resource_page") or 0))
         library = self.store.list_disk_resources(
-            self.config.download_dir,
+            self.config.managed_storage_roots,
             limit=RESOURCE_PAGE_SIZE,
             offset=page * RESOURCE_PAGE_SIZE,
             query=query,
@@ -1317,7 +1317,7 @@ class ControlBot:
         page = min(page, page_count - 1)
         if page != int(state.get("resource_page") or 0):
             library = self.store.list_disk_resources(
-                self.config.download_dir,
+                self.config.managed_storage_roots,
                 limit=RESOURCE_PAGE_SIZE,
                 offset=page * RESOURCE_PAGE_SIZE,
                 query=query,
@@ -1397,7 +1397,7 @@ class ControlBot:
         artifact_id = int(state.get("target_artifact_id") or -1)
         resource = self.store.get_disk_resource(
             artifact_id,
-            self.config.download_dir,
+            self.config.managed_storage_roots,
         )
         page = max(0, int(state.get("resource_page") or 0))
         if resource is None:
@@ -1436,7 +1436,7 @@ class ControlBot:
             f"锚点路径：{_compact_text(str(resource['relative_path']), 180)}",
         ]
         if str(resource.get("anchor_role") or "") == "live_segment":
-            lines.append("归档形态：仅有未合并的直播片段（暂无 master）")
+            lines.append("归档形态：仅有未合并的直播片段（暂无完整备份文件）")
         if int(resource["missing_file_count"]) > 0:
             lines.append(f"缺失记录：{resource['missing_file_count']} 个文件")
         if int(resource["unsafe_file_count"]) > 0:
@@ -1488,7 +1488,7 @@ class ControlBot:
         page = max(0, int(state.get("resource_page") or 0))
         resource = self.store.get_disk_resource(
             artifact_id,
-            self.config.download_dir,
+            self.config.managed_storage_roots,
         )
         if resource is None:
             state.update({"view": "resources", "target_artifact_id": None})

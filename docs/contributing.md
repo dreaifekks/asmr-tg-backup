@@ -63,7 +63,8 @@ troubleshooting instructions in MkDocs, and implementation constraints in the
   sessions stay out of logs, command-line arguments, fixtures, packages, and
   commits.
 - Local resource deletion remains opt-in and operates only on exact tracked
-  paths below the configured download root.
+  paths below configured managed storage roots (`downloads` and an optional
+  mounted archive root).
 
 ## Before opening a change
 

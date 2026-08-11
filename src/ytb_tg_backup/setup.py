@@ -1100,6 +1100,12 @@ def _write_setup_config(output_path: Path, setup: SetupAnswers) -> None:
         f"# Setup profile: {setup.profile}\n\n"
         "[app]\n"
         f"data_dir = {_toml_string(str(default_data_path()))}\n\n"
+        "[storage]\n"
+        "process_retention_hours = 24\n"
+        "backup_retention_hours = 0\n"
+        'archive_dir = ""\n'
+        "archive_after_delivery_hours = 24\n"
+        "archive_require_mount = true\n\n"
         "[sources]\n"
         'path = "sources.toml"\n\n'
         "[telegram]\n"

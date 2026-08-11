@@ -177,4 +177,4 @@ before moving a cloud-used token to a local server.
 `{video_id}`, and `{tag}`. `media_type` accepts `audio`, `video`, or `document`;
 `send_as_document = true` forces document delivery.
 
-An upload failure never removes the local archive master.
+An upload failure never removes the complete local backup file.

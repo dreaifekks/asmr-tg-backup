@@ -23,6 +23,13 @@ download. Workers claim jobs with leases. An ambiguous Telegram result becomes
 `uncertain` and is not retried automatically because Telegram may already have
 accepted the message.
 
+## Storage state and replicas
+
+SQLite records the backup lifecycle, confirmed Telegram deliveries, and the
+current storage location. Media content remains as regular files in the
+configured storage. Moving a file between local and mounted storage updates its
+database location without changing the completed delivery state.
+
 ## Module map
 
 | Module | Responsibility |
@@ -98,6 +105,8 @@ paired pages structurally aligned whenever user-visible behavior changes.
 
 - Run only one application process against a database and MTProto session pair.
 - Keep discovery, download, and delivery state durable across restarts.
+- Keep the logical backup and storage lifecycle in SQLite instead of deriving
+  delivery state from a file path.
 - Keep `sources.toml` authoritative for sources and the filter; SQLite holds
   only their runtime mirror and operational state.
 - Keep extensions outside SQLite/job/delivery ownership and import only IDs
@@ -109,7 +118,7 @@ paired pages structurally aligned whenever user-visible behavior changes.
   configuration, databases, downloads, and sessions out of logs, command-line
   arguments, fixtures, packages built from a source checkout, and commits.
 - Keep local resource deletion opt-in and limited to exact SQLite-tracked
-  regular files below the configured download root.
+  regular files below configured managed storage roots.
 
 See [Contributing](contributing.md) for the complete contribution workflow and
 checklist.

@@ -135,5 +135,11 @@ allow_disk_delete = true
 ```
 
 修改后重启服务。即使已启用，删除仍要求通过授权、使用当前有效 Panel，并针对具体资源
-二次确认。只有下载根目录下被精确跟踪的普通文件可以删除；数据库历史与已有 Telegram
-消息会保留。
+二次确认。只有已配置受管存储根目录下被精确跟踪的普通文件可以删除，其中也包括启用的
+挂载式 `[storage].archive_dir`。数据库历史与已有 Telegram 消息会保留；归档挂载不可用
+时会显示为不安全或缺失资源，不会因此改删其他路径。
+
+`allow_disk_delete` 只控制从 Panel 发起的删除。自动清理与挂载存储使用
+`[storage].process_retention_hours`、`[storage].backup_retention_hours` 和
+`archive_dir`。参见
+[本地文件自动保留策略](sources.md#automatic-local-retention)。

@@ -232,6 +232,23 @@ tracked in SQLite while retaining database history and Telegram messages.
 See [Control panel](https://dreaifekks.github.io/asmr-tg-backup/configuration/control-panel/)
 for configuration and file-management behavior.
 
+Automatic cleanup is configured separately from Panel deletion. New setup
+configs remove temporary recording and Telegram upload files one day after a
+successful delivery:
+
+```toml
+[storage]
+process_retention_hours = 24
+backup_retention_hours = 0
+```
+
+`backup_retention_hours = 0` keeps complete backup files. Set it to a positive
+number when those files should also expire.
+
+To move complete backup files to mounted storage, set `archive_dir` to an
+existing directory. They move 24 hours after delivery by default. Mounted NAS,
+remote disks, and S3-compatible filesystems can all be used this way.
+
 ## State and files
 
 Native setup stores runtime configuration below
