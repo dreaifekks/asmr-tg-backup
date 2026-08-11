@@ -128,21 +128,53 @@ running service was restarted after the update.
 
 ## The application cannot reach a Bot API
 
+Identify the failing path first, because media and panel traffic can use
+different endpoints:
+
+- Bot API media uploads use `telegram.bot_api.api_base` when
+  `telegram.upload_transport = "bot_api"`. `TELEGRAM_API_BASE` overrides this
+  value.
+- `/panel`, `getUpdates`, callbacks, commands, and panel message edits use
+  `control.api_base` when it is non-empty. An empty value inherits the Telegram
+  Bot API endpoint above.
+- MTProto media delivery does not use either HTTP endpoint; only the panel still
+  needs a Bot API endpoint in that configuration.
+
+Use an address reachable from the application process:
+
 - Native local service: `http://127.0.0.1:18081`.
 - Compose `local-api`: `http://telegram-bot-api:8081`.
 - Docker host or remote service: use an address routable from the container.
 
-Do not use application-container `127.0.0.1` for another container or the Docker
-host. Check `TELEGRAM_API_BASE` for a stale environment override. Loopback
-requests intentionally bypass inherited proxies. Plain HTTP is appropriate for
-the loopback and controlled private Compose addresses above; remote endpoints
-reached over an untrusted network should use HTTPS.
+For example, this keeps media on MTProto while the Compose panel uses the local
+Bot API service:
+
+```toml
+[telegram]
+upload_transport = "mtproto"
+
+[control]
+api_base = "http://telegram-bot-api:8081"
+```
+
+Application-container `127.0.0.1` reaches that container itself, not another
+container or the Docker host. If the media endpoint is unexpected, inspect
+`TELEGRAM_API_BASE`; it takes precedence over `[telegram.bot_api].api_base`.
+If only the panel is unexpected, inspect `[control].api_base` first. Loopback
+requests bypass inherited proxies. Plain HTTP is suitable for the loopback and
+controlled private Compose addresses above; use HTTPS for a remote endpoint
+across an untrusted network.
 
 ## Local Bot API rejects a bot token
 
-The cloud and local Bot API have migration requirements. Follow Telegram's
-[official procedure](https://github.com/tdlib/telegram-bot-api#moving-a-bot-to-a-local-server){ target="_blank" rel="noopener noreferrer" }
-and wait for it to complete. `asmr-tg-backup setup` never calls cloud `logOut`.
+Stop the application and every other `getUpdates` consumer for this token. If
+the token has already connected to Telegram's cloud Bot API, follow Telegram's
+[official procedure](https://github.com/tdlib/telegram-bot-api#moving-a-bot-to-a-local-server){ target="_blank" rel="noopener noreferrer" },
+including the cloud `logOut` call, and wait for the migration to complete. Start
+the local server first, then start the application, and keep cloud pollers
+stopped while the token is assigned to the local server. `asmr-tg-backup setup`
+configures the application and local service; complete token migration as the
+manual step in the same rollout.
 
 For native setup, the wheel does not install `telegram-bot-api`; build the C++
 server first using the [official source instructions](https://github.com/tdlib/telegram-bot-api#installation){ target="_blank" rel="noopener noreferrer" }.

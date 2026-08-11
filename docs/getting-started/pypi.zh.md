@@ -99,22 +99,53 @@ asmr-tg-backup run \
 可以编辑该文件后运行：
 
 ```bash
-asmr-tg-backup sources validate
-asmr-tg-backup sources apply
+asmr-tg-backup sources validate \
+  --config ~/.config/asmr-tg-backup/config.toml
+asmr-tg-backup sources apply \
+  --config ~/.config/asmr-tg-backup/config.toml
 ```
 
 通过 Panel 或 `asmr-tg-backup status` 确认首次下载和投递。
 
 ## 6. 更新
 
-更新前先备份 `~/.config/asmr-tg-backup/`（包括来源目录）和
-`~/.local/share/asmr-tg-backup/`。
+更新过程会保留现有配置和数据，并按照升级后的 pipx 环境重新生成用户服务。复制备份前
+先停止应用，以及备份范围内的本地 Bot API 服务，使各项状态保持一致。
+
+完整备份 `~/.config/asmr-tg-backup/` 和 `~/.local/share/asmr-tg-backup/`。配置备份
+包含 `config.toml`、`sources.toml`、可选的 `env`，以及使用一键扩展 setup 后生成的
+`config.extensions.toml` 和 `extensions/config/` 下的私密文件。
+
+部署使用原生本地 Bot API 时，还要备份
+`~/.config/systemd/user/asmr-tg-backup-telegram-bot-api.service`。复制数据前停止两个
+服务：
 
 ```bash
 systemctl --user stop asmr-tg-backup.service
+systemctl --user stop asmr-tg-backup-telegram-bot-api.service  # 仅本地 Bot API 部署
+```
+
+保持服务停止，升级并完成校验：
+
+```bash
 pipx upgrade asmr-tg-backup
-systemctl --user start asmr-tg-backup.service
 asmr-tg-backup --version
+asmr-tg-backup extensions doctor \
+  --config ~/.config/asmr-tg-backup/config.toml
+asmr-tg-backup sources validate \
+  --config ~/.config/asmr-tg-backup/config.toml
+```
+
+如果 `extensions doctor` 报告扩展缺失或版本不兼容，受信目录中的扩展可以重新运行
+`extensions enable <slug>`；第三方扩展则在同一个 pipx 环境中按照其安装说明更新。
+再次完成两项校验后再继续。
+
+部署使用本地 Bot API 时先启动该服务，再刷新应用 unit 并启动 worker：
+
+```bash
+systemctl --user start asmr-tg-backup-telegram-bot-api.service  # 仅本地 Bot API 部署
+asmr-tg-backup service install
+systemctl --user status asmr-tg-backup.service
 ```
 
 ## 其他上传与构建方式

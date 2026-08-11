@@ -114,19 +114,45 @@ max_upload_parts = 10
 
 ## 应用无法访问 Bot API
 
+先确认失败的是哪条路径，因为媒体和 Panel 可以使用不同端点：
+
+- 当 `telegram.upload_transport = "bot_api"` 时，Bot API 媒体上传使用
+  `telegram.bot_api.api_base`；`TELEGRAM_API_BASE` 会覆盖这个值。
+- `/panel`、`getUpdates`、callback、命令和 Panel 消息编辑优先使用非空的
+  `control.api_base`；该值留空时继承上面的 Telegram Bot API 地址。
+- MTProto 媒体投递不经过这两个 HTTP 端点；这种配置下只有 Panel 仍需要 Bot API。
+
+选择应用进程能够访问的地址：
+
 - 原生本地服务：`http://127.0.0.1:18081`。
 - Compose `local-api`：`http://telegram-bot-api:8081`。
 - Docker 主机或远程服务：使用容器内可路由的地址。
 
-不要使用应用容器内的 `127.0.0.1` 访问其他容器或 Docker 主机。检查是否有旧的
-`TELEGRAM_API_BASE` 环境变量覆盖。回环请求会按设计绕过继承的代理。上面的回环地址与
-受控私有 Compose 地址可以使用普通 HTTP；经过不可信网络访问的远程端点应使用 HTTPS。
+例如下面的配置会让媒体继续使用 MTProto，同时让 Compose Panel 连接本地 Bot API：
+
+```toml
+[telegram]
+upload_transport = "mtproto"
+
+[control]
+api_base = "http://telegram-bot-api:8081"
+```
+
+应用容器内的 `127.0.0.1` 只指向应用容器本身；访问其他容器或 Docker 主机时，请使用
+容器内可路由的地址。
+媒体端点与预期不同时检查 `TELEGRAM_API_BASE`，它优先于
+`[telegram.bot_api].api_base`；只有 Panel 端点异常时，先检查 `[control].api_base`。
+回环请求会绕过继承的代理。上面的回环地址与受控私有 Compose 地址可以使用普通 HTTP；
+经过不可信网络访问远程端点时使用 HTTPS。
 
 ## 本地 Bot API 拒绝 bot token
 
-云端和本地 Bot API 有迁移要求。请执行 Telegram
+先停止应用，以及使用这个 token 的其他所有 `getUpdates` consumer。如果 token 已经
+连接过 Telegram 云端 Bot API，请按照 Telegram
 [官方流程](https://github.com/tdlib/telegram-bot-api#moving-a-bot-to-a-local-server){ target="_blank" rel="noopener noreferrer" }
-并等待完成。`asmr-tg-backup setup` 不会调用云端 `logOut`。
+完成云端 `logOut`，并等待迁移完成。先启动本地服务，再启动应用；token 交给本地服务
+期间，云端 poller 保持停止。`asmr-tg-backup setup` 会完成应用和本地服务配置；token
+迁移是同一启用流程中需要手动完成的一步。
 
 对于原生 setup，wheel 不会安装 `telegram-bot-api`；请先按照
 [官方源码说明](https://github.com/tdlib/telegram-bot-api#installation){ target="_blank" rel="noopener noreferrer" }构建 C++ 服务端。

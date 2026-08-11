@@ -38,11 +38,13 @@
 
 XDG 变量会替换对应的默认根目录。
 
+下表中的 `<config-stem>` 表示去掉末尾 `.toml` 后的主配置文件名。
+
 | 资源 | XDG 路径 | 默认路径 |
 | --- | --- | --- |
 | Setup 配置 | `$XDG_CONFIG_HOME/asmr-tg-backup/config.toml` | `~/.config/asmr-tg-backup/config.toml` |
-| 受管扩展状态 | 每份主配置旁的 `NAME.extensions.toml` | `~/.config/asmr-tg-backup/config.extensions.toml` |
-| 私密扩展配置 | 主配置旁的 `extensions/` 目录 | `~/.config/asmr-tg-backup/extensions/` |
+| 受管扩展状态 | 与 `<config-stem>.toml` 同目录的 `<config-stem>.extensions.toml` | `~/.config/asmr-tg-backup/config.extensions.toml` |
+| 私密扩展配置 | 主配置同目录下的 `extensions/<config-stem>/<filename>` | `~/.config/asmr-tg-backup/extensions/config/<filename>` |
 | 来源目录 | 默认与 setup 配置同目录 | `~/.config/asmr-tg-backup/sources.toml` |
 | Worker 环境文件 | 与 setup 配置同目录的 `env` | `~/.config/asmr-tg-backup/env` |
 | Worker unit | `$XDG_CONFIG_HOME/systemd/user/asmr-tg-backup.service` | `~/.config/systemd/user/asmr-tg-backup.service` |
@@ -116,7 +118,8 @@ MTProto 时需要自己的完整凭据对；运行时凭据对会覆盖私有 TO
 
 ## 安全边界
 
-- 配置、来源目录、环境文件、SQLite 和 `.session` 文件都应保持私密。
+- 主配置、受管扩展状态、私密扩展设置、来源目录、环境文件、SQLite 和 `.session`
+  文件都应保持私密。
 - 绝不要把 bot token 或 session 写入包、镜像、issue 或日志。
 - MTProto application 凭据必须完整来自同一来源，不能混用两边。
 - 经过不可信网络访问的远程 Bot API 地址使用 HTTPS；回环地址与受控私有 Compose

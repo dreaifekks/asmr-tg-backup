@@ -102,8 +102,10 @@ Send `/panel` to the bot and add one YouTube or Twitch source. The panel updates
 For batch or complete-field changes, edit that file and run:
 
 ```bash
-asmr-tg-backup sources validate
-asmr-tg-backup sources apply
+asmr-tg-backup sources validate \
+  --config ~/.config/asmr-tg-backup/config.toml
+asmr-tg-backup sources apply \
+  --config ~/.config/asmr-tg-backup/config.toml
 ```
 
 Confirm the first download and delivery from the panel or
@@ -111,14 +113,48 @@ Confirm the first download and delivery from the panel or
 
 ## 6. Update
 
-Back up `~/.config/asmr-tg-backup/` (including the source catalog) and
-`~/.local/share/asmr-tg-backup/` before an update.
+The update keeps the current configuration and data, then regenerates the user
+service for the upgraded pipx environment. Stop the application and every local
+Bot API service included in the backup so their state stays consistent.
+
+Back up all of `~/.config/asmr-tg-backup/` and
+`~/.local/share/asmr-tg-backup/`. The configuration backup includes
+`config.toml`, `sources.toml`, the optional `env`, and—after one-command
+extension setup—`config.extensions.toml` plus private files below
+`extensions/config/`.
+
+When the deployment uses the native local Bot API, also back up
+`~/.config/systemd/user/asmr-tg-backup-telegram-bot-api.service`. Stop both
+services before copying their data:
 
 ```bash
 systemctl --user stop asmr-tg-backup.service
+systemctl --user stop asmr-tg-backup-telegram-bot-api.service  # local Bot API only
+```
+
+Upgrade and validate while the services remain stopped:
+
+```bash
 pipx upgrade asmr-tg-backup
-systemctl --user start asmr-tg-backup.service
 asmr-tg-backup --version
+asmr-tg-backup extensions doctor \
+  --config ~/.config/asmr-tg-backup/config.toml
+asmr-tg-backup sources validate \
+  --config ~/.config/asmr-tg-backup/config.toml
+```
+
+If `extensions doctor` reports a missing or incompatible package, rerun
+`extensions enable <slug>` for a trusted catalog extension. Update a
+third-party extension through the same pipx environment and its documented
+installation method. Rerun both validations before continuing.
+
+Start the local Bot API first when the deployment uses it, then refresh the
+application unit and start the worker:
+
+```bash
+systemctl --user start asmr-tg-backup-telegram-bot-api.service  # local Bot API only
+asmr-tg-backup service install
+systemctl --user status asmr-tg-backup.service
 ```
 
 ## Other upload and build paths

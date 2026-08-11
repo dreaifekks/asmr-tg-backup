@@ -1,16 +1,26 @@
 # Extensions
 
-Version 0.5 introduced runtime extension API level 1; version 0.6 adds the
-trusted one-command setup layer. An extension is a separately
-installed Python distribution that registers capabilities through the
-`asmr_tg_backup.extensions` entry-point group. Packages are discovered only
-from the core application's Python environment and are imported only after
-their IDs are explicitly enabled.
+The core service is complete on its own for YouTube, Twitch, downloads, and
+Telegram delivery. Add an extension when a deployment needs another source
+provider or task-scoped network routing:
+
+- enable `niconico-origin` to add a Niconico provider button to the Telegram
+  Panel;
+- enable `proxy-router` to choose which notification, discovery, probe,
+  download, or Telegram connection scopes use a proxy;
+- leave both disabled when the built-in providers and direct connections cover
+  the deployment.
+
+An extension is a separately installed Python distribution. It registers
+capabilities through the `asmr_tg_backup.extensions` entry-point group and runs
+in the same Python environment as the core. The core imports only the extension
+IDs enabled for the active configuration. Runtime extension API level 1 was
+introduced in version 0.5; version 0.6 adds the trusted one-command setup layer.
 
 ## What stays in core
 
-Extensions do not receive a database connection, job queue, downloader, or
-Telegram token. The core continues to own:
+The core keeps the database connection, job queue, downloader, and Telegram
+token, and continues to own:
 
 - `sources.toml` validation and atomic replacement;
 - SQLite media, checkpoints, deduplication, leases, and retry state;
@@ -33,9 +43,9 @@ route request     -> policy lease      -> one request/process/connection
 ```
 
 Multiple extensions may add distinct source provider IDs. Exactly one
-connection policy and one HTTP transport may be registered for a process, so
-enabling two competing network routers fails during startup instead of making
-ordering decide behavior.
+connection policy and one HTTP transport may be registered for a process.
+Startup validation reports a capability conflict when two network routers are
+enabled together.
 
 ## One-command enablement
 
@@ -51,11 +61,11 @@ asmr-tg-backup extensions enable proxy-router
 asmr-tg-backup extensions enable niconico-origin
 ```
 
-`enable` resolves an exact short name from the catalog bundled with the core.
-It does not accept arbitrary package names or URLs. It then installs the pinned
-distribution into the current pipx environment or virtual environment, checks
-both runtime and setup entry points without importing them, runs the
-extension-owned minimal setup, enables it, runs the same composed-runtime
+`enable` resolves an exact short name from the trusted catalog bundled with the
+core; third-party packages use the manual installation path below. It then
+installs the pinned distribution into the current pipx environment or virtual
+environment, checks both runtime and setup entry points without importing them,
+runs the extension-owned minimal setup, enables it, runs the same composed-runtime
 checks as `doctor`, and restarts an active core-managed systemd service only
 when that service uses the same main config. Repeating a healthy enable is a
 no-op; use `--reconfigure` to run setup again or `--no-restart` to leave the
@@ -63,31 +73,40 @@ current process alone.
 
 The proxy setup defaults to `127.0.0.1:7891` SOCKS5 and media-only routing, but
 also accepts an HTTP/SOCKS URL or a hidden Mihomo subscription URL plus broader
-scope presets. Niconico needs no extension config; the command prints its
-optional ASMR live-search source suggestion without silently adding a source
-that could start recording.
+scope presets. Niconico needs no extension config; the command presents an
+optional ASMR live-search suggestion, and you choose whether to add it as a
+source.
 
 After an enabled extension registers a non-built-in source provider, the
 Telegram panel automatically adds a matching provider button, such as
 `➕ Niconico`. Selecting it asks for `<external_id> [display name]`; quote an
-identifier that contains spaces. No source is created and no recording starts
-until the user submits that input. The new source then appears under
-`📚 Sources` as `provider/kind`.
+identifier that contains spaces. Submit that input when you want the service
+to create the source and begin polling it. The new source then appears under
+`📚 Sources` as `provider/kind`. After enabling and restarting the service,
+send a new `/panel` command or refresh the current active panel to regenerate
+its provider buttons.
 
-The command never rewrites the main config. For `config.toml`, it atomically
-maintains `config.extensions.toml` plus private files below `extensions/`, all
-with mode `0600`. Main-config extension settings take precedence over managed
-defaults. If setup, validation, or service restart fails, the previous sidecar
-and private extension config are restored; a newly installed package may stay
-installed but disabled.
+The command keeps the main config unchanged. Here `<config-stem>` means the main
+config filename without its final `.toml`. It atomically maintains:
 
-## Manual and container installation
+- `<config-stem>.extensions.toml` beside the main config for enabled IDs and
+  managed settings;
+- `extensions/<config-stem>/<filename>` beside the main config for private
+  extension settings.
 
-The following is the advanced path for image builds and deployments that do
-not allow runtime package installation.
+For the default `config.toml`, these paths become `config.extensions.toml` and
+`extensions/config/<filename>`. Managed files use mode `0600`, and explicit
+settings in the main config take precedence. If setup, validation, or service
+restart fails, the command restores the previous managed state and private
+settings; the installed package remains available for a later enable attempt.
 
-For pipx installations, inject each selected extension into the existing
-application environment:
+## Native manual installation
+
+The one-command path is preferred for native installations. When configuration
+management owns package installation, inject each selected extension into the
+same environment as the core.
+
+For pipx:
 
 ```bash
 pipx inject asmr-tg-backup \
@@ -96,7 +115,7 @@ pipx inject asmr-tg-backup \
   'asmr-tg-backup-ext-niconico-origin==0.2.0'
 ```
 
-For a virtual environment, use its interpreter:
+For a virtual environment:
 
 ```bash
 .venv/bin/python -m pip install \
@@ -104,18 +123,174 @@ For a virtual environment, use its interpreter:
   'asmr-tg-backup-ext-niconico-origin==0.2.0'
 ```
 
-An official container remains minimal. Build a small derived image when an
-extension is needed:
+Continue with [manual enable and validation](#manual-enable-and-validation)
+when using this package-managed path.
+
+## Install extensions in Docker Compose {#docker-extensions}
+
+A Docker installation has two durable layers:
+
+1. the derived image contains the extension Python packages;
+2. host-mounted configuration selects extension IDs and supplies private
+   settings.
+
+Recreating the container then produces the same extension runtime every time.
+Installing a package from a shell inside an existing container only changes
+that one container and is lost when Compose replaces it.
+
+The two trusted extensions use these exact package names and runtime IDs:
+
+| Capability | Package installed in the image | ID enabled in `config.toml` | Private file |
+| --- | --- | --- | --- |
+| Proxy routing | `asmr-tg-backup-ext-proxy-router==0.2.0` | `dreaife.proxy-router` | Required |
+| Niconico source | `asmr-tg-backup-ext-niconico-origin==0.2.0` | `dreaife.niconico-origin` | Not required |
+
+### 1. Create the derived image
+
+In the Compose checkout, create `Dockerfile.extensions`:
 
 ```dockerfile
-FROM ghcr.io/dreaifekks/asmr-tg-backup:0.6.3
+ARG CORE_VERSION=0.6.3
+FROM ghcr.io/dreaifekks/asmr-tg-backup:${CORE_VERSION}
+
+ARG PROXY_ROUTER_VERSION=0.2.0
+ARG NICONICO_ORIGIN_VERSION=0.2.0
+
 RUN python -m pip install --no-cache-dir \
-    'asmr-tg-backup-ext-proxy-router==0.2.0' \
-    'asmr-tg-backup-ext-niconico-origin==0.2.0'
+    "asmr-tg-backup-ext-proxy-router==${PROXY_ROUTER_VERSION}" \
+    "asmr-tg-backup-ext-niconico-origin==${NICONICO_ORIGIN_VERSION}"
 ```
 
-Pin exact versions or immutable commit IDs. Do not install an unreviewed
-extension into a service that holds Telegram credentials or private media.
+Keep only the package lines needed by this deployment. Build an immutable local
+tag so upgrades and rollbacks remain explicit:
+
+```bash
+docker build --pull \
+  --build-arg CORE_VERSION=0.6.3 \
+  --build-arg PROXY_ROUTER_VERSION=0.2.0 \
+  --build-arg NICONICO_ORIGIN_VERSION=0.2.0 \
+  -f Dockerfile.extensions \
+  -t asmr-tg-backup:0.6.3-extensions .
+```
+
+Select that image in `.env`:
+
+```dotenv
+ASMR_TG_BACKUP_IMAGE=asmr-tg-backup:0.6.3-extensions
+```
+
+### 2. Enable the installed IDs
+
+Edit the existing `[extensions]` section in the host `config.toml`. This example
+enables both packages:
+
+```toml
+[extensions]
+enabled = [
+  "dreaife.proxy-router",
+  "dreaife.niconico-origin",
+]
+
+[extensions."dreaife.proxy-router"]
+required = true
+config_file = "extensions/proxy-router.toml"
+
+[extensions."dreaife.niconico-origin"]
+required = true
+```
+
+Keep only the IDs installed in the image. The package name belongs in the
+Dockerfile; the runtime ID belongs in `config.toml`.
+
+### 3. Create the proxy settings when needed
+
+Niconico needs no private extension file, so a Niconico-only image can skip
+this step. For proxy routing, create the host directory and private file:
+
+```bash
+mkdir -p extensions
+chmod 700 extensions
+# Create extensions/proxy-router.toml with the settings below.
+chmod 600 extensions/proxy-router.toml
+```
+
+A media-only HTTP/SOCKS example is:
+
+```toml
+fail_closed = true
+routes = [
+  "http://host.docker.internal:7890",
+  "socks5h://host.docker.internal:7891",
+]
+
+[scopes]
+"media.probe" = "proxy"
+"media.download" = "proxy"
+```
+
+Inside the application container, `127.0.0.1` means the container itself.
+`compose.yaml` already maps `host.docker.internal` to the Docker host, but the
+host proxy must listen on an address reachable from the Docker bridge. Keep
+that listener limited to trusted local/Docker networks. When the proxy is
+another Compose service, use its service name instead. The
+[`proxy-router` package guide](https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router)
+covers subscriptions and every routing scope.
+
+### 4. Mount the private settings
+
+Create `compose.extensions.yaml`:
+
+```yaml
+services:
+  asmr-tg-backup:
+    volumes:
+      - ./extensions:/config/extensions:ro
+```
+
+Add the override to `.env` so every Compose command uses it:
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.extensions.yaml
+```
+
+If `COMPOSE_FILE` already contains another override, append
+`:compose.extensions.yaml` instead of replacing the existing value. A
+Niconico-only deployment can omit this override because it has no private file.
+
+### 5. Validate and start
+
+Confirm that Compose resolves the derived tag, then inspect and validate the
+composed extension runtime before starting the worker:
+
+```bash
+docker compose config --images
+docker compose run --rm asmr-tg-backup \
+  extensions list --config /config/config.toml
+docker compose run --rm asmr-tg-backup \
+  extensions doctor --config /config/config.toml
+docker compose run --rm asmr-tg-backup \
+  sources validate --config /config/config.toml
+```
+
+`extensions list` should report each selected ID as installed and enabled.
+After all three checks pass, start the exact image already built:
+
+```bash
+docker compose up -d --no-build asmr-tg-backup
+docker compose logs --tail=100 asmr-tg-backup
+```
+
+For Niconico, send a new `/panel` or refresh the active Panel after startup and
+confirm that `➕ Niconico` is present. For proxy routing, inspect the service log
+for the selected policy without printing the private endpoint or subscription.
+
+### Upgrade or roll back
+
+For an upgrade, change the core and extension version arguments, build a new
+image tag, point `ASMR_TG_BACKUP_IMAGE` at it, and rerun the three validation
+commands before recreation. Keep the previous local tag until the updated
+service has been verified; rollback consists of selecting that previous tag and
+recreating the application with `--no-build`.
 
 ## Manual enable and validation
 

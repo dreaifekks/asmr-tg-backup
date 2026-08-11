@@ -38,11 +38,14 @@
 
 XDG variables replace the corresponding default roots.
 
+`<config-stem>` below means the main configuration filename without its final
+`.toml`.
+
 | Resource | XDG path | Default |
 | --- | --- | --- |
 | Setup config | `$XDG_CONFIG_HOME/asmr-tg-backup/config.toml` | `~/.config/asmr-tg-backup/config.toml` |
-| Managed extension state | Beside each main config as `NAME.extensions.toml` | `~/.config/asmr-tg-backup/config.extensions.toml` |
-| Private extension configs | `extensions/` beside the main config | `~/.config/asmr-tg-backup/extensions/` |
+| Managed extension state | Beside `<config-stem>.toml` as `<config-stem>.extensions.toml` | `~/.config/asmr-tg-backup/config.extensions.toml` |
+| Private extension configs | Beside the main config as `extensions/<config-stem>/<filename>` | `~/.config/asmr-tg-backup/extensions/config/<filename>` |
 | Source catalog | beside the setup config by default | `~/.config/asmr-tg-backup/sources.toml` |
 | Worker environment | next to the setup config as `env` | `~/.config/asmr-tg-backup/env` |
 | Worker unit | `$XDG_CONFIG_HOME/systemd/user/asmr-tg-backup.service` | `~/.config/systemd/user/asmr-tg-backup.service` |
@@ -121,8 +124,9 @@ The control panel continues to use Bot API independently of the media transport.
 
 ## Security boundaries
 
-- Keep configuration, the source catalog, environment files, SQLite, and
-  `.session` files private.
+- Keep the main configuration, managed extension state, private extension
+  settings, source catalog, environment files, SQLite, and `.session` files
+  private.
 - Never put the bot token or session into a package, image, issue, or log.
 - Use a complete MTProto application pair from one source; never mix halves.
 - Use HTTPS for remote Bot API endpoints reached over an untrusted network;

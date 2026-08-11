@@ -12,6 +12,7 @@ method can be changed independently.
 | Runtime state | XDG data directory | `asmr-data` volume mounted at `/data` |
 | Default upload | MTProto | MTProto |
 | Media tools | Install `ffmpeg`/`ffprobe` | Included in the image |
+| Optional extensions | Enable trusted entries in the core pipx/virtualenv environment | Build a derived image, then enable its IDs in the mounted config |
 
 ## Telegram shortcuts {#telegram-shortcuts}
 
@@ -53,6 +54,14 @@ delivery. It does not require a personal account or phone verification code.
 - [Docker Compose](docker-compose.md) keeps the application and its data in a
   container-managed stack.
 
+Complete the core installation and basic configuration first. A native
+installation can then enable a trusted extension with
+`asmr-tg-backup extensions enable <slug>`. A Compose installation adds the
+package to a derived image and enables its ID in the mounted `config.toml`. If
+the first connection itself requires a proxy, prepare `proxy-router` before
+starting the service. The [extension guide](../configuration/extensions.md)
+covers both paths.
+
 ## Pick an upload method
 
 | Method | When to use it |
@@ -65,11 +74,12 @@ delivery. It does not require a personal account or phone verification code.
 ## What happens after setup
 
 The PyPI setup asks for the bot token, destination, and control-panel user ID.
-It creates `config.toml`, `sources.toml`, and the SQLite database, but does not
-add any media sources. Start the service, send `/panel` to the bot, and add one
-YouTube or Twitch source. The panel writes sources and the filter to the
-editable `sources.toml`; SQLite contains only the synchronized mirror and
-runtime state. Twitch sources also need application credentials from the
+It creates `config.toml`, `sources.toml`, and the SQLite database. Start the
+service and send `/panel` to add a YouTube or Twitch source. If you enable a
+source extension, send a new `/panel` and use its generated provider button.
+The panel writes sources and the filter to the editable `sources.toml`; SQLite
+contains only the synchronized mirror and runtime state. Twitch sources also
+need application credentials from the
 [Twitch setup guide](../configuration/sources.md#twitch-credentials).
 
 Compose uses `.env`, `config.toml`, and `settings/sources.toml` instead of the

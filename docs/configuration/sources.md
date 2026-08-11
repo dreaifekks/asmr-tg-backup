@@ -1,16 +1,70 @@
 # Sources and downloads
 
-**Use the Telegram control panel for routine source management.** Send
-`/panel` to add, enable, disable, or remove YouTube and Twitch sources, set the
-filter, or switch Twitch live/VOD mode. The same bot accepts
-`/origin rename <origin_id> <name>` and `/origin history <origin_id>` for
-renaming and history backfill.
+Sources tell the service where to discover media and how each origin should be
+polled. Use the Telegram panel for day-to-day changes, and use `sources.toml`
+when you need every field, an RSS feed, or a batch update.
 
-Those actions atomically update `sources.toml` and then synchronize its SQLite
-runtime mirror. They do not rewrite `config.toml`: that file holds global
-service, download, Telegram, Twitch credential-reference, and panel-access
-settings. SQLite keeps polling cursors, jobs, errors, and media records; it is
-not a second user-editable source configuration.
+## What you can manage
+
+From `/panel`, you can:
+
+- add YouTube channels and Twitch broadcasters;
+- add a provider registered by an enabled extension, such as Niconico;
+- enable, disable, inspect, or remove an existing source;
+- choose live recording or archive download for Twitch VOD sources; and
+- inspect, set, disable, or reset the global source filter.
+
+An extension that registers a source provider adds its own `➕ Provider`
+button after the extension is enabled and the service has restarted. The
+button makes the provider available; select it and submit an identifier when
+you want to create the source and begin polling.
+
+RSS feeds are built in as manual catalog sources. Add them to `sources.toml`
+and apply the catalog with the CLI.
+
+## What to prepare
+
+Keep these roles separate when editing or backing up the service:
+
+- `sources.toml` is the user-editable source catalog and global source filter;
+- `config.toml` holds service, download, Telegram, credential-reference,
+  manually managed extension, and panel-access settings;
+- one-command extension setup keeps managed state in
+  `<config-stem>.extensions.toml` and private settings below
+  `extensions/<config-stem>/`; and
+- SQLite holds the synchronized runtime mirror plus polling cursors, jobs,
+  errors, and media records.
+
+Here `<config-stem>` means the main config filename without its final `.toml`.
+The panel and CLI atomically update `sources.toml` and then synchronize SQLite.
+Edit the catalog instead of editing source rows in SQLite.
+
+Before adding a source, prepare the remote identifier it expects: a YouTube
+handle or channel ID, a Twitch login or user ID, an extension-specific
+identifier, or an RSS feed URL. Twitch also needs the credentials described in
+[Twitch credentials](#twitch-credentials). Review the source filter after
+adding an origin; a healthy source still skips items whose title, source name,
+and source ID do not match it.
+
+## Add a source from Telegram
+
+1. Enable and configure the required extension first when the provider is not
+   built in. For example:
+
+   ```bash
+   asmr-tg-backup extensions enable niconico-origin
+   ```
+
+2. Send `/panel`, then select `➕ YouTube`, `➕ Twitch`, or the provider button
+   added by the extension.
+3. Follow the prompt. Extension providers accept
+   `<external_id> [display name]`; quote an identifier that contains spaces.
+4. Open `📚 Sources` and confirm the new source, its enabled state, and its
+   `provider/kind` value.
+
+The same bot accepts `/origin rename <origin_id> <name>` and
+`/origin history <origin_id>` for renaming and history backfill. See
+[Extensions](extensions.md) for installation and provider-specific examples.
 
 ## The source catalog
 
@@ -59,33 +113,76 @@ and `external_id`; Twitch `vods` also includes
 `recording_mode`, so one broadcaster may deliberately have one `live` and one
 `vod` source, but not two exact duplicates.
 
+### Add an RSS feed manually {#rss-feed}
+
+For an RSS source, `external_id` is the complete feed URL and `kind` is
+`feed`:
+
+```toml
+[[origins]]
+id = "rss-example"
+provider = "rss"
+kind = "feed"
+name = "Example media feed"
+external_id = "https://feeds.example.com/media.xml"
+enabled = true
+bootstrap = "latest"
+allowed_media_hosts = ["media.example.com", "*.cdn.example.com"]
+allow_private_media = false
+```
+
+Each RSS item or Atom entry uses its link as the media URL. That link must use
+HTTP or HTTPS without embedded credentials. By default, media hosts must
+resolve to public addresses.
+`allowed_media_hosts` narrows downloads to the exact hosts and wildcard
+subdomains you list; it is useful when a feed should only publish media from a
+known site or CDN. Leave the list empty to accept any public media host.
+
+Set `allow_private_media = true` only when the feed is expected to publish
+media from a private or local network that this service is allowed to reach.
+This setting permits non-public media addresses, while `allowed_media_hosts`
+can still limit which host names are accepted. Run `sources validate` after
+changing either field.
+
 ## Manual tuning and CLI
 
 The panel covers common changes. Edit the catalog directly for every field or
 for batch changes:
 
 ```bash
-asmr-tg-backup sources path
-asmr-tg-backup sources export --output sources.backup.toml
+asmr-tg-backup sources path \
+  --config ~/.config/asmr-tg-backup/config.toml
+asmr-tg-backup sources export \
+  --config ~/.config/asmr-tg-backup/config.toml \
+  --output sources.backup.toml
 # Edit sources.toml.
-asmr-tg-backup sources validate
-asmr-tg-backup sources apply
-asmr-tg-backup sources list
+asmr-tg-backup sources validate \
+  --config ~/.config/asmr-tg-backup/config.toml
+asmr-tg-backup sources apply \
+  --config ~/.config/asmr-tg-backup/config.toml
+asmr-tg-backup sources list \
+  --config ~/.config/asmr-tg-backup/config.toml
 ```
 
-Append `--config /absolute/path/config.toml` when using a non-default config.
-You can also prepare another file and atomically replace the active catalog:
+The CLI otherwise looks for `config.toml` in the current directory. Replace
+the path above when using another main config. You can also prepare another
+file and atomically replace the active catalog:
 
 ```bash
-asmr-tg-backup sources validate --file ./candidate.toml
-asmr-tg-backup sources apply --file ./candidate.toml
+asmr-tg-backup sources validate \
+  --config ~/.config/asmr-tg-backup/config.toml \
+  --file ./candidate.toml
+asmr-tg-backup sources apply \
+  --config ~/.config/asmr-tg-backup/config.toml \
+  --file ./candidate.toml
 ```
 
 `apply` updates the SQLite mirror in one transaction. A source removed from the
 catalog is removed from the pollable source set while existing media and job
 history are retained. For an upgraded installation, run
-`asmr-tg-backup sources migrate` once to create the catalog from existing
-SQLite sources or legacy source declarations.
+`asmr-tg-backup sources migrate --config ~/.config/asmr-tg-backup/config.toml`
+once to create the catalog from existing SQLite sources or legacy source
+declarations.
 
 Legacy `[[origins]]`, `[[channels]]`, and `[[feeds]]` declarations participate
 only while `sources.toml` is missing. During that one-time migration, current
@@ -100,10 +197,10 @@ Common fields:
 | Field | Meaning |
 | --- | --- |
 | `id` | Stable local identifier; it need not change when the display name changes |
-| `provider` | `youtube` or `twitch` |
-| `kind` | YouTube uses `uploads`; Twitch supports `vods`, `highlights`, and `uploads` |
+| `provider` | Built-ins are `youtube`, `twitch`, and manual `rss`; enabled extensions may register additional values such as `niconico` |
+| `kind` | YouTube uses `uploads` or `vod_after_live`; Twitch supports `vods`, `highlights`, and `uploads`; RSS uses `feed`; extensions define their own kinds |
 | `name` | Display name in the panel and status output |
-| `external_id` | YouTube `UC...` channel ID, or Twitch login/numeric broadcaster ID |
+| `external_id` | Remote identifier: YouTube channel ID, Twitch broadcaster ID/login, RSS feed URL, or the value defined by an extension provider |
 | `enabled` | Whether the source is polled |
 | `bootstrap` | `latest` starts at the newest matching item; `all` requests a history backfill |
 | `recording_mode` | Twitch `vods` only: `vod` waits for an archive; `live` records during the stream |

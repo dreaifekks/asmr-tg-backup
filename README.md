@@ -65,6 +65,8 @@ asmr-tg-backup service uninstall
 
 Send `/panel` to the bot after the service starts. The panel is the recommended
 way to add the first YouTube or Twitch source and change the source filter.
+After the service loads a source extension, send a new `/panel` or refresh the
+current active panel to show its provider button, such as `➕ Niconico`.
 
 For a persistent native service, continue with the
 [systemd user-service guide](https://dreaifekks.github.io/asmr-tg-backup/getting-started/pypi/#run-as-a-user-service).
@@ -102,8 +104,8 @@ the service starts.
 
 See the
 [Docker Compose guide](https://dreaifekks.github.io/asmr-tg-backup/getting-started/docker-compose/)
-for UID/GID handling, source builds, upgrades, and the optional local Bot API
-profile.
+for UID/GID handling, derived extension images, source builds, upgrades, and the
+optional local Bot API profile.
 
 ## Sources: panel first, file when needed
 
@@ -111,7 +113,7 @@ profile.
 | --- | --- | --- |
 | YouTube | Channel uploads | Uses a real `UC...` channel ID |
 | Twitch | VODs, highlights, uploads, or live recording | Uses Twitch application settings |
-| Extension | Registered kinds | Edit `sources.toml`; the core still schedules and stores every item |
+| Enabled source extension | Kinds registered by that extension | Use its generated Panel button or edit `sources.toml`; the core still schedules and stores every item |
 
 Send `/panel` to add, enable, disable, or remove a source, switch Twitch mode,
 and change the global source filter. The same bot accepts `/origin rename` and
@@ -140,8 +142,10 @@ enabled = true
 history backfill. Validate and apply manual edits with:
 
 ```bash
-asmr-tg-backup sources validate
-asmr-tg-backup sources apply
+asmr-tg-backup sources validate \
+  --config ~/.config/asmr-tg-backup/config.toml
+asmr-tg-backup sources apply \
+  --config ~/.config/asmr-tg-backup/config.toml
 ```
 
 On an upgrade, legacy `[[origins]]`, `[[channels]]`, or `[[feeds]]` declarations
@@ -166,13 +170,19 @@ asmr-tg-backup extensions enable proxy-router
 asmr-tg-backup extensions enable niconico-origin
 ```
 
-The command never rewrites `config.toml`; it maintains a private managed
-sidecar beside it. Containers still install selected extensions at image build
-time. Advanced and third-party extensions can be installed and configured
-manually, then checked with `extensions list` and `extensions doctor`.
+The command keeps `config.toml` unchanged. Here `<config-stem>` means the main
+config filename without its final `.toml`. It stores managed state in
+`<config-stem>.extensions.toml` and private extension settings in
+`extensions/<config-stem>/<filename>`. Containers follow the
+[derived-image workflow](https://dreaifekks.github.io/asmr-tg-backup/configuration/extensions/#docker-extensions):
+install selected packages while building the image, enable their IDs in the
+mounted `config.toml`, and mount any private extension config. Advanced and
+third-party extensions can be installed and configured manually, then checked
+with `extensions list` and `extensions doctor`.
 Enabled source extensions are also discovered by the Telegram panel: it adds a
-provider-specific origin button and shows created origins as `provider/kind`,
-without creating or recording any source until the user submits it.
+provider-specific origin button and shows created origins as `provider/kind`.
+You decide when to create the source and begin polling by submitting its
+identifier in the panel.
 
 The first optional repositories using the 0.6 one-command setup layer are:
 
@@ -229,9 +239,15 @@ Native setup stores runtime configuration below
 `~/.local/share/asmr-tg-backup/`. Docker stores application state in
 `/data` and its editable source catalog in `./settings/sources.toml`.
 
-Back up `config.toml`, `sources.toml`, the environment file, SQLite database,
-downloads, and MTProto session before upgrades. Run only one application
-process against a given database/session pair.
+One-command extension setup also stores `<config-stem>.extensions.toml` beside
+the main config and private settings below
+`extensions/<config-stem>/<filename>`. With the default `config.toml`, these are
+`config.extensions.toml` and `extensions/config/<filename>`.
+
+Before an upgrade, back up the main config, `sources.toml`, the environment
+file, managed extension state and private extension settings, the SQLite
+database, downloads, and the MTProto session. Run only one application process
+against a given database/session pair.
 
 Keep runtime configuration, bot tokens, Twitch settings, SQLite/WAL files,
 downloads, and MTProto sessions in the local runtime directories rather than

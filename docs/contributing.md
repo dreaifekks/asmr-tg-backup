@@ -53,6 +53,12 @@ troubleshooting instructions in MkDocs, and implementation constraints in the
 - `sources.toml` is authoritative for sources and the filter. Panel and CLI
   changes go through the catalog manager; SQLite holds only the synchronized
   mirror and operational state.
+- Extensions register capabilities while the core retains ownership of SQLite,
+  jobs, downloads, delivery state, and the source catalog. Import only extension
+  IDs explicitly enabled for the active process configuration.
+- Keep one network route fixed for the complete request, subprocess, upload, or
+  client connection. Select another route only at its retry or reconnect
+  boundary.
 - Tokens, API credentials, private configuration, databases, downloads, and
   sessions stay out of logs, command-line arguments, fixtures, packages, and
   commits.

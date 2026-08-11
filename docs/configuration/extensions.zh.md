@@ -1,14 +1,21 @@
 # 扩展
 
-0.5 版引入 runtime 扩展 API level 1，0.6 版增加受信的一键 setup 层。扩展是单独
-安装的 Python distribution，通过
-`asmr_tg_backup.extensions` entry-point group 注册能力。核心只会从自身所在的 Python
-环境中发现扩展，并且只有在配置中显式启用 ID 后才会导入扩展代码。
+核心服务已经包含 YouTube、Twitch、下载与 Telegram 投递的完整流程。当部署需要
+其他来源提供方或按任务类型分配网络路由时，再选择对应扩展：
+
+- 启用 `niconico-origin`，在 Telegram Panel 中增加 Niconico provider 按钮；
+- 启用 `proxy-router`，分别选择通知、发现、探测、下载或 Telegram 连接中
+  需要使用代理的 scope；
+- 内置来源与直连已经满足需求时，保持扩展未启用即可。
+
+扩展是单独安装的 Python distribution，通过
+`asmr_tg_backup.extensions` entry-point group 注册能力，并运行在核心所在的同一个
+Python 环境中。核心只会导入当前配置已启用的扩展 ID。0.5 版引入 runtime 扩展
+API level 1，0.6 版增加受信的一键 setup 层。
 
 ## 核心仍然负责什么
 
-扩展拿不到数据库连接、任务队列、downloader 或 Telegram token。以下职责仍由核心
-掌握：
+数据库连接、任务队列、downloader 和 Telegram token 始终由核心持有。核心统一负责：
 
 - `sources.toml` 校验与原子替换；
 - SQLite 媒体、checkpoint、去重、租约和重试状态；
@@ -30,8 +37,7 @@ route request   -> policy lease     -> 单次请求/进程/连接
 ```
 
 多个扩展可以添加互不冲突的来源 provider ID。一个进程只能注册一个 connection policy
-和一个 HTTP transport；如果同时启用两个竞争的网络路由器，启动会明确失败，不会让
-安装顺序暗中决定行为。
+和一个 HTTP transport。同时启用两个网络路由器时，启动校验会报告能力冲突。
 
 ## 一条命令启用
 
@@ -47,32 +53,40 @@ asmr-tg-backup extensions enable proxy-router
 asmr-tg-backup extensions enable niconico-origin
 ```
 
-`enable` 只会精确匹配核心随包发布的短名，不接受任意包名或 URL。随后它会把固定版本
-安装到当前 pipx/虚拟环境，先静态检查 runtime 与 setup entry point，再运行扩展自己
-提供的最小配置、写入启用状态、执行与 `doctor` 相同的组合运行时检查；只有当前正在
+`enable` 会精确匹配核心随包发布的受信短名；第三方包使用下文的手工安装路径。
+随后它会把固定版本安装到当前 pipx/虚拟环境，先静态检查 runtime 与 setup entry point，
+再运行扩展自己提供的最小配置、写入启用状态、执行与 `doctor` 相同的组合运行时检查；只有当前正在
 运行的核心托管 systemd 服务使用同一份主配置时，才会安全重启。重复启用一个健康
 扩展不会重复安装、写文件或重启；`--reconfigure` 可重新配置，`--no-restart` 可保留
 当前进程。
 
 代理向导默认使用 `127.0.0.1:7891` SOCKS5 和“仅媒体探测/下载”预设，也支持现有
 HTTP/SOCKS URL、隐藏输入的 Mihomo 订阅和更广的 scope 预设。Niconico 扩展本身无需
-配置；命令只会显示可选 ASMR 直播搜索来源，不会悄悄添加可能开始录制的来源。
+配置；命令会显示可选的 ASMR 直播搜索建议，由你决定是否把它添加为来源。
 
 启用的扩展注册非内置来源 provider 后，Telegram 面板会自动增加对应按钮，例如
 `➕ Niconico`。点击后输入 `<来源标识> [显示名称]`；标识包含空格时需使用引号包住。
-用户提交前不会创建来源或开始录制。创建后，该来源会在 `📚 来源` 中显示为
-`provider/kind`。
+希望创建来源并开始轮询时，再提交这段输入。创建后，该来源会在 `📚 来源` 中显示为
+`provider/kind`。启用扩展并重启服务后，发送新的 `/panel`，或者刷新当前仍有效的
+Panel，即可重新生成 provider 按钮。
 
-该命令绝不会重写主配置。对于 `config.toml`，它原子维护同目录的
-`config.extensions.toml` 和 `extensions/` 下的私密扩展配置，权限均为 `0600`；主配置
-中的扩展设置优先于受管默认值。如果 setup、校验或服务重启失败，会恢复之前的 sidecar
-与私密配置；本次新装的包可以保留，但仍处于未启用状态。
+该命令保持主配置不变。`<config-stem>` 表示去掉末尾 `.toml` 后的主配置文件名。
+命令会原子维护：
 
-## 手工与容器安装
+- 与主配置同目录的 `<config-stem>.extensions.toml`，保存已启用 ID 和受管设置；
+- 与主配置同目录的 `extensions/<config-stem>/<filename>`，保存私密扩展设置。
 
-以下流程保留给镜像构建及禁止运行时安装包的部署。
+默认主配置 `config.toml` 对应 `config.extensions.toml` 与
+`extensions/config/<filename>`。受管文件权限为 `0600`，主配置中的显式设置优先。
+如果 setup、校验或服务重启失败，命令会恢复之前的受管状态与私密设置；已安装的包
+可以直接用于下次启用。
 
-使用 pipx 安装核心时，把选中的扩展逐个注入已有应用环境：
+## 原生手工安装
+
+原生部署优先使用上面的一键启用命令。由配置管理系统负责安装包时，把选中的扩展
+注入核心所在的同一个环境。
+
+使用 pipx 时：
 
 ```bash
 pipx inject asmr-tg-backup \
@@ -89,19 +103,166 @@ pipx inject asmr-tg-backup \
   'asmr-tg-backup-ext-niconico-origin==0.2.0'
 ```
 
-官方容器保持最小依赖；需要扩展时构建一个很薄的派生镜像：
+采用这种由包管理系统维护的方式时，继续完成
+[手工启用与检查](#manual-enable-and-validation)。
+
+## 在 Docker Compose 中安装扩展 {#docker-extensions}
+
+Docker 部署包含两个持久层：
+
+1. 派生镜像保存扩展 Python 包；
+2. 宿主机挂载的配置负责选择扩展 ID，并提供私密设置。
+
+这样每次重建容器都会得到同一套扩展运行环境。在现有容器的 shell 中临时执行
+`pip install` 只会改变那个容器，Compose 替换容器后这次安装就会消失。
+
+目前两个受信扩展对应的包名、运行时 ID 与私密文件如下：
+
+| 能力 | 镜像中安装的包 | `config.toml` 中启用的 ID | 私密文件 |
+| --- | --- | --- | --- |
+| 代理选路 | `asmr-tg-backup-ext-proxy-router==0.2.0` | `dreaife.proxy-router` | 需要 |
+| Niconico 来源 | `asmr-tg-backup-ext-niconico-origin==0.2.0` | `dreaife.niconico-origin` | 不需要 |
+
+### 1. 创建派生镜像
+
+在 Compose 项目目录创建 `Dockerfile.extensions`：
 
 ```dockerfile
-FROM ghcr.io/dreaifekks/asmr-tg-backup:0.6.3
+ARG CORE_VERSION=0.6.3
+FROM ghcr.io/dreaifekks/asmr-tg-backup:${CORE_VERSION}
+
+ARG PROXY_ROUTER_VERSION=0.2.0
+ARG NICONICO_ORIGIN_VERSION=0.2.0
+
 RUN python -m pip install --no-cache-dir \
-    'asmr-tg-backup-ext-proxy-router==0.2.0' \
-    'asmr-tg-backup-ext-niconico-origin==0.2.0'
+    "asmr-tg-backup-ext-proxy-router==${PROXY_ROUTER_VERSION}" \
+    "asmr-tg-backup-ext-niconico-origin==${NICONICO_ORIGIN_VERSION}"
 ```
 
-请固定精确版本或不可变 commit ID。不要把未经审查的扩展安装到持有 Telegram 凭据或
-私密媒体的服务中。
+只保留当前部署需要的包。用不可变的本地标签构建镜像，让更新与回滚都有明确目标：
 
-## 手工启用与检查
+```bash
+docker build --pull \
+  --build-arg CORE_VERSION=0.6.3 \
+  --build-arg PROXY_ROUTER_VERSION=0.2.0 \
+  --build-arg NICONICO_ORIGIN_VERSION=0.2.0 \
+  -f Dockerfile.extensions \
+  -t asmr-tg-backup:0.6.3-extensions .
+```
+
+在 `.env` 中选择这个镜像：
+
+```dotenv
+ASMR_TG_BACKUP_IMAGE=asmr-tg-backup:0.6.3-extensions
+```
+
+### 2. 启用已安装的 ID
+
+编辑宿主机 `config.toml` 中已有的 `[extensions]` 区块。下面的例子同时启用两个包：
+
+```toml
+[extensions]
+enabled = [
+  "dreaife.proxy-router",
+  "dreaife.niconico-origin",
+]
+
+[extensions."dreaife.proxy-router"]
+required = true
+config_file = "extensions/proxy-router.toml"
+
+[extensions."dreaife.niconico-origin"]
+required = true
+```
+
+只保留镜像中实际安装的 ID。Dockerfile 中填写包名，`config.toml` 中填写运行时 ID。
+
+### 3. 按需创建代理设置
+
+Niconico 不需要私密扩展文件，只安装 Niconico 时可以跳过这一步。使用代理选路时，
+在宿主机创建目录和私密文件：
+
+```bash
+mkdir -p extensions
+chmod 700 extensions
+# 用下方设置创建 extensions/proxy-router.toml。
+chmod 600 extensions/proxy-router.toml
+```
+
+仅让媒体探测与下载使用 HTTP/SOCKS 代理的例子如下：
+
+```toml
+fail_closed = true
+routes = [
+  "http://host.docker.internal:7890",
+  "socks5h://host.docker.internal:7891",
+]
+
+[scopes]
+"media.probe" = "proxy"
+"media.download" = "proxy"
+```
+
+应用容器中的 `127.0.0.1` 指向容器自身。`compose.yaml` 已把
+`host.docker.internal` 映射到 Docker 宿主机，但宿主机上的代理还需要监听 Docker
+网桥能够访问的地址；把监听范围限制在受信的本机或 Docker 网络。代理作为另一个
+Compose 服务运行时，直接使用它的服务名。订阅设置和完整 scope 列表见
+[`proxy-router` 扩展说明](https://github.com/dreaifekks/asmr-tg-backup-ext-proxy-router)。
+
+### 4. 挂载私密设置
+
+创建 `compose.extensions.yaml`：
+
+```yaml
+services:
+  asmr-tg-backup:
+    volumes:
+      - ./extensions:/config/extensions:ro
+```
+
+把 override 加入 `.env`，之后每条 Compose 命令都会使用这个挂载：
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.extensions.yaml
+```
+
+如果 `COMPOSE_FILE` 已经包含其他 override，在原值末尾追加
+`:compose.extensions.yaml`，不要覆盖原值。只使用 Niconico 时无需私密文件，也可以
+省略这个 override。
+
+### 5. 校验并启动
+
+先确认 Compose 解析到了派生镜像，再检查并校验组合后的扩展运行环境：
+
+```bash
+docker compose config --images
+docker compose run --rm asmr-tg-backup \
+  extensions list --config /config/config.toml
+docker compose run --rm asmr-tg-backup \
+  extensions doctor --config /config/config.toml
+docker compose run --rm asmr-tg-backup \
+  sources validate --config /config/config.toml
+```
+
+`extensions list` 应把每个选中的 ID 标记为已安装且已启用。三项检查都通过后，启动
+刚刚构建的同一个镜像：
+
+```bash
+docker compose up -d --no-build asmr-tg-backup
+docker compose logs --tail=100 asmr-tg-backup
+```
+
+使用 Niconico 时，启动后发送新的 `/panel` 或刷新当前有效的 Panel，确认出现
+`➕ Niconico`。使用代理选路时，在不打印私密地址或订阅的前提下，从服务日志确认
+选中的 policy 已生效。
+
+### 更新或回滚
+
+更新时修改核心与扩展版本参数，构建一个新镜像标签，让
+`ASMR_TG_BACKUP_IMAGE` 指向新标签，并在重建前重新运行上面的三条校验命令。确认新版
+服务正常前保留旧标签；需要回滚时，把 `.env` 切回旧标签，再用 `--no-build` 重建应用。
+
+## 手工启用与检查 {#manual-enable-and-validation}
 
 `extensions list` 只读取 distribution 元数据，不导入扩展代码：
 
