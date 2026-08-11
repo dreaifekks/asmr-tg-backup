@@ -69,15 +69,18 @@ class BackupService:
             config.telegram,
             self.runtime.connection,
         )
-        self.control_bot = ControlBot(
-            config,
-            self.store,
+        self.control_bot = self._new_control_bot(self.store)
+        self.sources = self._new_source_registry()
+        self._stop_event = threading.Event()
+
+    def _new_control_bot(self, store: Store) -> ControlBot:
+        return ControlBot(
+            self.config,
+            store,
             self.logger,
             connection=self.runtime.connection,
             providers=self.runtime.providers,
         )
-        self.sources = self._new_source_registry()
-        self._stop_event = threading.Event()
 
     @property
     def telegram_destination_key(self) -> str:
@@ -559,7 +562,7 @@ class BackupService:
             try:
                 store = Store(self.config.db_path)
                 store.initialize()
-                bot = ControlBot(self.config, store, self.logger)
+                bot = self._new_control_bot(store)
                 while not self._stop_event.is_set():
                     bot.process_once()
                     store.get_panel_snapshot(

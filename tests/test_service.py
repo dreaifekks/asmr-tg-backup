@@ -13,6 +13,43 @@ from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
 
 
 class BackupServiceTest(unittest.TestCase):
+    def test_control_worker_bot_inherits_runtime_dependencies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f'''[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "test-token"
+
+[control]
+enabled = true
+''',
+                encoding="utf-8",
+            )
+            service = BackupService(load_config(config_path))
+            worker_bot = mock.Mock()
+            worker_bot.process_once.side_effect = service.stop
+
+            try:
+                with mock.patch(
+                    "ytb_tg_backup.service.ControlBot",
+                    return_value=worker_bot,
+                ) as bot_factory:
+                    service._control_loop()
+
+                bot_factory.assert_called_once()
+                args, kwargs = bot_factory.call_args
+                self.assertIs(args[0], service.config)
+                self.assertEqual(args[1].path, service.store.path)
+                self.assertIs(args[2], service.logger)
+                self.assertIs(kwargs["connection"], service.runtime.connection)
+                self.assertIs(kwargs["providers"], service.runtime.providers)
+                worker_bot.process_once.assert_called_once_with()
+            finally:
+                service.close()
+
     def test_stale_poll_detection_covers_disabled_deleted_and_retargeted_origins(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

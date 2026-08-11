@@ -108,7 +108,7 @@ An official container remains minimal. Build a small derived image when an
 extension is needed:
 
 ```dockerfile
-FROM ghcr.io/dreaifekks/asmr-tg-backup:0.6.1
+FROM ghcr.io/dreaifekks/asmr-tg-backup:0.6.2
 RUN python -m pip install --no-cache-dir \
     'asmr-tg-backup-ext-proxy-router==0.2.0' \
     'asmr-tg-backup-ext-niconico-origin==0.2.0'

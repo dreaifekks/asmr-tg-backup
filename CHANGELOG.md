@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.6.2 - 2026-08-11
+
+- Make the Telegram long-poll worker use the same runtime-aware `ControlBot`
+  factory as startup command registration. Extension source buttons and scoped
+  control routing now reach the Bot instance that actually processes updates.
+
 ## 0.6.1 - 2026-08-10
 
 - Add extension-aware Telegram source controls. Enabled non-built-in source
