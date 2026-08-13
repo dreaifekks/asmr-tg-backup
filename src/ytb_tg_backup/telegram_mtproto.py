@@ -85,6 +85,7 @@ class MtprotoTransport(TelegramTransport):
         self._bindings = bindings
         self.connection = connection or ConnectionRuntime()
         self._client: Any | None = None
+        self._client_lock: asyncio.Lock | None = None
         self._route_context: Any | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -315,60 +316,78 @@ class MtprotoTransport(TelegramTransport):
     async def _ensure_client(self) -> Any:
         if self._client is not None:
             return self._client
-        bindings = self._get_bindings()
-        session_path = Path(str(self._mtproto_value("session_path", ""))).expanduser()
-        session_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._prepare_session_file(session_path)
-        route_context = self.connection.route(
-            RouteRequest(
-                scope=NetworkScope.TELEGRAM_DELIVERY_MTPROTO,
-                phase="connect",
-                idempotent=True,
-            )
-        )
-        route = route_context.__enter__()
-        client: Any | None = None
-        try:
-            client_kwargs: dict[str, Any] = {"receive_updates": False}
-            proxy = route.telethon_proxy()
-            if proxy is not None:
-                client_kwargs["proxy"] = proxy
-            client = bindings.client_factory(
-                str(session_path),
-                int(self._mtproto_value("api_id", 0)),
-                str(self._mtproto_value("api_hash", "")),
-                **client_kwargs,
-            )
-            started = client.start(bot_token=str(getattr(self.config, "bot_token", "")))
-            if inspect.isawaitable(started):
-                await started
-            self._protect_session_file(session_path)
-            identity = client.get_me()
-            if inspect.isawaitable(identity):
-                identity = await identity
-            expected_bot_id = _bot_id_from_token(str(getattr(self.config, "bot_token", "")))
-            actual_bot_id = getattr(identity, "id", None)
-            is_bot = bool(getattr(identity, "bot", False))
-            if expected_bot_id is None or actual_bot_id != expected_bot_id or not is_bot:
-                raise self._error(
-                    "Telegram MTProto session belongs to a different bot; remove the session "
-                    "file or restore the matching bot token",
-                    code="session_identity_mismatch",
-                    fallback_safe=True,
+        if self._client_lock is None:
+            self._client_lock = asyncio.Lock()
+        async with self._client_lock:
+            if self._client is not None:
+                return self._client
+            bindings = self._get_bindings()
+            session_path = Path(
+                str(self._mtproto_value("session_path", ""))
+            ).expanduser()
+            session_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self._prepare_session_file(session_path)
+            route_context = self.connection.route(
+                RouteRequest(
+                    scope=NetworkScope.TELEGRAM_DELIVERY_MTPROTO,
+                    phase="connect",
+                    idempotent=True,
                 )
-        except Exception as exc:
+            )
+            route = route_context.__enter__()
+            client: Any | None = None
             try:
-                if client is not None:
-                    disconnected = client.disconnect()
-                    if inspect.isawaitable(disconnected):
-                        await disconnected
-            except Exception:
-                pass
-            route_context.__exit__(type(exc), exc, exc.__traceback__)
-            raise
-        self._client = client
-        self._route_context = route_context
-        return client
+                client_kwargs: dict[str, Any] = {"receive_updates": False}
+                proxy = route.telethon_proxy()
+                if proxy is not None:
+                    client_kwargs["proxy"] = proxy
+                client = bindings.client_factory(
+                    str(session_path),
+                    int(self._mtproto_value("api_id", 0)),
+                    str(self._mtproto_value("api_hash", "")),
+                    **client_kwargs,
+                )
+                started = client.start(
+                    bot_token=str(getattr(self.config, "bot_token", ""))
+                )
+                if inspect.isawaitable(started):
+                    await started
+                self._protect_session_file(session_path)
+                identity = client.get_me()
+                if inspect.isawaitable(identity):
+                    identity = await identity
+                expected_bot_id = _bot_id_from_token(
+                    str(getattr(self.config, "bot_token", ""))
+                )
+                actual_bot_id = getattr(identity, "id", None)
+                is_bot = bool(getattr(identity, "bot", False))
+                if (
+                    expected_bot_id is None
+                    or actual_bot_id != expected_bot_id
+                    or not is_bot
+                ):
+                    raise self._error(
+                        "Telegram MTProto session belongs to a different bot; remove the "
+                        "session file or restore the matching bot token",
+                        code="session_identity_mismatch",
+                        fallback_safe=True,
+                    )
+            except BaseException as exc:
+                try:
+                    if client is not None:
+                        disconnected = client.disconnect()
+                        if inspect.isawaitable(disconnected):
+                            await asyncio.shield(disconnected)
+                except BaseException:
+                    pass
+                try:
+                    route_context.__exit__(type(exc), exc, exc.__traceback__)
+                except BaseException:
+                    pass
+                raise
+            self._client = client
+            self._route_context = route_context
+            return client
 
     def _media_attributes(
         self,
@@ -411,12 +430,32 @@ class MtprotoTransport(TelegramTransport):
         return attributes, True, False
 
     def _submit(self, coroutine: Any, *, timeout: float) -> Any:
-        loop = self._ensure_runtime()
-        future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        completion = threading.Event()
+
+        async def run_and_signal() -> Any:
+            try:
+                return await coroutine
+            finally:
+                completion.set()
+
+        wrapped = run_and_signal()
+        try:
+            loop = self._ensure_runtime()
+            future = asyncio.run_coroutine_threadsafe(wrapped, loop)
+        except BaseException:
+            wrapped.close()
+            if inspect.iscoroutine(coroutine):
+                coroutine.close()
+            raise
         try:
             return future.result(timeout=timeout)
         except FutureTimeoutError:
             future.cancel()
+            # The concurrent Future becomes cancelled before the asyncio Task
+            # has necessarily released its client/session resources.  Wait for
+            # the coroutine's finally path so the next upload cannot race a
+            # half-connected client on the same Telethon session file.
+            completion.wait(timeout=10)
             raise
 
     def _ensure_runtime(self) -> asyncio.AbstractEventLoop:

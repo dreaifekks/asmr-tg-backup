@@ -466,6 +466,127 @@ class StoreV2Test(unittest.TestCase):
             self.assertEqual(tuple(row), ("uncertain", "delivery_uncertain"))
             self.assertIsNone(store.claim_next_job(("telegram_delivery",), owner="other", lease_seconds=60))
 
+    def test_operator_can_confirm_uncertain_delivery_with_cas_and_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(Origin("yt", "youtube", "uploads", "YT", "UC-1"))
+            media_id, _ = store.upsert_discovered("yt", candidate("youtube", "abc"))
+            download = store.claim_next_job(("download",), owner="worker", lease_seconds=60)
+            path = Path(tmp) / "abc.m4a"
+            path.write_bytes(b"audio")
+            artifact_id = store.complete_download(download, path=path, size_bytes=5)
+            store.ensure_delivery_job(media_id, "telegram:@archive")
+            delivery = store.claim_next_job(
+                ("telegram_delivery",), owner="worker", lease_seconds=60
+            )
+            store.mark_job_uncertain(delivery, error="response boundary lost")
+
+            recovery = store.get_uncertain_delivery(media_id)
+            self.assertIsNotNone(recovery)
+            stale_revision = str(recovery["revision"])
+            store.conn.execute(
+                "UPDATE jobs SET updated_at=? WHERE id=?",
+                ("2099-01-01T00:00:00+00:00", delivery.id),
+            )
+            store.conn.commit()
+            with self.assertRaisesRegex(ValueError, "changed after confirmation"):
+                store.resolve_uncertain_delivery(
+                    delivery.id,
+                    expected_revision=stale_revision,
+                    action="confirm_delivered",
+                    actor="user=1 chat=2 thread=",
+                )
+
+            recovery = store.get_uncertain_delivery(media_id)
+            result = store.resolve_uncertain_delivery(
+                delivery.id,
+                expected_revision=str(recovery["revision"]),
+                action="confirm_delivered",
+                actor="user=1 chat=2 thread=",
+            )
+
+            self.assertEqual(result["action"], "confirm_delivered")
+            job_row = store.conn.execute(
+                "SELECT state, reason_code, last_error FROM jobs WHERE id=?",
+                (delivery.id,),
+            ).fetchone()
+            self.assertEqual(tuple(job_row), ("succeeded", None, None))
+            delivery_row = store.conn.execute(
+                """
+                SELECT artifact_id, remote_id FROM deliveries
+                WHERE media_id=? AND destination_key='telegram:@archive'
+                """,
+                (media_id,),
+            ).fetchone()
+            self.assertEqual(delivery_row["artifact_id"], artifact_id)
+            self.assertTrue(str(delivery_row["remote_id"]).startswith("operator-confirmed:"))
+            audit_row = store.conn.execute(
+                """
+                SELECT action, actor, previous_error, remote_id
+                FROM delivery_recovery_events WHERE job_id=?
+                """,
+                (delivery.id,),
+            ).fetchone()
+            self.assertEqual(audit_row["action"], "confirm_delivered")
+            self.assertEqual(audit_row["actor"], "user=1 chat=2 thread=")
+            self.assertEqual(audit_row["previous_error"], "response boundary lost")
+            self.assertEqual(audit_row["remote_id"], delivery_row["remote_id"])
+            delivered_at = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            store.conn.execute(
+                "UPDATE deliveries SET delivered_at=? WHERE media_id=?",
+                (delivered_at, media_id),
+            )
+            store.conn.commit()
+            candidates = store.list_delivery_retention_candidates(
+                (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            )
+            self.assertEqual(
+                [int(item["artifact_id"]) for item in candidates],
+                [artifact_id],
+            )
+
+    def test_operator_can_force_retry_uncertain_delivery_with_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(Origin("yt", "youtube", "uploads", "YT", "UC-1"))
+            media_id, _ = store.upsert_discovered("yt", candidate("youtube", "abc"))
+            store.ensure_delivery_job(media_id, "telegram:@archive")
+            delivery = store.claim_next_job(
+                ("telegram_delivery",), owner="worker", lease_seconds=60
+            )
+            store.mark_job_uncertain(delivery, error="unknown result")
+            recovery = store.get_uncertain_delivery(media_id)
+
+            store.resolve_uncertain_delivery(
+                delivery.id,
+                expected_revision=str(recovery["revision"]),
+                action="force_retry",
+                actor="user=7 chat=8 thread=9",
+            )
+
+            row = store.conn.execute(
+                "SELECT state, reason_code, finished_at FROM jobs WHERE id=?",
+                (delivery.id,),
+            ).fetchone()
+            self.assertEqual(tuple(row), ("retry", "operator_retry", None))
+            reclaimed = store.claim_next_job(
+                ("telegram_delivery",), owner="retry-worker", lease_seconds=60
+            )
+            self.assertIsNotNone(reclaimed)
+            self.assertEqual(reclaimed.id, delivery.id)
+            audit_row = store.conn.execute(
+                "SELECT action, actor, remote_id FROM delivery_recovery_events WHERE job_id=?",
+                (delivery.id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(audit_row),
+                ("force_retry", "user=7 chat=8 thread=9", None),
+            )
+
     def test_expired_delivery_preparation_is_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.db")

@@ -219,6 +219,23 @@ CREATE TABLE IF NOT EXISTS deliveries (
 CREATE INDEX IF NOT EXISTS idx_deliveries_retention
 ON deliveries(sink, delivered_at, media_id);
 
+CREATE TABLE IF NOT EXISTS delivery_recovery_events (
+  event_id TEXT PRIMARY KEY,
+  job_id INTEGER NOT NULL,
+  media_id INTEGER NOT NULL,
+  destination_key TEXT NOT NULL,
+  action TEXT NOT NULL CHECK(action IN ('confirm_delivered', 'force_retry')),
+  actor TEXT NOT NULL,
+  previous_updated_at TEXT NOT NULL,
+  previous_reason_code TEXT,
+  previous_error TEXT,
+  remote_id TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_delivery_recovery_events_job
+ON delivery_recovery_events(job_id, created_at);
+
 CREATE TABLE IF NOT EXISTS bot_state (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -3970,6 +3987,202 @@ class Store:
             raise RuntimeError("job lease is no longer owned by this worker")
         self.conn.commit()
 
+    def get_uncertain_delivery(self, media_id: int) -> dict[str, object] | None:
+        row = self.conn.execute(
+            """
+            SELECT j.id, j.media_id, j.target_key, j.state, j.reason_code,
+              j.last_error, j.updated_at, mi.title
+            FROM jobs j
+            JOIN media_items mi ON mi.id=j.media_id
+            WHERE j.media_id=? AND j.job_type='telegram_delivery'
+              AND j.state='uncertain'
+            ORDER BY j.updated_at DESC, j.id DESC
+            LIMIT 1
+            """,
+            (media_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        result = row_dict(row)
+        result["revision"] = _delivery_job_revision(row)
+        return result
+
+    def resolve_uncertain_delivery(
+        self,
+        job_id: int,
+        *,
+        expected_revision: str,
+        action: str,
+        actor: str,
+    ) -> dict[str, object]:
+        if action not in {"confirm_delivered", "force_retry"}:
+            raise ValueError("invalid uncertain delivery recovery action")
+        if not expected_revision:
+            raise ValueError("delivery recovery confirmation has expired")
+        actor = actor.strip()
+        if not actor:
+            raise ValueError("delivery recovery actor is required")
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                """
+                SELECT j.id, j.media_id, j.job_type, j.target_key, j.state,
+                  j.reason_code, j.last_error, j.updated_at, mi.title
+                FROM jobs j
+                JOIN media_items mi ON mi.id=j.media_id
+                WHERE j.id=?
+                """,
+                (job_id,),
+            ).fetchone()
+            if row is None or str(row["job_type"]) != "telegram_delivery":
+                raise ValueError("delivery job no longer exists")
+            if str(row["state"]) != "uncertain":
+                raise ValueError("delivery is no longer uncertain")
+            if _delivery_job_revision(row) != expected_revision:
+                raise ValueError("delivery changed after confirmation")
+
+            now = now_iso()
+            event_id = uuid.uuid4().hex
+            media_id = int(row["media_id"])
+            destination_key = str(row["target_key"])
+            remote_id: str | None = None
+
+            if action == "confirm_delivered":
+                existing_delivery = self.conn.execute(
+                    """
+                    SELECT artifact_id, remote_id
+                    FROM deliveries
+                    WHERE media_id=? AND sink='telegram' AND destination_key=?
+                    """,
+                    (media_id, destination_key),
+                ).fetchone()
+                if existing_delivery is not None:
+                    artifact_id = existing_delivery["artifact_id"]
+                    remote_id = str(existing_delivery["remote_id"])
+                else:
+                    artifact = self.conn.execute(
+                        """
+                        SELECT id
+                        FROM artifacts
+                        WHERE media_id=? AND state!='purged'
+                        ORDER BY
+                          CASE role
+                            WHEN 'telegram_upload' THEN 0
+                            WHEN 'master' THEN 1
+                            WHEN 'live_segment' THEN 2
+                            ELSE 3
+                          END,
+                          part_no,
+                          id
+                        LIMIT 1
+                        """,
+                        (media_id,),
+                    ).fetchone()
+                    artifact_id = int(artifact["id"]) if artifact is not None else None
+                    remote_id = f"operator-confirmed:{event_id}"
+                    self.conn.execute(
+                        """
+                        INSERT INTO deliveries(
+                          media_id, artifact_id, sink, destination_key,
+                          remote_id, delivered_at
+                        ) VALUES (?, ?, 'telegram', ?, ?, ?)
+                        """,
+                        (media_id, artifact_id, destination_key, remote_id, now),
+                    )
+                cursor = self.conn.execute(
+                    """
+                    UPDATE jobs SET
+                      state='succeeded', reason_code=NULL, last_error=NULL,
+                      lease_owner=NULL, lease_token=NULL, lease_until=NULL,
+                      available_at=?, finished_at=?, updated_at=?,
+                      payload_json=json_set(
+                        CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,
+                        '$.phase', 'operator_resolved',
+                        '$.operator_resolution.action', 'confirm_delivered',
+                        '$.operator_resolution.event_id', ?,
+                        '$.operator_resolution.actor', ?,
+                        '$.operator_resolution.at', ?
+                      )
+                    WHERE id=? AND state='uncertain' AND updated_at=?
+                    """,
+                    (
+                        now,
+                        now,
+                        now,
+                        event_id,
+                        actor,
+                        now,
+                        job_id,
+                        str(row["updated_at"]),
+                    ),
+                )
+            else:
+                cursor = self.conn.execute(
+                    """
+                    UPDATE jobs SET
+                      state='retry', reason_code='operator_retry', last_error=NULL,
+                      lease_owner=NULL, lease_token=NULL, lease_until=NULL,
+                      available_at=?, finished_at=NULL, updated_at=?,
+                      payload_json=json_set(
+                        CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,
+                        '$.phase', 'preparing',
+                        '$.operator_resolution.action', 'force_retry',
+                        '$.operator_resolution.event_id', ?,
+                        '$.operator_resolution.actor', ?,
+                        '$.operator_resolution.at', ?
+                      )
+                    WHERE id=? AND state='uncertain' AND updated_at=?
+                    """,
+                    (
+                        now,
+                        now,
+                        event_id,
+                        actor,
+                        now,
+                        job_id,
+                        str(row["updated_at"]),
+                    ),
+                )
+            if cursor.rowcount != 1:
+                raise ValueError("delivery changed while recovery was being applied")
+
+            self.conn.execute(
+                """
+                INSERT INTO delivery_recovery_events(
+                  event_id, job_id, media_id, destination_key, action, actor,
+                  previous_updated_at, previous_reason_code, previous_error,
+                  remote_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    job_id,
+                    media_id,
+                    destination_key,
+                    action,
+                    actor,
+                    str(row["updated_at"]),
+                    row["reason_code"],
+                    row["last_error"],
+                    remote_id,
+                    now,
+                ),
+            )
+            self.conn.commit()
+            return {
+                "event_id": event_id,
+                "job_id": job_id,
+                "media_id": media_id,
+                "destination_key": destination_key,
+                "title": str(row["title"]),
+                "action": action,
+                "remote_id": remote_id,
+            }
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def cancel_job(self, job: ClaimedJob, *, reason_code: str, error: str) -> None:
         self._finish_running_job(
             job,
@@ -5264,6 +5477,24 @@ def future_iso(seconds: int) -> str:
 
 def row_dict(row: sqlite3.Row) -> dict[str, object]:
     return dict(row)
+
+
+def _delivery_job_revision(row: sqlite3.Row) -> str:
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            (
+                int(row["id"]),
+                int(row["media_id"]),
+                str(row["target_key"]),
+                str(row["state"]),
+                str(row["updated_at"]),
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    return digest.hexdigest()[:24]
 
 
 def _artifact_set_revision(

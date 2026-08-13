@@ -210,6 +210,7 @@ class Downloader:
             str(download_format),
             "--print",
             "after_move:filepath",
+            "--no-progress",
         ]
         if ignore_archive or live:
             cmd.append("--no-download-archive")
@@ -253,7 +254,6 @@ class Downloader:
                         "-reconnect_delay_max 10 "
                         "-reconnect_delay_total_max 300"
                     ),
-                    "--no-progress",
                     "--no-match-filters",
                     "--match-filters",
                     f"id = {video_id}",
@@ -295,13 +295,10 @@ class Downloader:
                         ),
                     ) from exc
             else:
-                completed = subprocess.run(
+                completed = self._run_standard_download(
                     routed_cmd,
-                    check=True,
-                    text=True,
-                    capture_output=True,
-                    timeout=self.config.download.download_timeout_seconds,
-                    env=route.process_environment(),
+                    cancel_events=cancel_events,
+                    environment=route.process_environment(),
                 )
         printed_paths = [Path(line.strip()) for line in completed.stdout.splitlines() if line.strip()]
         candidates = [path for path in printed_paths if _looks_like_media(path)]
@@ -903,7 +900,38 @@ class Downloader:
         cancel_events: tuple[threading.Event, ...],
         environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        timeout_seconds = self.config.live.download_timeout_seconds
+        return self._run_download_process(
+            cmd,
+            cancel_events=cancel_events,
+            environment=environment,
+            timeout_seconds=self.config.live.download_timeout_seconds,
+            cancellation_message="live recording cancelled",
+        )
+
+    def _run_standard_download(
+        self,
+        cmd: list[str],
+        *,
+        cancel_events: tuple[threading.Event, ...],
+        environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        return self._run_download_process(
+            cmd,
+            cancel_events=cancel_events,
+            environment=environment,
+            timeout_seconds=self.config.download.download_timeout_seconds,
+            cancellation_message="download cancelled",
+        )
+
+    def _run_download_process(
+        self,
+        cmd: list[str],
+        *,
+        cancel_events: tuple[threading.Event, ...],
+        environment: dict[str, str] | None,
+        timeout_seconds: int,
+        cancellation_message: str,
+    ) -> subprocess.CompletedProcess[str]:
         deadline = time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
         process = subprocess.Popen(
             cmd,
@@ -920,7 +948,7 @@ class Downloader:
             except subprocess.TimeoutExpired:
                 if any(event.is_set() for event in cancel_events):
                     stdout, stderr = self._terminate_process_group(process)
-                    raise DownloadCancelled("live recording cancelled") from None
+                    raise DownloadCancelled(cancellation_message) from None
                 if deadline is not None and time.monotonic() >= deadline:
                     stdout, stderr = self._terminate_process_group(process)
                     raise subprocess.TimeoutExpired(

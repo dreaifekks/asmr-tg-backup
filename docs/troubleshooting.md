@@ -185,3 +185,17 @@ A timeout or connection loss may occur after Telegram accepted a message. The
 service records that state and does not automatically retry through MTProto,
 Bot API, or splitting, because another send could create a duplicate. Inspect
 the destination and local job state before deciding how to recover it.
+
+An authorized operator can send `/panel`, open **Local resources**, select the
+resource, and choose **Resolve uncertain delivery**. The panel exposes two
+explicit recovery actions:
+
+- Choose **Confirm delivered** only after verifying that the media exists in
+  the target Telegram conversation. This records the local delivery, completes
+  the job, and lets retention evaluation continue.
+- Choose **Force resend** only after deciding to accept the risk of a duplicate
+  Telegram message. The delivery job is immediately requeued.
+
+Both actions use a state-version check and record the operator, previous error,
+destination, and time in SQLite. Any intervening state change invalidates the
+old confirmation. The service still never resolves `uncertain` automatically.

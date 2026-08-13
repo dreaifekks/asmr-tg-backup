@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 import json
 import subprocess
@@ -294,6 +295,73 @@ class MtprotoTransportTest(unittest.TestCase):
             len([item for item in events if isinstance(item, tuple) and item[0] == "send"]),
             2,
         )
+
+    def test_first_connection_timeout_disconnects_before_a_second_client_starts(self):
+        events: list[object] = []
+        clients: list[_FakeTelethonClient] = []
+
+        class SlowStartClient(_FakeTelethonClient):
+            async def start(self, *, bot_token: str):
+                self.start_calls += 1
+                self.events.append(("slow_start", bot_token))
+                Path(self.session).write_text("partial session", encoding="utf-8")
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.events.append("slow_start_cancelled")
+                    raise
+
+        def client_factory(session, api_id, api_hash, *, receive_updates):
+            client_type = SlowStartClient if not clients else _FakeTelethonClient
+            client = client_type(
+                session,
+                api_id,
+                api_hash,
+                receive_updates=receive_updates,
+                events=events,
+            )
+            clients.append(client)
+            return client
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "audio.m4a"
+            source.write_bytes(b"audio")
+            transport = MtprotoTransport(
+                _mtproto_config(tmp, upload_timeout_seconds=0.05),
+                bindings=_fake_telethon_bindings(client_factory),
+            )
+            try:
+                with self.assertRaises(TelegramUploadError) as raised:
+                    transport.upload(
+                        source,
+                        title="first",
+                        url="https://example.com/first",
+                        feed_name="Artist",
+                        video_id="first",
+                    )
+                self.assertEqual(raised.exception.code, "timeout")
+                self.assertEqual(clients[0].disconnect_calls, 1)
+                self.assertLess(
+                    events.index("disconnect"),
+                    len(events),
+                )
+
+                result = transport.upload(
+                    source,
+                    title="second",
+                    url="https://example.com/second",
+                    feed_name="Artist",
+                    video_id="second",
+                )
+            finally:
+                transport.close()
+
+        self.assertEqual(result, 314)
+        self.assertEqual(len(clients), 2)
+        event_names = [item[0] if isinstance(item, tuple) else item for item in events]
+        first_disconnect = event_names.index("disconnect")
+        second_start = event_names.index("start")
+        self.assertLess(first_disconnect, second_start)
 
     def test_numeric_chat_id_is_resolved_as_integer(self):
         events: list[object] = []

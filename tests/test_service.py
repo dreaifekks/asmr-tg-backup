@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 from ytb_tg_backup.config import load_config
+from ytb_tg_backup.control import ControlApiError
 from ytb_tg_backup.extension_api import HttpResponse
 from ytb_tg_backup.feed import FeedEntry
 from ytb_tg_backup.models import Origin
@@ -470,6 +471,52 @@ enabled = true
                 worker_bot.process_once.assert_called_once_with()
             finally:
                 service.close()
+
+    def test_control_worker_waits_for_telegram_retry_after(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f'''[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "test-token"
+
+[control]
+enabled = true
+''',
+                encoding="utf-8",
+            )
+            service = BackupService(load_config(config_path))
+            worker_bot = mock.Mock()
+            worker_bot.process_once.side_effect = ControlApiError(
+                "Too Many Requests",
+                status=429,
+                error_code=429,
+                retry_after=7,
+            )
+            waits: list[float] = []
+
+            def record_wait(seconds: float) -> bool:
+                waits.append(seconds)
+                service._stop_event.set()
+                return True
+
+            try:
+                with mock.patch(
+                    "ytb_tg_backup.service.ControlBot",
+                    return_value=worker_bot,
+                ), mock.patch.object(
+                    service._stop_event,
+                    "wait",
+                    side_effect=record_wait,
+                ):
+                    service._control_loop()
+            finally:
+                service.close()
+
+        self.assertEqual(waits, [7])
+        worker_bot.process_once.assert_called_once_with()
 
     def test_stale_poll_detection_covers_disabled_deleted_and_retargeted_origins(self):
         with tempfile.TemporaryDirectory() as tmp:

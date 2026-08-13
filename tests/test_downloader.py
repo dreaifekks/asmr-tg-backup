@@ -1,14 +1,22 @@
 import json
 import logging
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
 from ytb_tg_backup.config import load_config
-from ytb_tg_backup.downloader import Downloader, _bitrate_candidates, _looks_like_thumbnail, _target_audio_bitrate_kbps
+from ytb_tg_backup.downloader import (
+    DownloadCancelled,
+    Downloader,
+    _bitrate_candidates,
+    _looks_like_thumbnail,
+    _target_audio_bitrate_kbps,
+)
 
 
 class DownloaderHelpersTest(unittest.TestCase):
@@ -294,8 +302,9 @@ class DownloaderHelpersTest(unittest.TestCase):
             media_path = tmp_path / "twitch-vod.m4a"
             media_path.write_bytes(b"audio")
 
-            with mock.patch(
-                "ytb_tg_backup.downloader.subprocess.run",
+            with mock.patch.object(
+                downloader,
+                "_run_standard_download",
                 return_value=subprocess.CompletedProcess(
                     ["yt-dlp"], 0, stdout=f"{media_path}\n", stderr=""
                 ),
@@ -303,6 +312,7 @@ class DownloaderHelpersTest(unittest.TestCase):
                 downloader.download("123", "https://www.twitch.tv/videos/123", provider="twitch")
 
             command = run.call_args.args[0]
+            self.assertIn("--no-progress", command)
             self.assertIn("--extract-audio", command)
             self.assertEqual(command[command.index("--format") + 1], "bestaudio/best")
             self.assertEqual(command[command.index("--audio-format") + 1], "m4a")
@@ -318,8 +328,9 @@ class DownloaderHelpersTest(unittest.TestCase):
             media_path = tmp_path / "repaired.m4a"
             media_path.write_bytes(b"audio")
 
-            with mock.patch(
-                "ytb_tg_backup.downloader.subprocess.run",
+            with mock.patch.object(
+                downloader,
+                "_run_standard_download",
                 return_value=subprocess.CompletedProcess(
                     ["yt-dlp"], 0, stdout=f"{media_path}\n", stderr=""
                 ),
@@ -333,6 +344,40 @@ class DownloaderHelpersTest(unittest.TestCase):
             command = run.call_args.args[0]
             self.assertIn("--no-download-archive", command)
             self.assertNotIn("--download-archive", command)
+
+    def test_cancel_event_terminates_standard_download_process_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{tmp_path}"')
+            downloader = Downloader(load_config(config_path), logging.getLogger("test"))
+            cancelled = threading.Event()
+            cancelled.set()
+            process = mock.Mock()
+            process.pid = 4321
+            process.poll.return_value = None
+            process.communicate.side_effect = [
+                subprocess.TimeoutExpired(cmd=["yt-dlp"], timeout=1),
+                ("", ""),
+            ]
+            with (
+                mock.patch(
+                    "ytb_tg_backup.downloader.subprocess.Popen",
+                    return_value=process,
+                ),
+                mock.patch("ytb_tg_backup.downloader.os.killpg") as killpg,
+            ):
+                with self.assertRaisesRegex(DownloadCancelled, "download cancelled"):
+                    downloader._run_standard_download(
+                        ["yt-dlp", "https://example.invalid/watch/abc"],
+                        cancel_events=(cancelled,),
+                    )
+
+        killpg.assert_called_once_with(4321, signal.SIGINT)
+        self.assertEqual(
+            process.communicate.call_args_list,
+            [mock.call(timeout=1), mock.call(timeout=12)],
+        )
 
 
 if __name__ == "__main__":

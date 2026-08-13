@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from ytb_tg_backup.config import load_config
-from ytb_tg_backup.downloader import DownloadResult, ProbeResult
+from ytb_tg_backup.downloader import DownloadCancelled, DownloadResult, ProbeResult
 from ytb_tg_backup.models import MediaCandidate, Origin
 from ytb_tg_backup.service import BackupService
 from ytb_tg_backup.store import Store
@@ -30,6 +30,42 @@ def candidate(external_id: str) -> MediaCandidate:
 
 
 class PipelineV2Test(unittest.TestCase):
+    def test_standard_download_cancellation_is_deferred_for_clean_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            service, media_id = self._service_with_media(tmp_path, "cancelled")
+            artifact_path = tmp_path / "unused.m4a"
+            artifact_path.write_bytes(b"unused")
+            downloader = self._downloader(artifact_path)
+            downloader.download.side_effect = DownloadCancelled("download cancelled")
+            telegram = mock.Mock()
+
+            self.assertEqual(
+                self._run_one(service, downloader, telegram, owner="download"),
+                1,
+            )
+
+            job = service.store.conn.execute(
+                """
+                SELECT state, failure_count, reason_code, last_error
+                FROM jobs
+                WHERE media_id=? AND job_type='download'
+                """,
+                (media_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(job),
+                (
+                    "retry",
+                    0,
+                    "service_stopping",
+                    "download stopped with the service; retry will start cleanly",
+                ),
+            )
+            self.assertIsNone(service.store.get_artifact(media_id))
+            telegram.upload.assert_not_called()
+            service.close()
+
     def test_upcoming_youtube_probe_defers_without_consuming_failure_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

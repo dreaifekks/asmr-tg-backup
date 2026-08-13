@@ -14,7 +14,7 @@ from urllib.error import HTTPError
 import uuid
 
 from .config import Config
-from .control import ControlBot
+from .control import ControlApiError, ControlBot
 from .downloader import (
     DownloadCancelled,
     DownloadResult,
@@ -141,6 +141,14 @@ class BackupService:
         if self.config.control.enabled:
             try:
                 self.control_bot.register_commands()
+            except ControlApiError as exc:
+                retry_after = max(1, int(exc.retry_after or 1))
+                self.logger.warning(
+                    "Telegram bot command registration rate-limited; waiting %ss: %s",
+                    retry_after,
+                    self._safe_error(exc),
+                )
+                self._stop_event.wait(retry_after)
             except Exception:
                 self.logger.warning("failed to register Telegram bot commands", exc_info=True)
 
@@ -858,6 +866,14 @@ class BackupService:
                         self._source_filter_pattern(store),
                         max_age_seconds=30,
                     )
+            except ControlApiError as exc:
+                retry_after = max(1, int(exc.retry_after or 1))
+                self.logger.warning(
+                    "control bot rate-limited; reconnecting after %ss: %s",
+                    retry_after,
+                    self._safe_error(exc),
+                )
+                self._stop_event.wait(retry_after)
             except Exception as exc:
                 self.logger.warning(
                     "control bot long-poll failed; reconnecting: %s",
@@ -1142,20 +1158,25 @@ class BackupService:
                 ),
             )
         except DownloadCancelled as exc:
-            self._record_live_segment(
-                store,
-                job.media_id,
-                exc.partial_result,
-                reason="service_stopping",
-            )
+            if live_recording:
+                self._record_live_segment(
+                    store,
+                    job.media_id,
+                    exc.partial_result,
+                    reason="service_stopping",
+                )
             if lease_lost_event.is_set():
-                raise RuntimeError("job lease lost during live recording") from None
+                raise RuntimeError("job lease lost during download") from None
             store.defer_job(
                 job,
                 reason_code="service_stopping",
                 error=(
-                    "live recording stopped with the service; retry starts from "
-                    "the channel's current live position"
+                    (
+                        "live recording stopped with the service; retry starts from "
+                        "the channel's current live position"
+                    )
+                    if live_recording
+                    else "download stopped with the service; retry will start cleanly"
                 ),
                 retry_seconds=0,
             )

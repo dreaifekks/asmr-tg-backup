@@ -139,6 +139,10 @@ allow_disk_delete = true
 挂载式 `[storage].archive_dir`。数据库历史与已有 Telegram 消息会保留；归档挂载不可用
 时会显示为不安全或缺失资源，不会因此改删其他路径。
 
+若某个 Telegram 投递因响应边界不明确而进入 `uncertain`，对应资源详情会显示“处理
+不确定投递”。操作员必须先在目标会话核实结果，再二次确认“已送达”或明确承担重复消息
+风险后“强制重新发送”。两种操作都有状态版本校验和独立审计记录；Panel 不会自动重发。
+
 `allow_disk_delete` 只控制从 Panel 发起的删除。自动清理与挂载存储使用
 `[storage].process_retention_hours`、`[storage].backup_retention_hours` 和
 `archive_dir`。参见

@@ -5,9 +5,11 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
+import math
 import re
 import secrets
 import shlex
+import time
 from typing import Any
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
@@ -42,6 +44,21 @@ TWITCH_LOGIN_PATTERN = re.compile(r"[a-zA-Z0-9_]{1,25}")
 BUILTIN_PANEL_PROVIDERS = frozenset({"youtube", "twitch", "rss"})
 
 
+class ControlApiError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        error_code: int | None = None,
+        retry_after: int | None = None,
+    ):
+        super().__init__(message)
+        self.status = status
+        self.error_code = error_code
+        self.retry_after = retry_after
+
+
 class ControlBot:
     def __init__(
         self,
@@ -62,6 +79,7 @@ class ControlBot:
             providers=providers,
         )
         self._source_catalog_ready = False
+        self._retry_not_before = 0.0
 
     def process_once(self, timeout_seconds: int | None = None) -> None:
         if not self.config.control.enabled:
@@ -697,6 +715,57 @@ class ControlBot:
                     }
                 )
             return
+        if action in {"delrecover", "delconfirm", "delretry"}:
+            if len(parts) != 3 or not parts[2].isdigit():
+                raise ValueError("invalid delivery recovery action")
+            job_id = int(parts[2])
+            artifact_id = int(state.get("target_artifact_id") or -1)
+            resource = self.store.get_disk_resource(
+                artifact_id,
+                self.config.managed_storage_roots,
+            )
+            if resource is None:
+                raise ValueError("resource no longer exists")
+            recovery = self.store.get_uncertain_delivery(int(resource["media_id"]))
+            if recovery is None or int(recovery["id"]) != job_id:
+                raise ValueError("delivery is no longer uncertain")
+            if action == "delrecover":
+                state.update(
+                    {
+                        "view": "delivery_recovery_confirm",
+                        "target_delivery_job_id": job_id,
+                        "target_delivery_revision": str(recovery["revision"]),
+                        "awaiting": None,
+                    }
+                )
+                return
+            if job_id != int(state.get("target_delivery_job_id") or -1):
+                raise ValueError("delivery confirmation no longer matches this job")
+            expected_revision = str(
+                state.get("target_delivery_revision") or ""
+            )
+            result = self.store.resolve_uncertain_delivery(
+                job_id,
+                expected_revision=expected_revision,
+                action=(
+                    "confirm_delivered" if action == "delconfirm" else "force_retry"
+                ),
+                actor=self._principal(message),
+            )
+            state.update(
+                {
+                    "view": "resource_detail",
+                    "awaiting": None,
+                    "flash": (
+                        "已按操作员确认记录为送达；本次处理已写入审计。"
+                        if result["action"] == "confirm_delivered"
+                        else "已承担重复投递风险并重新入队；本次处理已写入审计。"
+                    ),
+                }
+            )
+            state.pop("target_delivery_job_id", None)
+            state.pop("target_delivery_revision", None)
+            return
         if action == "filter":
             state.update({"view": "filter", "awaiting": None})
             return
@@ -1050,6 +1119,8 @@ class ControlBot:
                 )
                 self._save_panel_state(message, state)
                 return
+            except ControlApiError:
+                raise
             except RuntimeError as exc:
                 if "message is not modified" in str(exc).lower():
                     self._save_panel_state(message, state)
@@ -1135,6 +1206,8 @@ class ControlBot:
             text, keyboard = self._render_resource_detail_panel(state)
         elif view == "resource_delete_confirm":
             text, keyboard = self._render_resource_delete_confirm_panel(state)
+        elif view == "delivery_recovery_confirm":
+            text, keyboard = self._render_delivery_recovery_confirm_panel(state)
         elif view == "twitch_kind":
             text, keyboard = self._render_twitch_kind_panel()
         elif view == "twitch_mode":
@@ -1448,6 +1521,24 @@ class ControlBot:
         lines.extend(["", str(resource["canonical_url"])])
 
         keyboard: list[list[dict[str, str]]] = []
+        uncertain_delivery = self.store.get_uncertain_delivery(
+            int(resource["media_id"])
+        )
+        if uncertain_delivery is not None:
+            lines.extend(
+                [
+                    "",
+                    "⚠️ Telegram 返回结果不确定；系统已停止自动重试以避免重复投递。",
+                ]
+            )
+            keyboard.append(
+                [
+                    _button(
+                        "处理不确定投递",
+                        f"p:delrecover:{uncertain_delivery['id']}",
+                    )
+                ]
+            )
         delete_ready = (
             self.config.control.allow_disk_delete
             and not bool(resource["running"])
@@ -1476,6 +1567,67 @@ class ControlBot:
             [
                 _button("⬅️ 返回列表", f"p:resources:{page}"),
                 _button("🏠 首页", "p:home"),
+            ]
+        )
+        return "\n".join(lines), keyboard
+
+    def _render_delivery_recovery_confirm_panel(
+        self,
+        state: dict[str, Any],
+    ) -> tuple[str, list[list[dict[str, str]]]]:
+        artifact_id = int(state.get("target_artifact_id") or -1)
+        page = max(0, int(state.get("resource_page") or 0))
+        job_id = int(state.get("target_delivery_job_id") or -1)
+        resource = self.store.get_disk_resource(
+            artifact_id,
+            self.config.managed_storage_roots,
+        )
+        if resource is None:
+            state.update({"view": "resources", "target_artifact_id": None})
+            return (
+                "💾 该资源已经不在本地资源库中。",
+                [[_button("返回资源列表", f"p:resources:{page}")]],
+            )
+        recovery = self.store.get_uncertain_delivery(int(resource["media_id"]))
+        expected = str(state.get("target_delivery_revision") or "")
+        changed = (
+            recovery is None
+            or int(recovery["id"]) != job_id
+            or str(recovery["revision"]) != expected
+        )
+        lines = [
+            "⚠️ 处理不确定的 Telegram 投递",
+            "",
+            str(resource["title"]),
+            "",
+            "系统无法确认 Telegram 是否已经收到了上一笔请求，",
+            "因此不会自动重试，也不会替你猜测结果。",
+            "",
+            "“确认已送达”会写入本地投递记录并结束任务；",
+            "请先在目标 Telegram 会话中确认媒体确实存在。",
+            "",
+            "“强制重新发送”会立即重新入队，可能产生重复消息。",
+            "两种操作都会记录操作员、原错误和处理时间。",
+        ]
+        keyboard: list[list[dict[str, str]]] = []
+        if changed:
+            lines.extend(
+                [
+                    "",
+                    "投递状态在确认期间发生了变化；请返回详情后重新确认。",
+                ]
+            )
+        else:
+            keyboard.extend(
+                [
+                    [_button("✅ 确认已送达", f"p:delconfirm:{job_id}")],
+                    [_button("⚠️ 强制重新发送（可能重复）", f"p:delretry:{job_id}")],
+                ]
+            )
+        keyboard.append(
+            [
+                _button("取消并返回详情", f"p:resource:{artifact_id}"),
+                _button("返回列表", f"p:resources:{page}"),
             ]
         )
         return "\n".join(lines), keyboard
@@ -1948,6 +2100,14 @@ class ControlBot:
         *,
         request_timeout_seconds: int = 30,
     ) -> dict[str, Any]:
+        retry_remaining = self._retry_not_before - time.monotonic()
+        if retry_remaining > 0:
+            raise ControlApiError(
+                "Telegram control API is rate-limited",
+                status=429,
+                error_code=429,
+                retry_after=max(1, math.ceil(retry_remaining)),
+            )
         api_base = (
             self.config.control.api_base
             or self.config.telegram.bot_api.api_base.rstrip("/")
@@ -1969,9 +2129,14 @@ class ControlBot:
                 with open_request(request, timeout=request_timeout_seconds) as response:
                     parsed = json.loads(response.read().decode("utf-8"))
             except HTTPError as exc:
-                error_body = exc.read().decode("utf-8", errors="replace")
-                raise RuntimeError(
-                    f"Telegram API HTTP {exc.code}: {error_body[:500]}"
+                try:
+                    error_body = exc.read().decode("utf-8", errors="replace")
+                finally:
+                    exc.close()
+                raise self._control_api_error(
+                    status=int(exc.code),
+                    body=error_body,
+                    headers=exc.headers,
                 ) from exc
         else:
             response = self.connection.request(
@@ -2000,13 +2165,96 @@ class ControlBot:
             )
             if not 200 <= response.status < 300:
                 error_body = response.body.decode("utf-8", errors="replace")
-                raise RuntimeError(
-                    f"Telegram API HTTP {response.status}: {error_body[:500]}"
+                raise self._control_api_error(
+                    status=int(response.status),
+                    body=error_body,
+                    headers=response.headers,
                 )
             parsed = json.loads(response.body.decode("utf-8"))
         if not parsed.get("ok"):
-            raise RuntimeError(f"Telegram API error: {parsed}")
+            raise self._control_api_error(status=None, parsed=parsed)
         return parsed
+
+    def _control_api_error(
+        self,
+        *,
+        status: int | None,
+        body: str | None = None,
+        headers: Any = None,
+        parsed: dict[str, Any] | None = None,
+    ) -> ControlApiError:
+        payload = parsed
+        if payload is None and body:
+            try:
+                decoded = json.loads(body)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = None
+            payload = decoded if isinstance(decoded, dict) else None
+        error_code = _optional_positive_int(
+            payload.get("error_code") if payload is not None else None
+        )
+        parameters = payload.get("parameters") if payload is not None else None
+        retry_after = _optional_positive_int(
+            parameters.get("retry_after")
+            if isinstance(parameters, dict)
+            else None
+        )
+        if retry_after is None:
+            retry_after = _optional_positive_int(
+                _header_value(headers, "retry-after")
+            )
+        if retry_after is None and (status == 429 or error_code == 429):
+            retry_after = 1
+        description = (
+            str(payload.get("description") or "request failed")
+            if payload is not None
+            else "request failed"
+        )
+        label = status if status is not None else error_code
+        error = ControlApiError(
+            (
+                f"Telegram control API {label}: {description}"
+                if label is not None
+                else f"Telegram control API: {description}"
+            ),
+            status=status,
+            error_code=error_code,
+            retry_after=retry_after,
+        )
+        if retry_after is not None:
+            self._retry_not_before = max(
+                self._retry_not_before,
+                time.monotonic() + retry_after,
+            )
+        return error
+
+
+def _optional_positive_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _header_value(headers: Any, name: str) -> object | None:
+    if headers is None:
+        return None
+    try:
+        direct = headers.get(name)
+    except (AttributeError, TypeError):
+        direct = None
+    if direct is not None:
+        return direct
+    try:
+        for key, value in headers.items():
+            if str(key).lower() == name.lower():
+                return value
+    except (AttributeError, TypeError):
+        pass
+    return None
 
 
 def _format_snapshot_time(value: str) -> str:

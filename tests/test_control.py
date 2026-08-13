@@ -1,14 +1,21 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 import json
 import logging
 import tempfile
 import unittest
 from unittest import mock
+from urllib.error import HTTPError
 
 from ytb_tg_backup.config import load_config
-from ytb_tg_backup.control import ControlBot, _origin_token, _provider_token
+from ytb_tg_backup.control import (
+    ControlApiError,
+    ControlBot,
+    _origin_token,
+    _provider_token,
+)
 from ytb_tg_backup.extension_api import HttpResponse, SourceProviderDefinition
 from ytb_tg_backup.network import NetworkScope
 from ytb_tg_backup.extensions import SourceProviderCatalog
@@ -33,6 +40,112 @@ def _current_panel_callback(
 
 
 class ControlBotTest(unittest.TestCase):
+    def test_http_429_uses_retry_after_and_blocks_immediate_follow_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "secret-token"
+""".strip()
+            )
+            bot = ControlBot(
+                load_config(config_path),
+                mock.Mock(),
+                logging.getLogger("test"),
+            )
+            response = HTTPError(
+                "https://api.telegram.org/botsecret-token/getUpdates",
+                429,
+                "Too Many Requests",
+                {"Retry-After": "17"},
+                BytesIO(
+                    b'{"ok":false,"error_code":429,'
+                    b'"description":"Too Many Requests"}'
+                ),
+            )
+            with mock.patch(
+                "ytb_tg_backup.control.urlopen",
+                side_effect=response,
+            ):
+                with self.assertRaises(ControlApiError) as raised:
+                    bot._api("getUpdates", {})
+
+            self.assertEqual(raised.exception.status, 429)
+            self.assertEqual(raised.exception.error_code, 429)
+            self.assertEqual(raised.exception.retry_after, 17)
+            with mock.patch("ytb_tg_backup.control.urlopen") as follow_up:
+                with self.assertRaises(ControlApiError) as gated:
+                    bot._api("getUpdates", {})
+            follow_up.assert_not_called()
+            self.assertGreaterEqual(gated.exception.retry_after, 16)
+
+    def test_routed_429_parses_telegram_retry_after(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "secret-token"
+""".strip()
+            )
+            connection = mock.Mock()
+            connection.request.return_value = HttpResponse(
+                429,
+                "https://api.telegram.org/botsecret-token/getUpdates",
+                {},
+                (
+                    b'{"ok":false,"error_code":429,'
+                    b'"description":"Too Many Requests",'
+                    b'"parameters":{"retry_after":23}}'
+                ),
+            )
+            bot = ControlBot(
+                load_config(config_path),
+                mock.Mock(),
+                logging.getLogger("test"),
+                connection=connection,
+            )
+
+            with self.assertRaises(ControlApiError) as raised:
+                bot._api("getUpdates", {})
+
+            self.assertEqual(raised.exception.retry_after, 23)
+            self.assertEqual(connection.request.call_count, 1)
+
+    def test_panel_edit_rate_limit_does_not_fall_back_to_send(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{tmp}"')
+            bot = ControlBot(
+                load_config(config_path),
+                mock.Mock(),
+                logging.getLogger("test"),
+            )
+            message = {"chat": {"id": -100}}
+            state = {"message_id": 123}
+            error = ControlApiError(
+                "rate limited",
+                status=429,
+                error_code=429,
+                retry_after=9,
+            )
+            with mock.patch.object(
+                bot,
+                "_render_panel",
+                return_value=("panel", {"inline_keyboard": []}),
+            ), mock.patch.object(bot, "_api", side_effect=error) as api:
+                with self.assertRaises(ControlApiError):
+                    bot._render_panel_message(message, state)
+
+            api.assert_called_once()
+
     def test_loopback_api_uses_an_opener_with_proxies_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
@@ -1192,6 +1305,135 @@ allowed_chat_ids = ["-100"]
 
             self.assertTrue(resource_path.exists())
             self.assertEqual(store.get_artifact(media_id)["state"], "ready")
+
+    def test_panel_resolves_uncertain_delivery_with_two_step_cas_and_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+bot_token = "test-token"
+
+[control]
+enabled = true
+allowed_user_ids = ["123"]
+allowed_chat_ids = ["-100"]
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin(
+                    "youtube-asmr",
+                    "youtube",
+                    "uploads",
+                    "Quiet ASMR",
+                    "UC-quiet",
+                )
+            )
+            media_id, _ = store.upsert_discovered(
+                "youtube-asmr",
+                MediaCandidate(
+                    provider="youtube",
+                    content_kind="video",
+                    external_id="uncertain-1",
+                    title="Uncertain Delivery ASMR",
+                    url="https://www.youtube.com/watch?v=uncertain-1",
+                    published_at=None,
+                ),
+            )
+            resource_path = config.download_dir / "youtube" / "uncertain-1.m4a"
+            resource_path.parent.mkdir(parents=True)
+            resource_path.write_bytes(b"audio")
+            download = store.claim_next_job(
+                ("download",), owner="download", lease_seconds=60
+            )
+            artifact_id = store.complete_download(
+                download,
+                path=resource_path,
+                size_bytes=5,
+                delivery_targets=("telegram:@archive",),
+            )
+            delivery = store.claim_next_job(
+                ("telegram_delivery",), owner="delivery", lease_seconds=60
+            )
+            store.mark_job_uncertain(delivery, error="unknown Telegram result")
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            message = {"from": {"id": 123}, "chat": {"id": -100}}
+            state = {
+                "view": "resource_detail",
+                "target_artifact_id": artifact_id,
+            }
+
+            detail_text, detail_keyboard = bot._render_resource_detail_panel(state)
+            self.assertIn("系统已停止自动重试", detail_text)
+            self.assertIn(
+                f"p:delrecover:{delivery.id}",
+                {
+                    button["callback_data"]
+                    for row in detail_keyboard
+                    for button in row
+                },
+            )
+            bot._apply_panel_action(
+                f"p:delrecover:{delivery.id}", state, message
+            )
+            self.assertEqual(state["view"], "delivery_recovery_confirm")
+            first_revision = state["target_delivery_revision"]
+
+            store.conn.execute(
+                "UPDATE jobs SET updated_at=? WHERE id=?",
+                ("2099-01-01T00:00:00+00:00", delivery.id),
+            )
+            store.conn.commit()
+            stale_text, stale_keyboard = bot._render_delivery_recovery_confirm_panel(
+                state
+            )
+            self.assertIn("投递状态在确认期间发生了变化", stale_text)
+            self.assertNotIn(
+                f"p:delconfirm:{delivery.id}",
+                {
+                    button["callback_data"]
+                    for row in stale_keyboard
+                    for button in row
+                },
+            )
+            self.assertEqual(state["target_delivery_revision"], first_revision)
+
+            bot._apply_panel_action(
+                f"p:delrecover:{delivery.id}", state, message
+            )
+            confirm_text, confirm_keyboard = (
+                bot._render_delivery_recovery_confirm_panel(state)
+            )
+            self.assertIn("可能产生重复消息", confirm_text)
+            callbacks = {
+                button["callback_data"]
+                for row in confirm_keyboard
+                for button in row
+            }
+            self.assertIn(f"p:delconfirm:{delivery.id}", callbacks)
+            self.assertIn(f"p:delretry:{delivery.id}", callbacks)
+            bot._apply_panel_action(
+                f"p:delconfirm:{delivery.id}", state, message
+            )
+
+            self.assertEqual(state["view"], "resource_detail")
+            self.assertIn("已按操作员确认记录为送达", state["flash"])
+            job_row = store.conn.execute(
+                "SELECT state FROM jobs WHERE id=?", (delivery.id,)
+            ).fetchone()
+            self.assertEqual(job_row["state"], "succeeded")
+            audit_row = store.conn.execute(
+                "SELECT action, actor FROM delivery_recovery_events WHERE job_id=?",
+                (delivery.id,),
+            ).fetchone()
+            self.assertEqual(audit_row["action"], "confirm_delivered")
+            self.assertEqual(audit_row["actor"], "user=123 chat=-100 thread=")
 
     def test_panel_stale_resource_confirmation_cannot_delete_new_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:

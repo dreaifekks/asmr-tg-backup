@@ -163,6 +163,12 @@ existing Telegram messages remain. An unavailable archive mount is shown as an
 unsafe/missing resource and is never treated as permission to delete another
 path.
 
+When a Telegram delivery reaches `uncertain` because the response boundary is
+ambiguous, its resource detail shows **Resolve uncertain delivery**. An operator
+must verify the destination first, then explicitly confirm delivery or accept
+the duplicate-message risk and force a resend. Both actions have a state-version
+check and a separate audit record; the Panel never retries automatically.
+
 `allow_disk_delete` controls only deletion started from the Panel. Automatic
 cleanup and mounted storage use `[storage].process_retention_hours`,
 `[storage].backup_retention_hours`, and `archive_dir`. See
