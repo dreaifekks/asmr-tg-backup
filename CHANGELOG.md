@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.6.5 - 2026-08-13
+
+- Stop standard yt-dlp downloads cooperatively during shutdown or lease loss,
+  including their process groups, so a restarted service cannot race an old
+  downloader for the same media.
+- Add audited operator actions for uncertain Telegram deliveries: confirm a
+  delivery as completed or explicitly retry it while accepting duplicate risk.
+- Clean up partially initialized MTProto clients after timeout or cancellation
+  and serialize client creation for each session.
+- Respect Telegram Bot API flood-wait guidance in the control panel by parsing
+  both `parameters.retry_after` and the HTTP `Retry-After` header.
+
 ## 0.6.4 - 2026-08-11
 
 - Add automatic cleanup for temporary recording and Telegram upload files. New
