@@ -21,6 +21,7 @@ from .downloader import (
     Downloader,
     LiveDownloadError,
     ProbeResult,
+    TELEGRAM_AUDIO_EXTENSIONS,
     WAIT_LIVE_STATUSES,
 )
 from .extensions import RuntimeDependencies, build_runtime
@@ -1381,27 +1382,38 @@ class BackupService:
         upload_paths = [master_path]
         upload_artifact_id = int(artifact["id"])
         try:
-            if (
-                self.config.telegram.media_type == "audio"
-                and self.config.telegram.upload_transport == "bot_api"
-            ):
-                if (
-                    self.config.telegram.bot_api.split_large_audio
-                    and not self.config.telegram.send_as_document
-                ):
-                    prepared_parts = downloader.split_audio_for_upload(
-                        master_path,
-                        self.config.telegram.bot_api.max_upload_bytes,
-                        max_parts=self.config.telegram.bot_api.max_upload_parts,
-                    )
-                else:
+            prepared_parts: list[DownloadResult] = []
+            if self.config.telegram.media_type == "audio":
+                if self.config.telegram.upload_transport == "bot_api":
+                    if (
+                        self.config.telegram.bot_api.split_large_audio
+                        and not self.config.telegram.send_as_document
+                    ):
+                        prepared_parts = downloader.split_audio_for_upload(
+                            master_path,
+                            self.config.telegram.bot_api.max_upload_bytes,
+                            max_parts=(
+                                self.config.telegram.bot_api.max_upload_parts
+                            ),
+                        )
+                    else:
+                        prepared_parts = [
+                            downloader.shrink_audio_for_upload(
+                                master_path,
+                                self.config.telegram.bot_api.max_upload_bytes,
+                                force_audio=True,
+                            )
+                        ]
+                elif master_path.suffix.lower() not in TELEGRAM_AUDIO_EXTENSIONS:
                     prepared_parts = [
                         downloader.shrink_audio_for_upload(
                             master_path,
-                            self.config.telegram.bot_api.max_upload_bytes,
+                            self.config.telegram.mtproto.max_upload_bytes,
                             force_audio=True,
                         )
                     ]
+
+            if prepared_parts:
                 upload_paths = [part.file_path for part in prepared_parts]
                 for part_no, prepared in enumerate(prepared_parts):
                     if prepared.file_path == master_path:

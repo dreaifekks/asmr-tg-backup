@@ -13,7 +13,8 @@ job_lease_seconds = 900
 log_level = "INFO"
 
 [storage]
-# Delete temporary recording and Telegram upload files after delivery.
+# Delete verified live segments after merge.
+# Delete Telegram upload derivatives after delivery.
 process_retention_hours = 24
 # Keep complete backup files. Set a positive number to expire them.
 backup_retention_hours = 0

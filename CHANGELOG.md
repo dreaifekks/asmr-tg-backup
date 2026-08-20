@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Restore audio derivation for MTProto delivery when a provider keeps a video
+  master while Telegram is configured for audio.
+- Let process retention remove verified live-recording segments after merge
+  even when Telegram delivery is blocked, while keeping Telegram upload
+  derivatives until delivery succeeds.
+
 ## 0.6.5 - 2026-08-13
 
 - Stop standard yt-dlp downloads cooperatively during shutdown or lease loss,

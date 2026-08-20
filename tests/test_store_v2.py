@@ -1366,7 +1366,7 @@ class StoreV2Test(unittest.TestCase):
                     store_module._is_on_nonroot_mount(archive_root)
                 )
 
-    def test_process_retention_candidates_are_media_local_and_fail_closed(self):
+    def test_process_retention_candidates_are_media_local_and_split_delivery_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "downloads"
             root.mkdir()
@@ -1471,11 +1471,15 @@ class StoreV2Test(unittest.TestCase):
                     (state, extra_job_id),
                 )
                 store.conn.commit()
-                self.assertEqual(
-                    store.list_process_retention_candidates(cutoff),
-                    [],
-                    state,
-                )
+                candidates = store.list_process_retention_candidates(cutoff)
+                if state == "running":
+                    self.assertEqual(candidates, [], state)
+                else:
+                    self.assertEqual(
+                        candidates[0]["artifact_id"],
+                        delivered_artifact_id,
+                        state,
+                    )
             store.conn.execute(
                 "UPDATE jobs SET state='cancelled' WHERE id=?",
                 (extra_job_id,),
@@ -1487,6 +1491,120 @@ class StoreV2Test(unittest.TestCase):
                 ],
                 delivered_artifact_id,
             )
+
+    def test_process_retention_purges_merged_live_segment_before_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "downloads"
+            root.mkdir()
+            store = Store(Path(tmp) / "state.db")
+            store.initialize()
+            store.upsert_origin(
+                Origin("tw", "twitch", "vods", "TW", "streamer")
+            )
+            media_id, _ = store.upsert_discovered(
+                "tw",
+                candidate(
+                    "twitch",
+                    "process-blocked-delivery",
+                    kind="live_stream",
+                    metadata={"stream_id": "process-blocked-delivery"},
+                ),
+            )
+            master_path = root / "process-blocked-delivery.mp4"
+            master_id = self._complete_download_for_media(
+                store,
+                media_id,
+                master_path,
+            )
+            old_merge = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            store.conn.execute(
+                "UPDATE artifacts SET created_at=?, updated_at=? WHERE id=?",
+                (old_merge, old_merge, master_id),
+            )
+            delivery_job_id = store.ensure_delivery_job(
+                media_id,
+                "telegram:@archive",
+            )
+            store.conn.execute(
+                """
+                UPDATE jobs SET state='blocked', reason_code='upload_too_large',
+                  last_error='video master exceeds transport limit'
+                WHERE id=?
+                """,
+                (delivery_job_id,),
+            )
+            store.conn.commit()
+            segment_path = root / "process-blocked-delivery.segment.ts"
+            segment_path.write_bytes(b"segment")
+            segment_part = store.record_live_segment(
+                media_id,
+                path=segment_path,
+                size_bytes=segment_path.stat().st_size,
+            )
+            upload_path = root / "process-blocked-delivery.tgaudio.m4a"
+            upload_path.write_bytes(b"pending upload")
+            upload_id = store.record_artifact(
+                media_id,
+                role="telegram_upload",
+                path=upload_path,
+                size_bytes=upload_path.stat().st_size,
+            )
+            store.conn.commit()
+            segment_id = int(
+                store.conn.execute(
+                    """
+                    SELECT id FROM artifacts
+                    WHERE media_id=? AND role='live_segment' AND part_no=?
+                    """,
+                    (media_id, segment_part),
+                ).fetchone()[0]
+            )
+
+            candidates = store.list_process_retention_candidates(cutoff)
+            self.assertEqual(
+                [candidate["artifact_id"] for candidate in candidates],
+                [master_id],
+            )
+            detail = store.get_disk_resource(master_id, root)
+            result = store.purge_process_artifacts(
+                master_id,
+                root,
+                expected_revision=str(detail["resource_revision"]),
+                delivered_before=cutoff,
+            )
+
+            self.assertTrue(result["completed"])
+            self.assertEqual(result["deleted_files"], 1)
+            self.assertTrue(master_path.exists())
+            self.assertFalse(segment_path.exists())
+            self.assertTrue(upload_path.exists())
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT state FROM artifacts WHERE id=?",
+                    (segment_id,),
+                ).fetchone()[0],
+                "purged",
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT state FROM artifacts WHERE id=?",
+                    (upload_id,),
+                ).fetchone()[0],
+                "ready",
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT state FROM jobs WHERE id=?",
+                    (delivery_job_id,),
+                ).fetchone()[0],
+                "blocked",
+            )
+            store.close()
 
     def test_process_purge_keeps_master_and_allows_derivative_regeneration(self):
         with tempfile.TemporaryDirectory() as tmp:

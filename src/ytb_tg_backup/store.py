@@ -384,9 +384,8 @@ media_groups AS (
 
 
 DELIVERY_PROCESS_RETENTION_SOURCE = "delivery_process_retention"
-DELIVERY_PROCESS_ARTIFACT_ROLES = frozenset(
-    {"live_segment", "telegram_upload"}
-)
+LIVE_PROCESS_ARTIFACT_ROLES = frozenset({"live_segment"})
+DELIVERY_PROCESS_ARTIFACT_ROLES = frozenset({"telegram_upload"})
 
 
 @dataclass(frozen=True)
@@ -1136,12 +1135,13 @@ class Store:
         *,
         limit: int = 25,
     ) -> list[dict[str, object]]:
-        """List delivered media with explicit process artifacts to remove.
+        """List media with explicit process artifacts ready to remove.
 
-        Unlike full-resource retention, process retention is deliberately
-        media-local: a Twitch sibling's delivery never makes another media
-        item's process files eligible. Thumbnails are eligible only when their
-        metadata explicitly identifies them as Telegram delivery derivatives.
+        Live recording segments age from a successful delivery when present,
+        otherwise from merge completion. They do not depend on delivery
+        success once a canonical master exists. Telegram upload derivatives
+        still require an old successful delivery and terminal jobs. Unlike
+        full-resource retention, both policies are deliberately media-local.
         """
 
         page_limit = max(1, min(100, int(limit)))
@@ -1159,41 +1159,70 @@ class Store:
               resources.artifact_id,
               resources.media_id,
               resources.master_state AS artifact_state,
-              own_delivery.delivered_at
+              COALESCE(
+                own_delivery.delivered_at,
+                resources.artifact_updated_at
+              ) AS delivered_at
             FROM resources
-            JOIN own_delivery ON own_delivery.media_id=resources.media_id
-            WHERE own_delivery.delivered_at <= ?
-              AND resources.anchor_role='master'
+            LEFT JOIN own_delivery ON own_delivery.media_id=resources.media_id
+            WHERE resources.anchor_role='master'
               AND resources.master_state='ready'
-              AND NOT EXISTS (
-                SELECT 1
-                FROM jobs j
-                WHERE j.media_id=resources.media_id
-                  AND j.state NOT IN ('succeeded', 'cancelled')
-              )
-              AND EXISTS (
-                SELECT 1
-                FROM artifacts process_artifact
-                WHERE process_artifact.media_id=resources.media_id
-                  AND process_artifact.state IN ('ready', 'purge_failed')
-                  AND (
-                    process_artifact.role IN (
-                      'live_segment', 'telegram_upload'
-                    )
-                    OR (
-                      process_artifact.role='thumbnail'
-                      AND json_valid(process_artifact.metadata_json)
-                      AND json_type(
-                        process_artifact.metadata_json,
-                        '$.delivery_derivative'
-                      )='true'
-                    )
+              AND (
+                (
+                  COALESCE(
+                    own_delivery.delivered_at,
+                    resources.artifact_updated_at
+                  ) <= ?
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM jobs j
+                    WHERE j.media_id=resources.media_id
+                      AND j.state='running'
                   )
+                  AND EXISTS (
+                    SELECT 1
+                    FROM artifacts process_artifact
+                    WHERE process_artifact.media_id=resources.media_id
+                      AND process_artifact.state IN ('ready', 'purge_failed')
+                      AND process_artifact.role='live_segment'
+                  )
+                )
+                OR (
+                  own_delivery.delivered_at <= ?
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM jobs j
+                    WHERE j.media_id=resources.media_id
+                      AND j.state NOT IN ('succeeded', 'cancelled')
+                  )
+                  AND EXISTS (
+                    SELECT 1
+                    FROM artifacts process_artifact
+                    WHERE process_artifact.media_id=resources.media_id
+                      AND process_artifact.state IN ('ready', 'purge_failed')
+                      AND (
+                        process_artifact.role='telegram_upload'
+                        OR (
+                          process_artifact.role='thumbnail'
+                          AND json_valid(process_artifact.metadata_json)
+                          AND json_type(
+                            process_artifact.metadata_json,
+                            '$.delivery_derivative'
+                          )='true'
+                        )
+                      )
+                  )
+                )
               )
-            ORDER BY own_delivery.delivered_at, resources.artifact_id
+            ORDER BY
+              COALESCE(
+                own_delivery.delivered_at,
+                resources.artifact_updated_at
+              ),
+              resources.artifact_id
             LIMIT ?
             """,
-            (str(delivered_before), page_limit),
+            (str(delivered_before), str(delivered_before), page_limit),
         ).fetchall()
         return [
             {
@@ -1523,49 +1552,88 @@ class Store:
         )
         row = self.conn.execute(
             f"""
+            WITH own_delivery AS (
+              SELECT MAX(delivered_at) AS delivered_at
+              FROM deliveries
+              WHERE media_id=? AND sink='telegram'
+            )
             SELECT
-              MAX(d.delivered_at) AS delivered_at
-            FROM deliveries d
-            WHERE d.media_id=? AND d.sink='telegram'
-            HAVING MAX(d.delivered_at) <= ?
-              AND NOT EXISTS (
-                SELECT 1
-                FROM jobs j
-                WHERE j.media_id=?
-                  AND j.state NOT IN ('succeeded', 'cancelled')
-              )
-              AND EXISTS (
-                SELECT 1
-                FROM artifacts process_artifact
-                WHERE process_artifact.media_id=?
-                  AND process_artifact.state IN ({eligible_states})
-                  AND (
-                    process_artifact.role IN (
-                      'live_segment', 'telegram_upload'
+              master.updated_at AS master_updated_at,
+              own_delivery.delivered_at,
+              CASE WHEN
+                COALESCE(own_delivery.delivered_at, master.updated_at) <= ?
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM jobs j
+                  WHERE j.media_id=master.media_id AND j.state='running'
+                )
+                AND EXISTS (
+                  SELECT 1
+                  FROM artifacts process_artifact
+                  WHERE process_artifact.media_id=master.media_id
+                    AND process_artifact.state IN ({eligible_states})
+                    AND process_artifact.role='live_segment'
+                )
+              THEN 1 ELSE 0 END AS live_segments_eligible,
+              CASE WHEN
+                own_delivery.delivered_at <= ?
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM jobs j
+                  WHERE j.media_id=master.media_id
+                    AND j.state NOT IN ('succeeded', 'cancelled')
+                )
+                AND EXISTS (
+                  SELECT 1
+                  FROM artifacts process_artifact
+                  WHERE process_artifact.media_id=master.media_id
+                    AND process_artifact.state IN ({eligible_states})
+                    AND (
+                      process_artifact.role='telegram_upload'
+                      OR (
+                        process_artifact.role='thumbnail'
+                        AND json_valid(process_artifact.metadata_json)
+                        AND json_type(
+                          process_artifact.metadata_json,
+                          '$.delivery_derivative'
+                        )='true'
+                      )
                     )
-                    OR (
-                      process_artifact.role='thumbnail'
-                      AND json_valid(process_artifact.metadata_json)
-                      AND json_type(
-                        process_artifact.metadata_json,
-                        '$.delivery_derivative'
-                      )='true'
-                    )
-                  )
-              )
+                )
+              THEN 1 ELSE 0 END AS delivery_artifacts_eligible
+            FROM artifacts master
+            CROSS JOIN own_delivery
+            WHERE master.media_id=?
+              AND master.role='master'
+              AND master.part_no=0
+              AND master.state='ready'
             """,
             (
                 int(media_id),
                 str(delivered_before),
-                int(media_id),
+                str(delivered_before),
                 int(media_id),
             ),
         ).fetchone()
-        if row is None:
+        if row is None or not (
+            bool(row["live_segments_eligible"])
+            or bool(row["delivery_artifacts_eligible"])
+        ):
             return None
         return {
             "group_key": f"media:{int(media_id)}",
-            "delivered_at": str(row["delivered_at"]),
+            "delivered_at": (
+                str(row["delivered_at"])
+                if row["delivered_at"] is not None
+                else None
+            ),
+            "master_updated_at": str(row["master_updated_at"]),
+            "live_segments_eligible": bool(
+                row["live_segments_eligible"]
+            ),
+            "delivery_artifacts_eligible": bool(
+                row["delivery_artifacts_eligible"]
+            ),
         }
 
     def _delivery_archive_status(
@@ -1596,14 +1664,22 @@ class Store:
         }
 
     @staticmethod
-    def _is_delivery_process_artifact(artifact: sqlite3.Row) -> bool:
+    def _process_retention_artifact_is_eligible(
+        artifact: sqlite3.Row,
+        retention_status: dict[str, object],
+    ) -> bool:
         role = str(artifact["role"])
+        if role in LIVE_PROCESS_ARTIFACT_ROLES:
+            return bool(retention_status["live_segments_eligible"])
         if role in DELIVERY_PROCESS_ARTIFACT_ROLES:
-            return True
+            return bool(retention_status["delivery_artifacts_eligible"])
         if role != "thumbnail":
             return False
         metadata = _json_object(artifact["metadata_json"])
-        return metadata.get("delivery_derivative") is True
+        return (
+            metadata.get("delivery_derivative") is True
+            and bool(retention_status["delivery_artifacts_eligible"])
+        )
 
     @staticmethod
     def _delivery_retention_artifact_is_eligible(
@@ -2486,7 +2562,10 @@ class Store:
                 [
                     artifact
                     for artifact in resource_rows
-                    if self._is_delivery_process_artifact(artifact)
+                    if self._process_retention_artifact_is_eligible(
+                        artifact,
+                        process_status,
+                    )
                     and str(artifact["state"])
                     in {"ready", "purge_failed"}
                 ]
@@ -2936,6 +3015,13 @@ class Store:
                     process_status is None
                     or str(process_status["group_key"])
                     != str(retention_group_key)
+                    or not all(
+                        self._process_retention_artifact_is_eligible(
+                            artifact,
+                            process_status,
+                        )
+                        for artifact in artifact_rows
+                    )
                 ):
                     retention_skip_reason = (
                         "process retention eligibility changed after deletion "

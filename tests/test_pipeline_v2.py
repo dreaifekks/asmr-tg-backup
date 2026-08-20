@@ -438,6 +438,61 @@ class PipelineV2Test(unittest.TestCase):
             self.assertEqual(telegram.upload.call_args.kwargs["performer"], "ASMR")
             service.store.close()
 
+    def test_mtproto_audio_delivery_derives_audio_from_video_master(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            service, media_id = self._service_with_media(
+                tmp_path,
+                "mtproto-video-master",
+                upload_transport="mtproto",
+            )
+            master_path = tmp_path / "mtproto-video-master.mp4"
+            master_path.write_bytes(b"video master")
+            upload_path = tmp_path / "mtproto-video-master.tgaudio.m4a"
+            upload_path.write_bytes(b"derived audio")
+            downloader = self._downloader(master_path)
+            downloader.shrink_audio_for_upload.return_value = DownloadResult(
+                file_path=upload_path,
+                file_size=upload_path.stat().st_size,
+            )
+            telegram = mock.Mock()
+
+            def upload(_path, **kwargs):
+                kwargs["before_commit"]()
+                return 904
+
+            telegram.upload.side_effect = upload
+
+            self.assertEqual(
+                self._run_one(service, downloader, telegram, owner="download"),
+                1,
+            )
+            self.assertEqual(
+                self._run_one(service, downloader, telegram, owner="delivery"),
+                1,
+            )
+
+            downloader.split_audio_for_upload.assert_not_called()
+            downloader.shrink_audio_for_upload.assert_called_once_with(
+                master_path,
+                service.config.telegram.mtproto.max_upload_bytes,
+                force_audio=True,
+            )
+            self.assertEqual(telegram.upload.call_args.args[0], upload_path)
+            artifact = service.store.conn.execute(
+                """
+                SELECT a.id, a.path, a.state, d.artifact_id
+                FROM artifacts a
+                JOIN deliveries d ON d.media_id=a.media_id
+                WHERE a.media_id=? AND a.role='telegram_upload'
+                """,
+                (media_id,),
+            ).fetchone()
+            self.assertEqual(str(artifact["path"]), str(upload_path))
+            self.assertEqual(str(artifact["state"]), "ready")
+            self.assertEqual(int(artifact["artifact_id"]), int(artifact["id"]))
+            service.store.close()
+
     def test_split_audio_delivery_records_parts_and_all_remote_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

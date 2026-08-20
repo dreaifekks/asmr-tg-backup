@@ -233,7 +233,8 @@ See [Control panel](https://dreaifekks.github.io/asmr-tg-backup/configuration/co
 for configuration and file-management behavior.
 
 Automatic cleanup is configured separately from Panel deletion. New setup
-configs remove temporary recording and Telegram upload files one day after a
+configs remove verified live-recording segments one day after merge, even if
+delivery is blocked. Telegram upload files are removed one day after a
 successful delivery:
 
 ```toml

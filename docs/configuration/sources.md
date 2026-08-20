@@ -257,8 +257,9 @@ changing that directory.
 
 ## Automatic local retention {#automatic-local-retention}
 
-New setup configs remove temporary recording and Telegram upload files one day
-after a successful delivery. Complete backup files are kept:
+New setup configs remove verified live-recording segments one day after merge,
+even when delivery is blocked. Telegram upload files are removed one day after
+a successful delivery. Complete backup files are kept:
 
 ```toml
 [storage]
@@ -269,9 +270,10 @@ archive_after_delivery_hours = 24
 archive_require_mount = true
 ```
 
-`process_retention_hours` controls temporary files. `backup_retention_hours`
-controls complete backup files. A value of `0` keeps that category
-indefinitely.
+`process_retention_hours` controls both clocks: live segments age from merge
+completion when no delivery exists, while Telegram upload files age from a
+successful delivery. `backup_retention_hours` controls complete backup files.
+A value of `0` keeps that category indefinitely.
 
 To move complete backup files instead of keeping them below `downloads`, set
 `archive_dir` to an existing directory on the mounted disk. The move happens

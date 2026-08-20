@@ -224,8 +224,9 @@ TWITCH_CLIENT_SECRET=replace-with-client-secret
 
 ## 本地文件自动保留策略 {#automatic-local-retention}
 
-新生成的 setup 配置会在成功投递一天后清理录制与 Telegram 上传产生的过程文件，并
-继续保留完整备份文件：
+新生成的 setup 配置会在直播合并并验证完成一天后清理录制分段，即使 Telegram 投递
+被阻塞也不会无限保留；Telegram 上传派生文件则在成功投递一天后清理。完整备份文件
+继续保留：
 
 ```toml
 [storage]
@@ -236,7 +237,8 @@ archive_after_delivery_hours = 24
 archive_require_mount = true
 ```
 
-`process_retention_hours` 控制过程文件，`backup_retention_hours` 控制完整备份文件。
+`process_retention_hours` 同时控制两类过程文件：未投递直播的分段从合并完成开始计时，
+Telegram 上传派生文件从成功投递开始计时。`backup_retention_hours` 控制完整备份文件。
 任一字段设为 `0` 都表示一直保留对应文件。
 
 如果要把完整备份文件转移到挂载磁盘，把 `archive_dir` 设为磁盘中已经存在的目录。
