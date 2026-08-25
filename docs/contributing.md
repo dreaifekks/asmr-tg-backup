@@ -75,4 +75,5 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
 .venv/bin/mkdocs build --strict --clean
 ```
 
-Update `CHANGELOG.md` under `Unreleased` for user-visible behavior.
+Keep commits focused and descriptive; Git history is the project change
+record.

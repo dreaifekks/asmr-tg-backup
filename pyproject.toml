@@ -16,7 +16,7 @@ keywords = ["asmr", "extensions", "media-archiver", "telegram", "twitch", "youtu
 requires-python = ">=3.11"
 dependencies = [
     "Telethon>=1.44,<2",
-    "yt-dlp",
+    "yt-dlp[default,deno]",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -44,7 +44,6 @@ Homepage = "https://github.com/dreaifekks/asmr-tg-backup"
 Documentation = "https://dreaifekks.github.io/asmr-tg-backup/"
 Repository = "https://github.com/dreaifekks/asmr-tg-backup.git"
 Issues = "https://github.com/dreaifekks/asmr-tg-backup/issues"
-Changelog = "https://github.com/dreaifekks/asmr-tg-backup/blob/master/CHANGELOG.md"
 
 [project.scripts]
 asmr-tg-backup = "ytb_tg_backup.cli:main"

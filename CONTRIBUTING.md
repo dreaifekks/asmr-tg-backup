@@ -69,6 +69,6 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
 .venv/bin/mkdocs build --strict --clean
 ```
 
-Update `CHANGELOG.md` under `Unreleased` for user-visible behavior. Do not
-commit real `config.toml`, `.env`, SQLite/WAL files, downloads, archives,
-MTProto sessions, or virtual environments.
+Keep commits focused and descriptive; Git history is the project change
+record. Do not commit real `config.toml`, `.env`, SQLite/WAL files, downloads,
+archives, MTProto sessions, or virtual environments.

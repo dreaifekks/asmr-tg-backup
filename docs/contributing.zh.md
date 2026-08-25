@@ -66,4 +66,4 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
 .venv/bin/mkdocs build --strict --clean
 ```
 
-用户可见行为发生变化时，在 `CHANGELOG.md` 的 `Unreleased` 中补充记录。
+保持提交聚焦且描述清楚；项目的变更记录以 Git history 为准。

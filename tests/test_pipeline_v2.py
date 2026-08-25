@@ -97,6 +97,41 @@ class PipelineV2Test(unittest.TestCase):
             telegram.upload.assert_not_called()
             service.store.close()
 
+    def test_standard_download_failure_logs_warning_and_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            service, media_id = self._service_with_media(tmp_path, "download-failure")
+            artifact_path = tmp_path / "unused.m4a"
+            artifact_path.write_bytes(b"unused")
+            downloader = self._downloader(artifact_path)
+            downloader.download.side_effect = subprocess.CalledProcessError(
+                1,
+                ["yt-dlp"],
+                stderr="HTTP Error 403: Forbidden",
+            )
+            telegram = mock.Mock()
+
+            with self.assertLogs("asmr_tg_backup", level="WARNING") as captured:
+                self.assertEqual(
+                    self._run_one(service, downloader, telegram, owner="download"),
+                    1,
+                )
+
+            job = service.store.conn.execute(
+                """
+                SELECT state, failure_count, reason_code
+                FROM jobs
+                WHERE media_id=? AND job_type='download'
+                """,
+                (media_id,),
+            ).fetchone()
+            self.assertEqual(tuple(job), ("retry", 1, "download_failed"))
+            warning = "\n".join(captured.output)
+            self.assertIn("reason=download_failed", warning)
+            self.assertIn("HTTP Error 403: Forbidden", warning)
+            telegram.upload.assert_not_called()
+            service.close()
+
     def test_complete_download_atomically_creates_artifact_and_delivery_job(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

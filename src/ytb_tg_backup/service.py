@@ -1084,7 +1084,8 @@ class BackupService:
                 ),
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as exc:
-            store.fail_job(
+            self._fail_job_with_warning(
+                store,
                 job,
                 reason_code="probe_failed",
                 error=self._safe_error(exc),
@@ -1245,7 +1246,8 @@ class BackupService:
                 and self._finalize_live_segments(store, downloader, job, media)
             ):
                 return
-            store.fail_job(
+            self._fail_job_with_warning(
+                store,
                 job,
                 reason_code="download_failed",
                 error=self._safe_error(exc.cause),
@@ -1253,7 +1255,8 @@ class BackupService:
             )
             return
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, RuntimeError) as exc:
-            store.fail_job(
+            self._fail_job_with_warning(
+                store,
                 job,
                 reason_code="download_failed",
                 error=self._safe_error(exc),
@@ -1736,6 +1739,38 @@ class BackupService:
         if pattern is None:
             return DEFAULT_SOURCE_FILTER_PATTERN
         return pattern or None
+
+    def _fail_job_with_warning(
+        self,
+        store: Store,
+        job: ClaimedJob,
+        *,
+        reason_code: str,
+        error: str,
+        retry_seconds: int,
+    ) -> None:
+        summary = " | ".join(
+            line.strip()
+            for line in error.splitlines()
+            if line.strip()
+        )[:500]
+        self.logger.warning(
+            "job attempt failed id=%s type=%s media_id=%s attempt=%s/%s "
+            "reason=%s: %s",
+            job.id,
+            job.job_type,
+            job.media_id,
+            job.attempts,
+            job.max_attempts,
+            reason_code,
+            summary,
+        )
+        store.fail_job(
+            job,
+            reason_code=reason_code,
+            error=error,
+            retry_seconds=retry_seconds,
+        )
 
     def _safe_error(self, exc: BaseException) -> str:
         if isinstance(exc, subprocess.TimeoutExpired):
