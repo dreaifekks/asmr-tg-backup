@@ -37,6 +37,7 @@ from .youtube import resolve_channel_id
 PANEL_STATE_PREFIX = "control_panel_v1"
 PANEL_PAGE_SIZE = 6
 RESOURCE_PAGE_SIZE = 6
+REACTION_PAGE_SIZE = 6
 PANEL_SNAPSHOT_MAX_AGE_SECONDS = 30
 PANEL_REVISION_SEPARATOR = "~"
 TWITCH_KINDS = {"vods", "highlights", "uploads"}
@@ -81,6 +82,10 @@ class ControlBot:
         self._source_catalog_ready = False
         self._retry_not_before = 0.0
 
+    @property
+    def telegram_destination_key(self) -> str:
+        return f"telegram:{self.config.telegram.chat_id}"
+
     def process_once(self, timeout_seconds: int | None = None) -> None:
         if not self.config.control.enabled:
             return
@@ -100,10 +105,13 @@ class ControlBot:
                 ),
             ),
         )
+        allowed_updates = ["message", "callback_query"]
+        if self.config.control.reaction_favorites_enabled:
+            allowed_updates.append("message_reaction_count")
         payload: dict[str, Any] = {
             "timeout": long_poll_seconds,
             "limit": 20,
-            "allowed_updates": ["message", "callback_query"],
+            "allowed_updates": allowed_updates,
         }
         if offset:
             payload["offset"] = offset + 1
@@ -118,6 +126,8 @@ class ControlBot:
                 self._handle_update(update)
             finally:
                 self.store.set_bot_offset(update_id)
+        if self.config.control.reaction_favorites_enabled:
+            self._sync_pending_reaction_pins()
         self.expire_idle_panels()
 
     def register_commands(self) -> None:
@@ -140,6 +150,10 @@ class ControlBot:
         )
 
     def _handle_update(self, update: dict[str, Any]) -> None:
+        reaction_counts = update.get("message_reaction_count")
+        if reaction_counts:
+            self._handle_reaction_count_update(reaction_counts)
+            return
         callback = update.get("callback_query")
         if callback:
             self._handle_callback(callback)
@@ -169,6 +183,105 @@ class ControlBot:
             self.logger.exception("control command failed")
             reply = f"error: {exc}"
         self._reply(message, reply)
+
+    def _handle_reaction_count_update(
+        self,
+        reaction_update: dict[str, Any],
+    ) -> None:
+        if not self.config.control.reaction_favorites_enabled:
+            return
+        chat = reaction_update.get("chat") or {}
+        if not self._reaction_chat_matches(chat):
+            self.logger.debug(
+                "ignored reaction update for another chat chat_id=%s username=%s",
+                chat.get("id"),
+                chat.get("username"),
+            )
+            return
+        try:
+            message_id = int(reaction_update.get("message_id"))
+            telegram_date = int(reaction_update.get("date") or 0)
+        except (TypeError, ValueError):
+            self.logger.warning("ignored malformed Telegram reaction update")
+            return
+        if message_id <= 0:
+            return
+        raw_counts = reaction_update.get("reactions")
+        counts = raw_counts if isinstance(raw_counts, list) else []
+        result = self.store.record_telegram_reaction_counts(
+            self.telegram_destination_key,
+            message_id,
+            chat_id=str(chat.get("id") or ""),
+            chat_username=(
+                str(chat.get("username"))
+                if chat.get("username")
+                else None
+            ),
+            counts=counts,
+            telegram_date=telegram_date,
+        )
+        if not bool(result.get("tracked")):
+            self.logger.debug(
+                "ignored reaction update for untracked delivery message_id=%s",
+                message_id,
+            )
+
+    def _reaction_chat_matches(self, chat: dict[str, Any]) -> bool:
+        expected = str(self.config.telegram.chat_id or "").strip()
+        if not expected:
+            return False
+        actual_id = str(chat.get("id") or "").strip()
+        if actual_id and actual_id == expected:
+            return True
+        username = str(chat.get("username") or "").strip().casefold()
+        return bool(
+            expected.startswith("@")
+            and username
+            and username == expected[1:].casefold()
+        )
+
+    def _sync_pending_reaction_pins(self) -> None:
+        for row in self.store.list_pending_telegram_reaction_pins(
+            self.telegram_destination_key,
+            limit=10,
+        ):
+            should_pin = bool(row["should_pin"])
+            method = "pinChatMessage" if should_pin else "unpinChatMessage"
+            message_id = int(row["message_id"])
+            try:
+                payload: dict[str, Any] = {
+                    "chat_id": row["chat_id"],
+                    "message_id": message_id,
+                }
+                if should_pin:
+                    payload["disable_notification"] = True
+                self._api(method, payload)
+            except Exception as exc:
+                retry_after = (
+                    exc.retry_after
+                    if isinstance(exc, ControlApiError)
+                    else None
+                )
+                self.store.record_telegram_reaction_pin_failure(
+                    self.telegram_destination_key,
+                    message_id,
+                    error=str(exc),
+                    retry_seconds=retry_after,
+                )
+                self.logger.warning(
+                    "could not %s reaction favorite message_id=%s: %s",
+                    "pin" if should_pin else "unpin",
+                    message_id,
+                    exc,
+                )
+                if isinstance(exc, ControlApiError) and exc.retry_after:
+                    break
+                continue
+            self.store.record_telegram_reaction_pin_success(
+                self.telegram_destination_key,
+                message_id,
+                pinned=should_pin,
+            )
 
     def _execute(self, text: str, message: dict[str, Any]) -> str:
         parts = shlex.split(text)
@@ -594,6 +707,35 @@ class ControlBot:
         if action == "statsrefresh":
             self._panel_snapshot(force=True)
             state.update({"view": "stats", "awaiting": None})
+            return
+        if action in {"reactions", "reactionsrefresh"}:
+            if not self.config.control.reaction_favorites_enabled:
+                raise ValueError("Telegram reaction 收藏尚未启用")
+            scope = parts[2] if len(parts) > 2 else "total"
+            if scope not in {"total", "mine"}:
+                raise ValueError("invalid reaction ranking scope")
+            page = int(parts[3]) if len(parts) > 3 else 0
+            state.update(
+                {
+                    "view": "reactions",
+                    "reaction_scope": scope,
+                    "reaction_page": max(0, page),
+                    "awaiting": None,
+                }
+            )
+            return
+        if action == "reactionfav":
+            if not self.config.control.reaction_favorites_enabled:
+                raise ValueError("Telegram reaction 收藏尚未启用")
+            if len(parts) != 3 or not parts[2].isdigit():
+                raise ValueError("invalid reaction favorite action")
+            user_id = str((message.get("from") or {}).get("id") or "")
+            favorite = self.store.toggle_telegram_media_favorite(
+                int(parts[2]),
+                self.telegram_destination_key,
+                user_id=user_id,
+            )
+            state["flash"] = "已加入我的收藏" if favorite else "已取消我的收藏"
             return
         if action == "resources":
             page = int(parts[2]) if len(parts) > 2 else 0
@@ -1200,6 +1342,8 @@ class ControlBot:
         view = str(state.get("view") or "home")
         if view == "origins":
             text, keyboard = self._render_origins_panel(state)
+        elif view == "reactions":
+            text, keyboard = self._render_reactions_panel(state)
         elif view == "resources":
             text, keyboard = self._render_resources_panel(state)
         elif view == "resource_detail":
@@ -1261,9 +1405,19 @@ class ControlBot:
         )
         keyboard = [
             [_button("📚 来源", "p:origins:0"), _button("💾 本地资源", "p:resources:0")],
-            [_button("📊 状态", "p:stats"), _button("🔎 过滤器", "p:filter")],
-            [_button("➕ YouTube", "p:addyt"), _button("➕ Twitch", "p:addtw")],
         ]
+        if self.config.control.reaction_favorites_enabled:
+            keyboard.append(
+                [_button("❤️ Reaction 收藏", "p:reactions:total:0"), _button("📊 状态", "p:stats")]
+            )
+            keyboard.append([_button("🔎 过滤器", "p:filter")])
+        else:
+            keyboard.append(
+                [_button("📊 状态", "p:stats"), _button("🔎 过滤器", "p:filter")]
+            )
+        keyboard.append(
+            [_button("➕ YouTube", "p:addyt"), _button("➕ Twitch", "p:addtw")]
+        )
         keyboard.extend(self._extension_provider_button_rows())
         keyboard.append([_button("🔄 刷新", "p:refresh")])
         return text, keyboard
@@ -1370,6 +1524,132 @@ class ControlBot:
         keyboard.extend(self._extension_provider_button_rows())
         keyboard.append(
             [_button("🏠 返回", "p:home"), _button("🔄 刷新", f"p:originsrefresh:{page}")]
+        )
+        return "\n".join(lines), keyboard
+
+    def _render_reactions_panel(
+        self,
+        state: dict[str, Any],
+    ) -> tuple[str, list[list[dict[str, str]]]]:
+        scope = str(state.get("reaction_scope") or "total")
+        if scope not in {"total", "mine"}:
+            scope = "total"
+        page = max(0, int(state.get("reaction_page") or 0))
+        user_id = str(state.get("user_id") or "")
+        ranking = self.store.list_telegram_reaction_rankings(
+            self.telegram_destination_key,
+            user_id=user_id,
+            scope=scope,
+            limit=REACTION_PAGE_SIZE,
+            offset=page * REACTION_PAGE_SIZE,
+        )
+        total = int(ranking["total"])
+        page_count = max(1, (total + REACTION_PAGE_SIZE - 1) // REACTION_PAGE_SIZE)
+        page = min(page, page_count - 1)
+        if page != int(state.get("reaction_page") or 0):
+            ranking = self.store.list_telegram_reaction_rankings(
+                self.telegram_destination_key,
+                user_id=user_id,
+                scope=scope,
+                limit=REACTION_PAGE_SIZE,
+                offset=page * REACTION_PAGE_SIZE,
+            )
+        state.update(
+            {
+                "reaction_scope": scope,
+                "reaction_page": page,
+            }
+        )
+
+        if scope == "total":
+            lines = [
+                f"❤️ Telegram Reaction 排行  {page + 1}/{page_count}",
+                "",
+                f"有 reaction 的 ASMR：{total}",
+                "按原生 Telegram reaction 总数从多到少排列。",
+                "总数大于 0 的投递消息会保持置顶。",
+                "",
+            ]
+        else:
+            lines = [
+                f"⭐ 我的收藏  {page + 1}/{page_count}",
+                "",
+                f"我收藏的 ASMR：{total}",
+                "频道 reaction 是匿名的；此页由 Panel 收藏按钮记录。",
+                "列表仍按 Telegram reaction 总数从多到少排列。",
+                "",
+            ]
+
+        keyboard: list[list[dict[str, str]]] = []
+        items = list(ranking["items"])
+        for index, item in enumerate(
+            items,
+            start=page * REACTION_PAGE_SIZE + 1,
+        ):
+            reaction_count = int(item["total_count"])
+            title = _compact_text(str(item["title"]), 64)
+            date_text = _format_resource_date(
+                item.get("published_at") or item.get("delivered_at")
+            )
+            lines.extend(
+                [
+                    f"{index}. ❤️ {reaction_count} · {title}",
+                    (
+                        f"   {item['provider']}/{item['content_kind']} · "
+                        f"{date_text}"
+                    ),
+                ]
+            )
+            row: list[dict[str, str]] = []
+            message_id = item.get("message_id")
+            if message_id is not None:
+                message_url = _telegram_message_url(
+                    self.config.telegram.chat_id,
+                    int(message_id),
+                )
+                if message_url:
+                    row.append(
+                        _url_button(
+                            f"{index}. 打开频道消息",
+                            message_url,
+                        )
+                    )
+            row.append(
+                _button(
+                    "★ 取消收藏" if bool(item["is_favorite"]) else "☆ 收藏",
+                    f"p:reactionfav:{item['media_id']}",
+                )
+            )
+            keyboard.append(row)
+        if not items:
+            lines.append(
+                "（还没有 Telegram reaction）"
+                if scope == "total"
+                else "（还没有 Panel 收藏）"
+            )
+
+        navigation: list[dict[str, str]] = []
+        if page > 0:
+            navigation.append(
+                _button("⬅️", f"p:reactions:{scope}:{page - 1}")
+            )
+        if page + 1 < page_count:
+            navigation.append(
+                _button("➡️", f"p:reactions:{scope}:{page + 1}")
+            )
+        if navigation:
+            keyboard.append(navigation)
+        keyboard.append(
+            [
+                _button("❤️ 总排行", "p:reactions:total:0"),
+                _button("⭐ 我的收藏", "p:reactions:mine:0"),
+            ]
+        )
+        keyboard.append(
+            [
+                _button("🏠 返回", "p:home"),
+                _button("🔄 刷新", f"p:reactionsrefresh:{scope}:{page}"),
+            ]
         )
         return "\n".join(lines), keyboard
 
@@ -1518,9 +1798,45 @@ class ControlBot:
             )
         if bool(resource["irreplaceable_live"]):
             lines.append("⚠️ 这是直播录制，本地删除后通常无法重新获取。")
+        reaction_summary = None
+        if self.config.control.reaction_favorites_enabled:
+            reaction_summary = self.store.get_media_reaction_summary(
+                int(resource["media_id"]),
+                self.telegram_destination_key,
+                user_id=str(state.get("user_id") or ""),
+            )
+            if reaction_summary is not None:
+                lines.append(
+                    "Reaction："
+                    f"❤️ {int(reaction_summary['total_count'])}；"
+                    f"我的收藏：{'是' if reaction_summary['is_favorite'] else '否'}"
+                )
         lines.extend(["", str(resource["canonical_url"])])
 
         keyboard: list[list[dict[str, str]]] = []
+        if reaction_summary is not None:
+            reaction_buttons: list[dict[str, str]] = []
+            message_id = reaction_summary.get("message_id")
+            if message_id is not None:
+                message_url = _telegram_message_url(
+                    self.config.telegram.chat_id,
+                    int(message_id),
+                )
+                if message_url:
+                    reaction_buttons.append(
+                        _url_button("打开 Telegram 消息", message_url)
+                    )
+            reaction_buttons.append(
+                _button(
+                    (
+                        "★ 取消我的收藏"
+                        if bool(reaction_summary["is_favorite"])
+                        else "☆ 加入我的收藏"
+                    ),
+                    f"p:reactionfav:{resource['media_id']}",
+                )
+            )
+            keyboard.append(reaction_buttons)
         uncertain_delivery = self.store.get_uncertain_delivery(
             int(resource["media_id"])
         )
@@ -2407,6 +2723,26 @@ def _button(text: str, callback_data: str) -> dict[str, str]:
     if len(callback_data.encode("utf-8")) > 64:
         raise ValueError("Telegram callback_data exceeds 64 bytes")
     return {"text": text, "callback_data": callback_data}
+
+
+def _url_button(text: str, url: str) -> dict[str, str]:
+    if not url.startswith(("https://t.me/", "tg://")):
+        raise ValueError("unsupported Telegram message URL")
+    return {"text": text, "url": url}
+
+
+def _telegram_message_url(chat_id: object, message_id: int) -> str | None:
+    if int(message_id) <= 0:
+        return None
+    chat = str(chat_id or "").strip()
+    if chat.startswith("@"):
+        username = chat[1:]
+        if re.fullmatch(r"[A-Za-z0-9_]+", username):
+            return f"https://t.me/{username}/{int(message_id)}"
+        return None
+    if chat.startswith("-100") and chat[4:].isdigit():
+        return f"https://t.me/c/{chat[4:]}/{int(message_id)}"
+    return None
 
 
 def _inline_keyboard(rows: list[list[dict[str, str]]]) -> dict[str, Any]:

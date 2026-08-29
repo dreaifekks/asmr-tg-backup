@@ -15,6 +15,7 @@ from ytb_tg_backup.control import (
     ControlBot,
     _origin_token,
     _provider_token,
+    _telegram_message_url,
 )
 from ytb_tg_backup.extension_api import HttpResponse, SourceProviderDefinition
 from ytb_tg_backup.network import NetworkScope
@@ -317,6 +318,202 @@ allowed_user_ids = ["123"]
                 request_timeout_seconds=15,
             )
             expire_idle_panels.assert_called_once_with()
+
+    def test_channel_reactions_drive_pin_sync_and_panel_rankings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                f"""
+[app]
+data_dir = "{tmp}"
+
+[telegram]
+enabled = true
+bot_token = "test-token"
+chat_id = "@archive"
+
+[control]
+enabled = true
+reaction_favorites_enabled = true
+allowed_user_ids = ["123"]
+""".strip()
+            )
+            config = load_config(config_path)
+            store = Store(config.db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "Quiet ASMR", "UC-1")
+            )
+            media_id, _ = store.upsert_discovered(
+                "yt",
+                MediaCandidate(
+                    provider="youtube",
+                    content_kind="video",
+                    external_id="reaction-panel",
+                    title="Reaction Panel ASMR",
+                    url="https://example.invalid/reaction-panel",
+                    published_at="2026-08-28T00:00:00+00:00",
+                ),
+            )
+            media_path = config.download_dir / "reaction-panel.m4a"
+            media_path.parent.mkdir(parents=True)
+            media_path.write_bytes(b"audio")
+            download = store.claim_next_job(
+                ("download",),
+                owner="download",
+                lease_seconds=60,
+            )
+            artifact_id = store.complete_download(
+                download,
+                path=media_path,
+                size_bytes=5,
+                delivery_targets=("telegram:@archive",),
+            )
+            delivery = store.claim_next_job(
+                ("telegram_delivery",),
+                owner="delivery",
+                lease_seconds=60,
+            )
+            store.complete_delivery(
+                delivery,
+                artifact_id=artifact_id,
+                destination_key="telegram:@archive",
+                remote_id="77",
+            )
+            bot = ControlBot(config, store, logging.getLogger("test"))
+            get_updates = [
+                {
+                    "ok": True,
+                    "result": [
+                        {
+                            "update_id": 1,
+                            "message_reaction_count": {
+                                "chat": {
+                                    "id": -100555,
+                                    "type": "channel",
+                                    "username": "archive",
+                                },
+                                "message_id": 77,
+                                "date": 100,
+                                "reactions": [
+                                    {
+                                        "type": {
+                                            "type": "emoji",
+                                            "emoji": "❤️",
+                                        },
+                                        "total_count": 4,
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                },
+                {
+                    "ok": True,
+                    "result": [
+                        {
+                            "update_id": 2,
+                            "message_reaction_count": {
+                                "chat": {
+                                    "id": -100555,
+                                    "type": "channel",
+                                    "username": "archive",
+                                },
+                                "message_id": 77,
+                                "date": 101,
+                                "reactions": [],
+                            },
+                        }
+                    ],
+                },
+            ]
+            calls: list[tuple[str, dict]] = []
+
+            def fake_api(method: str, payload: dict, **_kwargs) -> dict:
+                calls.append((method, payload))
+                if method == "getUpdates":
+                    return get_updates.pop(0)
+                return {"ok": True, "result": True}
+
+            with mock.patch.object(bot, "_api", side_effect=fake_api):
+                bot.process_once(timeout_seconds=1)
+                total_state = {
+                    "view": "reactions",
+                    "reaction_scope": "total",
+                    "reaction_page": 0,
+                    "user_id": 123,
+                }
+                total_text, total_keyboard = bot._render_reactions_panel(
+                    total_state
+                )
+                self.assertIn("Reaction Panel ASMR", total_text)
+                self.assertIn("❤️ 4", total_text)
+                self.assertIn(
+                    "https://t.me/archive/77",
+                    {
+                        button.get("url")
+                        for row in total_keyboard
+                        for button in row
+                    },
+                )
+                bot._apply_panel_action(
+                    f"p:reactionfav:{media_id}",
+                    total_state,
+                    {"from": {"id": 123}, "chat": {"id": 123}},
+                )
+                mine_state = {
+                    "view": "reactions",
+                    "reaction_scope": "mine",
+                    "reaction_page": 0,
+                    "user_id": 123,
+                }
+                mine_text, _ = bot._render_reactions_panel(mine_state)
+                self.assertIn("我的收藏", mine_text)
+                self.assertIn("Reaction Panel ASMR", mine_text)
+                bot.process_once(timeout_seconds=1)
+
+            get_update_payloads = [
+                payload for method, payload in calls if method == "getUpdates"
+            ]
+            self.assertEqual(
+                get_update_payloads[0]["allowed_updates"],
+                ["message", "callback_query", "message_reaction_count"],
+            )
+            self.assertEqual(
+                [method for method, _ in calls if method.endswith("ChatMessage")],
+                ["pinChatMessage", "unpinChatMessage"],
+            )
+            pin_payload = next(
+                payload for method, payload in calls if method == "pinChatMessage"
+            )
+            self.assertEqual(pin_payload["chat_id"], "-100555")
+            self.assertEqual(pin_payload["message_id"], 77)
+            self.assertTrue(pin_payload["disable_notification"])
+            persisted = store.get_media_reaction_summary(
+                media_id,
+                "telegram:@archive",
+                user_id="123",
+            )
+            self.assertEqual(persisted["total_count"], 0)
+            self.assertTrue(persisted["is_favorite"])
+            pin_state = store.conn.execute(
+                """
+                SELECT pinned_by_bot FROM telegram_message_reactions
+                WHERE destination_key='telegram:@archive' AND message_id=77
+                """
+            ).fetchone()
+            self.assertEqual(pin_state["pinned_by_bot"], 0)
+
+    def test_telegram_message_urls_cover_public_and_private_channels(self):
+        self.assertEqual(
+            _telegram_message_url("@archive", 77),
+            "https://t.me/archive/77",
+        )
+        self.assertEqual(
+            _telegram_message_url("-1003763707895", 117),
+            "https://t.me/c/3763707895/117",
+        )
+        self.assertIsNone(_telegram_message_url("private-chat", 77))
 
     def test_authorization_and_catalog_origin_add(self):
         with tempfile.TemporaryDirectory() as tmp:

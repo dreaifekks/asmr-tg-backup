@@ -65,6 +65,7 @@ enabled = true
         self.assertEqual(config.control.api_base, "")
         self.assertEqual(config.control.panel_idle_timeout_seconds, 3600)
         self.assertFalse(config.control.allow_disk_delete)
+        self.assertFalse(config.control.reaction_favorites_enabled)
         self.assertTrue(config.control.delete_webhook_on_startup)
 
     def test_control_api_base_is_an_optional_validated_override(self):
@@ -122,6 +123,34 @@ allow_disk_delete = "false"
             with self.assertRaisesRegex(
                 ValueError,
                 "control.allow_disk_delete must be true or false",
+            ):
+                load_config(invalid_path)
+
+    def test_reaction_favorites_require_explicit_control_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                """
+[control]
+reaction_favorites_enabled = true
+""".strip()
+            )
+
+            config = load_config(path)
+
+        self.assertTrue(config.control.reaction_favorites_enabled)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            invalid_path = Path(tmp) / "config.toml"
+            invalid_path.write_text(
+                """
+[control]
+reaction_favorites_enabled = "true"
+""".strip()
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "control.reaction_favorites_enabled must be true or false",
             ):
                 load_config(invalid_path)
 

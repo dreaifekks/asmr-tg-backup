@@ -171,6 +171,7 @@ class ControlConfig:
     poll_interval_seconds: int = 10
     panel_idle_timeout_seconds: int = 3600
     allow_disk_delete: bool = False
+    reaction_favorites_enabled: bool = False
     delete_webhook_on_startup: bool = True
     default_routes: list[str] = field(default_factory=lambda: ["live"])
     allowed_user_ids: list[str] = field(default_factory=list)
@@ -498,6 +499,10 @@ def load_config(path: str | Path) -> Config:
         allow_disk_delete=_strict_bool(
             control_raw.get("allow_disk_delete", False),
             label="control.allow_disk_delete",
+        ),
+        reaction_favorites_enabled=_strict_bool(
+            control_raw.get("reaction_favorites_enabled", False),
+            label="control.reaction_favorites_enabled",
         ),
         delete_webhook_on_startup=bool(control_raw.get("delete_webhook_on_startup", True)),
         default_routes=[str(route).strip("/") for route in control_raw.get("default_routes", ["live"])],

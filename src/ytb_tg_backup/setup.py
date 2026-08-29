@@ -1131,6 +1131,7 @@ def _write_setup_config(output_path: Path, setup: SetupAnswers) -> None:
         "to separate panel traffic.\n"
         'api_base = ""\n'
         "allow_disk_delete = false\n"
+        "reaction_favorites_enabled = false\n"
         f"allowed_user_ids = [{_toml_string(setup.allowed_user_id)}]\n"
         "allowed_chat_ids = []\n"
         "allowed_message_thread_ids = []\n"

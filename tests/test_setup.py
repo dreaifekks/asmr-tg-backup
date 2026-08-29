@@ -47,6 +47,7 @@ class SetupTest(unittest.TestCase):
             self.assertEqual(config.storage.archive_after_delivery_hours, 24)
             self.assertTrue(config.storage.archive_require_mount)
             self.assertFalse(config.control.allow_disk_delete)
+            self.assertFalse(config.control.reaction_favorites_enabled)
 
     def test_managed_service_inspection_matches_exact_config(self):
         with tempfile.TemporaryDirectory() as tmp:

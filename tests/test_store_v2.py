@@ -82,6 +82,185 @@ class StoreV2Test(unittest.TestCase):
             store.conn.commit()
         return artifact_id
 
+    def test_telegram_reaction_totals_pin_state_rankings_and_personal_favorites(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "state.db"
+            destination = "telegram:@archive"
+            store = Store(db_path)
+            store.initialize()
+            store.upsert_origin(
+                Origin("yt", "youtube", "uploads", "Quiet ASMR", "UC-1")
+            )
+            first_id, _ = store.upsert_discovered(
+                "yt", candidate("youtube", "reaction-first")
+            )
+            second_id, _ = store.upsert_discovered(
+                "yt", candidate("youtube", "reaction-second")
+            )
+            self._complete_download_for_media(
+                store,
+                first_id,
+                root / "reaction-first.m4a",
+                destination=destination,
+            )
+            self._complete_download_for_media(
+                store,
+                second_id,
+                root / "reaction-second.m4a",
+                destination=destination,
+            )
+            store.conn.execute(
+                "UPDATE deliveries SET remote_id='101,102' WHERE media_id=?",
+                (first_id,),
+            )
+            store.conn.execute(
+                "UPDATE deliveries SET remote_id='202' WHERE media_id=?",
+                (second_id,),
+            )
+            store.conn.commit()
+
+            first = store.record_telegram_reaction_counts(
+                destination,
+                102,
+                chat_id="-100123",
+                chat_username="archive",
+                counts=[
+                    {
+                        "type": {"type": "emoji", "emoji": "❤️"},
+                        "total_count": 2,
+                    },
+                    {
+                        "type": {
+                            "type": "custom_emoji",
+                            "custom_emoji_id": "9001",
+                        },
+                        "total_count": 1,
+                    },
+                ],
+                telegram_date=100,
+            )
+            second = store.record_telegram_reaction_counts(
+                destination,
+                202,
+                chat_id="-100123",
+                chat_username="archive",
+                counts=[
+                    {
+                        "type": {"type": "emoji", "emoji": "👍"},
+                        "total_count": 5,
+                    }
+                ],
+                telegram_date=200,
+            )
+
+            self.assertTrue(first["tracked"])
+            self.assertEqual(first["total_count"], 3)
+            self.assertTrue(first["pin_sync_needed"])
+            self.assertEqual(second["total_count"], 5)
+            self.assertEqual(
+                [row["message_id"] for row in store.list_pending_telegram_reaction_pins(destination)],
+                [102, 202],
+            )
+            store.record_telegram_reaction_pin_success(
+                destination,
+                102,
+                pinned=True,
+            )
+
+            stale = store.record_telegram_reaction_counts(
+                destination,
+                102,
+                chat_id="-100123",
+                chat_username="archive",
+                counts=[],
+                telegram_date=99,
+            )
+            self.assertTrue(stale["stale"])
+            self.assertEqual(stale["total_count"], 3)
+            removed = store.record_telegram_reaction_counts(
+                destination,
+                102,
+                chat_id="-100123",
+                chat_username="archive",
+                counts=[],
+                telegram_date=300,
+            )
+            self.assertEqual(removed["total_count"], 0)
+            self.assertTrue(removed["pin_sync_needed"])
+
+            total = store.list_telegram_reaction_rankings(
+                destination,
+                user_id="42",
+                scope="total",
+            )
+            self.assertEqual(total["total"], 1)
+            self.assertEqual(total["items"][0]["media_id"], second_id)
+            self.assertEqual(total["items"][0]["message_id"], 202)
+            self.assertFalse(total["items"][0]["is_favorite"])
+
+            self.assertTrue(
+                store.toggle_telegram_media_favorite(
+                    first_id,
+                    destination,
+                    user_id="42",
+                )
+            )
+            self.assertTrue(
+                store.toggle_telegram_media_favorite(
+                    second_id,
+                    destination,
+                    user_id="42",
+                )
+            )
+            mine = store.list_telegram_reaction_rankings(
+                destination,
+                user_id="42",
+                scope="mine",
+            )
+            self.assertEqual(mine["total"], 2)
+            self.assertEqual(
+                [item["media_id"] for item in mine["items"]],
+                [second_id, first_id],
+            )
+            self.assertEqual(mine["items"][1]["message_id"], 102)
+            summary = store.get_media_reaction_summary(
+                first_id,
+                destination,
+                user_id="42",
+            )
+            self.assertEqual(summary["total_count"], 0)
+            self.assertTrue(summary["is_favorite"])
+            self.assertEqual(summary["message_id"], 102)
+
+            unknown = store.record_telegram_reaction_counts(
+                destination,
+                999,
+                chat_id="-100123",
+                chat_username="archive",
+                counts=[],
+                telegram_date=400,
+            )
+            self.assertFalse(unknown["tracked"])
+            self.assertIsNone(
+                store.get_telegram_delivery_message(
+                    "telegram:@other",
+                    102,
+                )
+            )
+            store.close()
+
+            reopened = Store(db_path)
+            reopened.initialize()
+            persisted = reopened.get_media_reaction_summary(
+                second_id,
+                destination,
+                user_id="42",
+            )
+            self.assertEqual(persisted["total_count"], 5)
+            self.assertTrue(persisted["is_favorite"])
+            reopened.close()
+
     def test_panel_snapshot_is_materialized_and_invalidated_by_relevant_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.db")

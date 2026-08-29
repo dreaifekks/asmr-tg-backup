@@ -138,6 +138,10 @@ panel_idle_timeout_seconds = 3600
 # Resource browsing is always available. Keep permanent local file deletion
 # disabled until the authorized panel operator explicitly needs it.
 allow_disk_delete = false
+# Track native Telegram reactions on delivered channel messages, pin messages
+# while their reaction total is positive, and expose reaction/favorite rankings
+# in the Panel. The bot must be a channel administrator with edit rights.
+reaction_favorites_enabled = false
 delete_webhook_on_startup = true
 # Every /panel command sends a fresh panel below the command; navigation edits
 # that current message. Its state is persisted and scoped to user + chat + thread.

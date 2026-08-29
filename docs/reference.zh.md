@@ -74,7 +74,7 @@ Docker 设置 `ASMR_TG_BACKUP_DATA_DIR=/data`，把宿主机可写目录 `./sett
 | `[telegram]` | 启用、token、目标、transport、媒体和 caption |
 | `[telegram.mtproto]` | Application 凭据对、session 路径与 MTProto 大小限制 |
 | `[telegram.bot_api]` | Bot API 地址、大小限制与可播放分块 |
-| `[control]` | Telegram 面板地址、权限与轮询 |
+| `[control]` | Telegram 面板地址、权限、轮询与可选 reaction 收藏 |
 | `[twitch]` | Helix 凭据与 VOD/live 行为 |
 | `[live]` | 与提供方无关的直播轮询、重试、worker 数量与录制超时 |
 

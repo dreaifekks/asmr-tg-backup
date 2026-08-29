@@ -219,6 +219,40 @@ CREATE TABLE IF NOT EXISTS deliveries (
 CREATE INDEX IF NOT EXISTS idx_deliveries_retention
 ON deliveries(sink, delivered_at, media_id);
 
+CREATE TABLE IF NOT EXISTS telegram_message_reactions (
+  destination_key TEXT NOT NULL,
+  message_id INTEGER NOT NULL,
+  media_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL,
+  chat_username TEXT,
+  counts_json TEXT NOT NULL DEFAULT '[]',
+  total_count INTEGER NOT NULL DEFAULT 0 CHECK(total_count >= 0),
+  telegram_date INTEGER NOT NULL,
+  pinned_by_bot INTEGER NOT NULL DEFAULT 0,
+  pin_failure_count INTEGER NOT NULL DEFAULT 0,
+  pin_retry_at TEXT,
+  pin_error TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(destination_key, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_message_reactions_media
+ON telegram_message_reactions(destination_key, media_id, total_count DESC);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_message_reactions_pin_sync
+ON telegram_message_reactions(destination_key, pin_retry_at, message_id);
+
+CREATE TABLE IF NOT EXISTS telegram_media_favorites (
+  destination_key TEXT NOT NULL,
+  media_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(destination_key, media_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_media_favorites_user
+ON telegram_media_favorites(destination_key, user_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS delivery_recovery_events (
   event_id TEXT PRIMARY KEY,
   job_id INTEGER NOT NULL,
@@ -4687,6 +4721,481 @@ class Store:
             self.conn.rollback()
             raise
 
+    def get_telegram_delivery_message(
+        self,
+        destination_key: str,
+        message_id: int,
+    ) -> dict[str, object] | None:
+        """Resolve one Bot API message update to a confirmed delivery.
+
+        ``deliveries.remote_id`` predates reaction tracking and may contain a
+        comma-separated media-group ID list. Keep that durable format intact
+        while matching exact numeric tokens here.
+        """
+
+        matches = [
+            row
+            for row in self.conn.execute(
+                """
+                SELECT d.id AS delivery_id, d.media_id, d.destination_key,
+                  d.remote_id, d.delivered_at, mi.title
+                FROM deliveries d
+                JOIN media_items mi ON mi.id=d.media_id
+                WHERE d.sink='telegram' AND d.destination_key=?
+                ORDER BY d.id
+                """,
+                (destination_key,),
+            ).fetchall()
+            if int(message_id) in _telegram_remote_message_ids(row["remote_id"])
+        ]
+        if len(matches) != 1:
+            return None
+        result = row_dict(matches[0])
+        result["message_id"] = int(message_id)
+        return result
+
+    def record_telegram_reaction_counts(
+        self,
+        destination_key: str,
+        message_id: int,
+        *,
+        chat_id: str,
+        chat_username: str | None,
+        counts: Sequence[object],
+        telegram_date: int,
+    ) -> dict[str, object]:
+        """Persist one authoritative anonymous-reaction counter update."""
+
+        delivery = self.get_telegram_delivery_message(
+            destination_key,
+            int(message_id),
+        )
+        if delivery is None:
+            return {
+                "tracked": False,
+                "destination_key": destination_key,
+                "message_id": int(message_id),
+            }
+        normalized_counts = _normalize_telegram_reaction_counts(counts)
+        total_count = sum(
+            int(item["total_count"])
+            for item in normalized_counts
+        )
+        event_date = max(0, int(telegram_date))
+        received_at = now_iso()
+        media_id = int(delivery["media_id"])
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            previous = self.conn.execute(
+                """
+                SELECT telegram_date
+                FROM telegram_message_reactions
+                WHERE destination_key=? AND message_id=?
+                """,
+                (destination_key, int(message_id)),
+            ).fetchone()
+            stale = (
+                previous is not None
+                and int(previous["telegram_date"]) > event_date
+            )
+            self.conn.execute(
+                """
+                INSERT INTO telegram_message_reactions(
+                  destination_key, message_id, media_id, chat_id,
+                  chat_username, counts_json, total_count, telegram_date,
+                  updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(destination_key, message_id) DO UPDATE SET
+                  media_id=excluded.media_id,
+                  chat_id=excluded.chat_id,
+                  chat_username=excluded.chat_username,
+                  counts_json=excluded.counts_json,
+                  total_count=excluded.total_count,
+                  telegram_date=excluded.telegram_date,
+                  updated_at=excluded.updated_at
+                WHERE excluded.telegram_date >=
+                  telegram_message_reactions.telegram_date
+                """,
+                (
+                    destination_key,
+                    int(message_id),
+                    media_id,
+                    str(chat_id),
+                    str(chat_username).strip() if chat_username else None,
+                    json.dumps(
+                        normalized_counts,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    total_count,
+                    event_date,
+                    received_at,
+                ),
+            )
+            row = self.conn.execute(
+                """
+                SELECT *
+                FROM telegram_message_reactions
+                WHERE destination_key=? AND message_id=?
+                """,
+                (destination_key, int(message_id)),
+            ).fetchone()
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        if row is None:
+            raise RuntimeError("reaction counter disappeared during update")
+        result = row_dict(row)
+        result.update(
+            {
+                "tracked": True,
+                "stale": stale,
+                "should_pin": int(row["total_count"]) > 0,
+                "pin_sync_needed": (
+                    (int(row["total_count"]) > 0)
+                    != bool(row["pinned_by_bot"])
+                ),
+            }
+        )
+        return result
+
+    def list_pending_telegram_reaction_pins(
+        self,
+        destination_key: str,
+        *,
+        limit: int = 10,
+    ) -> list[dict[str, object]]:
+        rows = self.conn.execute(
+            """
+            SELECT destination_key, message_id, media_id, chat_id,
+              chat_username, total_count, pinned_by_bot, pin_failure_count,
+              pin_retry_at, pin_error
+            FROM telegram_message_reactions
+            WHERE destination_key=?
+              AND ((total_count > 0 AND pinned_by_bot=0)
+                OR (total_count=0 AND pinned_by_bot=1))
+              AND (pin_retry_at IS NULL OR pin_retry_at <= ?)
+            ORDER BY COALESCE(pin_retry_at, ''), updated_at, message_id
+            LIMIT ?
+            """,
+            (destination_key, now_iso(), max(1, min(100, int(limit)))),
+        ).fetchall()
+        result: list[dict[str, object]] = []
+        for row in rows:
+            item = row_dict(row)
+            item["should_pin"] = int(row["total_count"]) > 0
+            result.append(item)
+        return result
+
+    def record_telegram_reaction_pin_success(
+        self,
+        destination_key: str,
+        message_id: int,
+        *,
+        pinned: bool,
+    ) -> None:
+        self.conn.execute(
+            """
+            UPDATE telegram_message_reactions
+            SET pinned_by_bot=?, pin_failure_count=0,
+              pin_retry_at=NULL, pin_error=NULL
+            WHERE destination_key=? AND message_id=?
+            """,
+            (int(bool(pinned)), destination_key, int(message_id)),
+        )
+        self.conn.commit()
+
+    def record_telegram_reaction_pin_failure(
+        self,
+        destination_key: str,
+        message_id: int,
+        *,
+        error: str,
+        retry_seconds: int | None = None,
+    ) -> None:
+        row = self.conn.execute(
+            """
+            SELECT pin_failure_count
+            FROM telegram_message_reactions
+            WHERE destination_key=? AND message_id=?
+            """,
+            (destination_key, int(message_id)),
+        ).fetchone()
+        if row is None:
+            return
+        failure_count = int(row["pin_failure_count"]) + 1
+        delay = (
+            max(1, int(retry_seconds))
+            if retry_seconds is not None
+            else min(3600, 30 * (2 ** min(7, failure_count - 1)))
+        )
+        self.conn.execute(
+            """
+            UPDATE telegram_message_reactions
+            SET pin_failure_count=?, pin_retry_at=?, pin_error=?
+            WHERE destination_key=? AND message_id=?
+            """,
+            (
+                failure_count,
+                future_iso(delay),
+                str(error)[:1000],
+                destination_key,
+                int(message_id),
+            ),
+        )
+        self.conn.commit()
+
+    def get_media_reaction_summary(
+        self,
+        media_id: int,
+        destination_key: str,
+        *,
+        user_id: str = "",
+    ) -> dict[str, object] | None:
+        row = self.conn.execute(
+            """
+            SELECT mi.id AS media_id, mi.title, mi.provider, mi.content_kind,
+              mi.published_at, d.remote_id, d.delivered_at,
+              COALESCE((
+                SELECT SUM(r.total_count)
+                FROM telegram_message_reactions r
+                WHERE r.destination_key=d.destination_key
+                  AND r.media_id=mi.id
+              ), 0) AS total_count,
+              EXISTS(
+                SELECT 1
+                FROM telegram_media_favorites favorite
+                WHERE favorite.destination_key=d.destination_key
+                  AND favorite.media_id=mi.id AND favorite.user_id=?
+              ) AS is_favorite,
+              (
+                SELECT MAX(r.updated_at)
+                FROM telegram_message_reactions r
+                WHERE r.destination_key=d.destination_key
+                  AND r.media_id=mi.id
+              ) AS last_reacted_at
+            FROM media_items mi
+            JOIN deliveries d
+              ON d.media_id=mi.id AND d.sink='telegram'
+                AND d.destination_key=?
+            WHERE mi.id=?
+            """,
+            (str(user_id), destination_key, int(media_id)),
+        ).fetchone()
+        if row is None:
+            return None
+        result = row_dict(row)
+        result["message_id"] = self._preferred_telegram_message_id(
+            int(media_id),
+            destination_key,
+            row["remote_id"],
+        )
+        result["is_favorite"] = bool(row["is_favorite"])
+        return result
+
+    def toggle_telegram_media_favorite(
+        self,
+        media_id: int,
+        destination_key: str,
+        *,
+        user_id: str,
+    ) -> bool:
+        actor = str(user_id).strip()
+        if not actor:
+            raise ValueError("favorite user ID is required")
+        delivery = self.conn.execute(
+            """
+            SELECT remote_id
+            FROM deliveries
+            WHERE media_id=? AND sink='telegram' AND destination_key=?
+            """,
+            (int(media_id), destination_key),
+        ).fetchone()
+        if delivery is None or not _telegram_remote_message_ids(
+            delivery["remote_id"]
+        ):
+            raise ValueError("media has no linkable Telegram delivery")
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.conn.execute(
+                """
+                SELECT 1 FROM telegram_media_favorites
+                WHERE destination_key=? AND media_id=? AND user_id=?
+                """,
+                (destination_key, int(media_id), actor),
+            ).fetchone()
+            if existing is None:
+                self.conn.execute(
+                    """
+                    INSERT INTO telegram_media_favorites(
+                      destination_key, media_id, user_id, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (destination_key, int(media_id), actor, now_iso()),
+                )
+                favorite = True
+            else:
+                self.conn.execute(
+                    """
+                    DELETE FROM telegram_media_favorites
+                    WHERE destination_key=? AND media_id=? AND user_id=?
+                    """,
+                    (destination_key, int(media_id), actor),
+                )
+                favorite = False
+            self.conn.commit()
+            return favorite
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def list_telegram_reaction_rankings(
+        self,
+        destination_key: str,
+        *,
+        user_id: str,
+        scope: str = "total",
+        limit: int = 6,
+        offset: int = 0,
+    ) -> dict[str, object]:
+        if scope not in {"total", "mine"}:
+            raise ValueError("reaction ranking scope must be total or mine")
+        page_limit = max(1, min(50, int(limit)))
+        page_offset = max(0, int(offset))
+        actor = str(user_id).strip()
+        totals_cte = """
+        WITH reaction_totals AS (
+          SELECT media_id, SUM(total_count) AS total_count,
+            MAX(updated_at) AS last_reacted_at
+          FROM telegram_message_reactions
+          WHERE destination_key=?
+          GROUP BY media_id
+        )
+        """
+        if scope == "total":
+            summary = self.conn.execute(
+                f"""
+                {totals_cte}
+                SELECT COUNT(*) AS count
+                FROM reaction_totals total
+                JOIN deliveries d
+                  ON d.media_id=total.media_id AND d.sink='telegram'
+                    AND d.destination_key=?
+                WHERE total.total_count > 0
+                """,
+                (destination_key, destination_key),
+            ).fetchone()
+            rows = self.conn.execute(
+                f"""
+                {totals_cte}
+                SELECT mi.id AS media_id, mi.title, mi.provider,
+                  mi.content_kind, mi.published_at, d.remote_id,
+                  d.delivered_at, total.total_count,
+                  total.last_reacted_at,
+                  EXISTS(
+                    SELECT 1 FROM telegram_media_favorites favorite
+                    WHERE favorite.destination_key=?
+                      AND favorite.media_id=mi.id AND favorite.user_id=?
+                  ) AS is_favorite
+                FROM reaction_totals total
+                JOIN media_items mi ON mi.id=total.media_id
+                JOIN deliveries d
+                  ON d.media_id=mi.id AND d.sink='telegram'
+                    AND d.destination_key=?
+                WHERE total.total_count > 0
+                ORDER BY total.total_count DESC,
+                  total.last_reacted_at DESC, mi.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (
+                    destination_key,
+                    destination_key,
+                    actor,
+                    destination_key,
+                    page_limit,
+                    page_offset,
+                ),
+            ).fetchall()
+        else:
+            summary = self.conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM telegram_media_favorites favorite
+                JOIN deliveries d
+                  ON d.media_id=favorite.media_id AND d.sink='telegram'
+                    AND d.destination_key=favorite.destination_key
+                WHERE favorite.destination_key=? AND favorite.user_id=?
+                """,
+                (destination_key, actor),
+            ).fetchone()
+            rows = self.conn.execute(
+                f"""
+                {totals_cte}
+                SELECT mi.id AS media_id, mi.title, mi.provider,
+                  mi.content_kind, mi.published_at, d.remote_id,
+                  d.delivered_at, COALESCE(total.total_count, 0) AS total_count,
+                  total.last_reacted_at, 1 AS is_favorite,
+                  favorite.created_at AS favorite_created_at
+                FROM telegram_media_favorites favorite
+                JOIN media_items mi ON mi.id=favorite.media_id
+                JOIN deliveries d
+                  ON d.media_id=mi.id AND d.sink='telegram'
+                    AND d.destination_key=favorite.destination_key
+                LEFT JOIN reaction_totals total ON total.media_id=mi.id
+                WHERE favorite.destination_key=? AND favorite.user_id=?
+                ORDER BY COALESCE(total.total_count, 0) DESC,
+                  favorite.created_at DESC, mi.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (
+                    destination_key,
+                    destination_key,
+                    actor,
+                    page_limit,
+                    page_offset,
+                ),
+            ).fetchall()
+        items: list[dict[str, object]] = []
+        for row in rows:
+            item = row_dict(row)
+            item["is_favorite"] = bool(row["is_favorite"])
+            item["message_id"] = self._preferred_telegram_message_id(
+                int(row["media_id"]),
+                destination_key,
+                row["remote_id"],
+            )
+            items.append(item)
+        return {
+            "items": items,
+            "total": int(summary["count"]),
+            "scope": scope,
+        }
+
+    def _preferred_telegram_message_id(
+        self,
+        media_id: int,
+        destination_key: str,
+        remote_id: object,
+    ) -> int | None:
+        reacted = self.conn.execute(
+            """
+            SELECT message_id
+            FROM telegram_message_reactions
+            WHERE destination_key=? AND media_id=?
+            ORDER BY total_count DESC, updated_at DESC, message_id
+            LIMIT 1
+            """,
+            (destination_key, int(media_id)),
+        ).fetchone()
+        if reacted is not None:
+            return int(reacted["message_id"])
+        message_ids = _telegram_remote_message_ids(remote_id)
+        return message_ids[0] if message_ids else None
+
     def get_media(self, media_id: int) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM media_items WHERE id=?", (media_id,)).fetchone()
 
@@ -5563,6 +6072,56 @@ def future_iso(seconds: int) -> str:
 
 def row_dict(row: sqlite3.Row) -> dict[str, object]:
     return dict(row)
+
+
+def _telegram_remote_message_ids(value: object) -> tuple[int, ...]:
+    message_ids: list[int] = []
+    for token in str(value or "").split(","):
+        candidate = token.strip()
+        if not candidate.isdigit():
+            continue
+        parsed = int(candidate)
+        if parsed > 0 and parsed not in message_ids:
+            message_ids.append(parsed)
+    return tuple(message_ids)
+
+
+def _normalize_telegram_reaction_counts(
+    counts: Sequence[object],
+) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
+    for raw in counts:
+        if not isinstance(raw, dict):
+            continue
+        reaction_type = raw.get("type")
+        if not isinstance(reaction_type, dict):
+            continue
+        kind = str(reaction_type.get("type") or "").strip()
+        if kind not in {"emoji", "custom_emoji", "paid"}:
+            continue
+        try:
+            total_count = int(raw.get("total_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if total_count <= 0:
+            continue
+        normalized_type: dict[str, str] = {"type": kind}
+        if kind == "emoji":
+            emoji = str(reaction_type.get("emoji") or "")
+            if not emoji:
+                continue
+            normalized_type["emoji"] = emoji
+        elif kind == "custom_emoji":
+            custom_emoji_id = str(
+                reaction_type.get("custom_emoji_id") or ""
+            ).strip()
+            if not custom_emoji_id:
+                continue
+            normalized_type["custom_emoji_id"] = custom_emoji_id
+        normalized.append(
+            {"type": normalized_type, "total_count": total_count}
+        )
+    return normalized
 
 
 def _delivery_job_revision(row: sqlite3.Row) -> str:

@@ -24,6 +24,8 @@ routing without taking over durable job state.
   does not discard or repeat a completed download.
 - The optional Telegram panel manages sources, filters, status, and tracked
   local resources, with source changes persisted in an editable TOML catalog.
+- Opt-in channel reaction tracking persists totals, pins reacted deliveries,
+  and adds total/personal favorite rankings with message links to the panel.
 
 ## Quick start with PyPI
 
@@ -228,6 +230,10 @@ user, chat, and topic IDs.
 
 Disk deletion is optional. When enabled, the panel manages downloaded files
 tracked in SQLite while retaining database history and Telegram messages.
+
+Reaction favorites are also opt-in. Native channel reaction totals drive the
+ranking and pin state; because channel reactions are anonymous, personal
+favorites are recorded explicitly through authorized Panel buttons.
 
 See [Control panel](https://dreaifekks.github.io/asmr-tg-backup/configuration/control-panel/)
 for configuration and file-management behavior.

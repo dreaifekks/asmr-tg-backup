@@ -11,7 +11,9 @@ The panel lets an authorized user:
 - add providers registered by enabled extensions, such as Niconico;
 - enable, disable, inspect, and remove sources;
 - choose Twitch live recording or archive download;
-- manage the global source filter and inspect polling or job status; and
+- manage the global source filter and inspect polling or job status;
+- browse channel favorites ranked by Telegram reaction totals and maintain a
+  personal Panel favorite list; and
 - browse tracked local files, with optional confirmed disk deletion.
 
 Enabling a source-provider extension adds its provider button after the service
@@ -31,6 +33,7 @@ poll_interval_seconds = 10
 panel_idle_timeout_seconds = 3600
 delete_webhook_on_startup = true
 allow_disk_delete = false
+reaction_favorites_enabled = false
 allowed_user_ids = ["123456789"]
 allowed_chat_ids = []
 allowed_message_thread_ids = []
@@ -84,6 +87,45 @@ the local server, stop the application, complete the server's documented bot
 migration, update the field, and restart. Keep cloud and local `getUpdates`
 consumers mutually exclusive throughout the move.
 
+## Reaction favorites and channel pins
+
+When the delivery target is a Telegram channel, reaction favorites are an
+explicit opt-in:
+
+```toml
+[control]
+enabled = true
+reaction_favorites_enabled = true
+```
+
+The control worker then explicitly subscribes to Bot API
+`message_reaction_count` updates. It accepts only messages that belong to the
+current destination in SQLite `deliveries`. Per-reaction counts, the aggregate
+total, message ID, update time, and pin-sync state are persisted in `state.db`.
+The bot calls `pinChatMessage` when a total changes from zero to a positive
+value. When the total returns to zero, it removes only a pin synchronized by
+this feature; it never clears unrelated channel pins. Multiple messages from a
+split delivery are grouped under one media item and their counts are summed in
+the ASMR ranking.
+
+The bot must be a target-channel administrator with the channel
+`can_edit_messages` right. Reaction counts are still recorded if that right is
+missing; pin errors are persisted and retried with backoff. Bot API does not
+backfill reaction totals from before the feature was enabled, so rankings begin
+with updates received afterward.
+
+Telegram channel reactions are anonymous. Bot API provides the total but
+cannot reliably attribute a native reaction to the current Panel user. The
+Panel therefore keeps the concepts explicit:
+
+- `❤️ Total ranking` uses native Telegram reaction totals and sorts descending;
+- `⭐ My favorites` is the authorized user's explicit Panel favorite list,
+  also sorted by the current total.
+
+Every entry includes a URL button that opens the original channel message.
+Public channels use `t.me/<username>/<message_id>`; private-channel links use
+the member-only `t.me/c/...` form.
+
 ## Open the panel
 
 1. Save the `[control]` settings and restart the service with the command for
@@ -133,6 +175,7 @@ Here `<config-stem>` means the main config filename without its final `.toml`.
 | Managed extension enablement, required flags, and private-config references | `<config-stem>.extensions.toml`; the default path is `config.extensions.toml` | `extensions enable` manages the sidecar; settings in the main config take precedence |
 | Managed private extension settings | `extensions/<config-stem>/` beside the main config | Extension setup or `extensions enable --reconfigure`; validate with `extensions doctor` |
 | Poll cursors, errors, media, jobs, deliveries, file records | `state.db` | Maintained by the running service |
+| Telegram reaction totals, pin-sync state, personal Panel favorites | `state.db` | Maintained by reaction updates and authorized Panel buttons |
 | Current panel message, navigation session, Telegram update offset | `state.db` | Maintained automatically by the panel |
 | Downloads and MTProto session | Application data directory | Maintained by the service; explicit file deletion may use the panel |
 

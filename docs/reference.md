@@ -77,7 +77,7 @@ MTProto session.
 | `[telegram]` | Enablement, token, destination, transport, media, caption |
 | `[telegram.mtproto]` | Application pair, session path, MTProto size limit |
 | `[telegram.bot_api]` | Endpoint, Bot API size limit, playable splitting |
-| `[control]` | Telegram panel endpoint, permissions, and polling |
+| `[control]` | Telegram panel endpoint, permissions, polling, and opt-in reaction favorites |
 | `[twitch]` | Helix credentials and VOD/live behavior |
 | `[live]` | Provider-neutral live polling, retry, worker count, and recording timeout |
 

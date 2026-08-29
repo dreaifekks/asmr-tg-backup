@@ -12,6 +12,7 @@ Telegram 控制面板把日常来源和本地资源操作集中在一条内联�
 - 启用、停用、查看和移除来源；
 - 为 Twitch 选择直播录制或结束后下载；
 - 管理全局来源过滤器，并查看轮询或任务状态；
+- 按 Telegram reaction 总数浏览频道收藏排行，并维护个人 Panel 收藏；
 - 浏览已跟踪的本地文件，并按需开启经过确认的磁盘删除。
 
 启用来源扩展并重启服务后，Panel 会增加对应的提供方按钮。需要创建来源并开始轮询时，
@@ -29,6 +30,7 @@ poll_interval_seconds = 10
 panel_idle_timeout_seconds = 3600
 delete_webhook_on_startup = true
 allow_disk_delete = false
+reaction_favorites_enabled = false
 allowed_user_ids = ["123456789"]
 allowed_chat_ids = []
 allowed_message_thread_ids = []
@@ -72,6 +74,37 @@ api_base = "http://127.0.0.1:18081"
 按照服务文档完成 bot 迁移，再修改配置并重启。迁移期间让云端与本地的 `getUpdates`
 consumer 保持互斥。
 
+## Reaction 收藏与频道置顶
+
+在目标是 Telegram 频道时，可以明确开启 reaction 收藏：
+
+```toml
+[control]
+enabled = true
+reaction_favorites_enabled = true
+```
+
+启用后，控制面会显式订阅 Bot API 的 `message_reaction_count` 更新。只有 SQLite
+`deliveries` 中属于当前目标频道的消息会被接受；收到的每种 reaction 计数、总数、消息
+ID、更新时间与置顶同步状态都保存在 `state.db`。总数从 0 变为正数时，bot 使用
+`pinChatMessage` 置顶该消息；总数回到 0 时，只会撤销由这套功能同步过的置顶，不会批量
+清空频道的其他置顶消息。分段投递的多个消息归入同一个 ASMR，总排行会合计这些消息的
+reaction 数。
+
+bot 必须是目标频道管理员，并具有频道的编辑消息权限（Bot API 中为
+`can_edit_messages`）。缺少权限时 reaction 数据仍会入库，置顶同步会记录错误并退避
+重试。Bot API 不会回填启用前的历史 reaction 计数，因此排行从启用后收到的更新开始。
+
+频道 reaction 在 Telegram 中是匿名的，Bot API 只能提供总数，不能可靠判断某一次
+reaction 是否来自当前 Panel 用户。Panel 因而明确分成两种视图：
+
+- `❤️ 总排行`：原生 Telegram reaction 的总数，按数量从多到少；
+- `⭐ 我的收藏`：当前授权用户通过 Panel 的收藏按钮建立的个人列表，同样按总 reaction
+  数排序。
+
+每一项都有直达原频道消息的 URL 按钮。公开频道使用 `t.me/<username>/<message_id>`；
+私有频道使用仅成员可访问的 `t.me/c/...` 消息链接。
+
 ## 打开控制面板
 
 1. 保存 `[control]` 配置，并按照对应的[部署方式](../operations.md)重启服务。
@@ -114,6 +147,7 @@ SQLite 运行时镜像。手工编辑同一文件并执行 `asmr-tg-backup sourc
 | 受管扩展的启用状态、required 标记和私密配置引用 | `<config-stem>.extensions.toml`；默认路径是 `config.extensions.toml` | `extensions enable` 管理该 sidecar；主配置中的设置优先 |
 | 受管私密扩展配置 | 主配置旁的 `extensions/<config-stem>/` | 扩展 setup 或 `extensions enable --reconfigure`；使用 `extensions doctor` 校验 |
 | 轮询游标、错误、媒体、任务、投递和文件记录 | `state.db` | 由服务运行时维护 |
+| Telegram reaction 总数、置顶同步状态和个人 Panel 收藏 | `state.db` | 由 reaction 更新与授权 Panel 按钮维护 |
 | 当前 Panel 消息、会话导航和 Telegram update offset | `state.db` | 由 Panel 自动维护 |
 | 下载文件和 MTProto session | 应用数据目录 | 由服务维护；文件删除可在 Panel 中明确执行 |
 
