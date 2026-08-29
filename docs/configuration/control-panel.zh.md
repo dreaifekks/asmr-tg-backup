@@ -12,7 +12,7 @@ Telegram 控制面板把日常来源和本地资源操作集中在一条内联�
 - 启用、停用、查看和移除来源；
 - 为 Twitch 选择直播录制或结束后下载；
 - 管理全局来源过滤器，并查看轮询或任务状态；
-- 按 Telegram reaction 总数浏览频道收藏排行，并维护个人 Panel 收藏；
+- 按频道收藏总数浏览排行，并维护个人 Panel 收藏；
 - 浏览已跟踪的本地文件，并按需开启经过确认的磁盘删除。
 
 启用来源扩展并重启服务后，Panel 会增加对应的提供方按钮。需要创建来源并开始轮询时，
@@ -74,9 +74,10 @@ api_base = "http://127.0.0.1:18081"
 按照服务文档完成 bot 迁移，再修改配置并重启。迁移期间让云端与本地的 `getUpdates`
 consumer 保持互斥。
 
-## Reaction 收藏与频道置顶
+## 收藏与频道置顶
 
-在目标是 Telegram 频道时，可以明确开启 reaction 收藏：
+在目标是 Telegram 频道时，可以明确开启收藏功能。底层仍使用 Telegram 原生
+reaction，但 Panel 统一显示为“收藏”：
 
 ```toml
 [control]
@@ -147,7 +148,7 @@ SQLite 运行时镜像。手工编辑同一文件并执行 `asmr-tg-backup sourc
 | 受管扩展的启用状态、required 标记和私密配置引用 | `<config-stem>.extensions.toml`；默认路径是 `config.extensions.toml` | `extensions enable` 管理该 sidecar；主配置中的设置优先 |
 | 受管私密扩展配置 | 主配置旁的 `extensions/<config-stem>/` | 扩展 setup 或 `extensions enable --reconfigure`；使用 `extensions doctor` 校验 |
 | 轮询游标、错误、媒体、任务、投递和文件记录 | `state.db` | 由服务运行时维护 |
-| Telegram reaction 总数、置顶同步状态和个人 Panel 收藏 | `state.db` | 由 reaction 更新与授权 Panel 按钮维护 |
+| Telegram 收藏总数、置顶同步状态和个人 Panel 收藏 | `state.db` | 由 reaction 更新与授权 Panel 按钮维护 |
 | 当前 Panel 消息、会话导航和 Telegram update offset | `state.db` | 由 Panel 自动维护 |
 | 下载文件和 MTProto session | 应用数据目录 | 由服务维护；文件删除可在 Panel 中明确执行 |
 

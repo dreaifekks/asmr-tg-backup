@@ -87,7 +87,7 @@ the local server, stop the application, complete the server's documented bot
 migration, update the field, and restart. Keep cloud and local `getUpdates`
 consumers mutually exclusive throughout the move.
 
-## Reaction favorites and channel pins
+## Favorites and channel pins
 
 When the delivery target is a Telegram channel, reaction favorites are an
 explicit opt-in:

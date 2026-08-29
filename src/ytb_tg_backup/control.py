@@ -710,7 +710,7 @@ class ControlBot:
             return
         if action in {"reactions", "reactionsrefresh"}:
             if not self.config.control.reaction_favorites_enabled:
-                raise ValueError("Telegram reaction 收藏尚未启用")
+                raise ValueError("Telegram 收藏尚未启用")
             scope = parts[2] if len(parts) > 2 else "total"
             if scope not in {"total", "mine"}:
                 raise ValueError("invalid reaction ranking scope")
@@ -726,7 +726,7 @@ class ControlBot:
             return
         if action == "reactionfav":
             if not self.config.control.reaction_favorites_enabled:
-                raise ValueError("Telegram reaction 收藏尚未启用")
+                raise ValueError("Telegram 收藏尚未启用")
             if len(parts) != 3 or not parts[2].isdigit():
                 raise ValueError("invalid reaction favorite action")
             user_id = str((message.get("from") or {}).get("id") or "")
@@ -1408,7 +1408,7 @@ class ControlBot:
         ]
         if self.config.control.reaction_favorites_enabled:
             keyboard.append(
-                [_button("❤️ Reaction 收藏", "p:reactions:total:0"), _button("📊 状态", "p:stats")]
+                [_button("❤️ 收藏", "p:reactions:total:0"), _button("📊 状态", "p:stats")]
             )
             keyboard.append([_button("🔎 过滤器", "p:filter")])
         else:
@@ -1563,11 +1563,11 @@ class ControlBot:
 
         if scope == "total":
             lines = [
-                f"❤️ Telegram Reaction 排行  {page + 1}/{page_count}",
+                f"❤️ 收藏排行  {page + 1}/{page_count}",
                 "",
-                f"有 reaction 的 ASMR：{total}",
-                "按原生 Telegram reaction 总数从多到少排列。",
-                "总数大于 0 的投递消息会保持置顶。",
+                f"有频道收藏的 ASMR：{total}",
+                "按频道收藏总数从多到少排列。",
+                "收藏数大于 0 的投递消息会保持置顶。",
                 "",
             ]
         else:
@@ -1575,8 +1575,8 @@ class ControlBot:
                 f"⭐ 我的收藏  {page + 1}/{page_count}",
                 "",
                 f"我收藏的 ASMR：{total}",
-                "频道 reaction 是匿名的；此页由 Panel 收藏按钮记录。",
-                "列表仍按 Telegram reaction 总数从多到少排列。",
+                "频道收藏是匿名的；此页由 Panel 收藏按钮记录。",
+                "列表仍按频道收藏总数从多到少排列。",
                 "",
             ]
 
@@ -1623,7 +1623,7 @@ class ControlBot:
             keyboard.append(row)
         if not items:
             lines.append(
-                "（还没有 Telegram reaction）"
+                "（还没有频道收藏）"
                 if scope == "total"
                 else "（还没有 Panel 收藏）"
             )
@@ -1807,7 +1807,7 @@ class ControlBot:
             )
             if reaction_summary is not None:
                 lines.append(
-                    "Reaction："
+                    "收藏："
                     f"❤️ {int(reaction_summary['total_count'])}；"
                     f"我的收藏：{'是' if reaction_summary['is_favorite'] else '否'}"
                 )

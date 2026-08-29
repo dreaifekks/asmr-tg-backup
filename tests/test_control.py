@@ -446,6 +446,8 @@ allowed_user_ids = ["123"]
                 total_text, total_keyboard = bot._render_reactions_panel(
                     total_state
                 )
+                self.assertIn("收藏排行", total_text)
+                self.assertNotIn("Reaction 排行", total_text)
                 self.assertIn("Reaction Panel ASMR", total_text)
                 self.assertIn("❤️ 4", total_text)
                 self.assertIn(
