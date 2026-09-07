@@ -137,6 +137,44 @@ the member-only `t.me/c/...` form.
 
 ## Source management
 
+### Back up one video
+
+After selecting `➕ YouTube`, send `@handle [display name]` to subscribe as before,
+or send a video URL directly, optionally prefixed with `url`:
+
+```text
+https://www.youtube.com/watch?v=abcdefghijk
+url "https://youtu.be/abcdefghijk"
+```
+
+YouTube watch, youtu.be, Shorts, live, and embed video URLs are supported.
+Playlist and sharing parameters are removed from video links; a playlist-only
+URL is rejected. Ordinary channel URLs still subscribe, while `url "channel URL"`
+is rejected.
+
+For Twitch, select the source type and recording mode, then send
+`https://www.twitch.tv/videos/123456` or `url "https://www.twitch.tv/videos/123456"`.
+The configured Twitch API credentials resolve that video ID and its actual type
+(VOD, Highlight, or Upload), regardless of the selected subscription mode.
+No channel scan or channel recording starts. Clips and live channel URLs are
+not supported in single-video mode.
+
+Submit one URL at a time. A single-video request does not change `sources.toml`
+or subscribe to future uploads. It bypasses the global source keyword filter
+and new-video download delay, then uses the existing download, conversion,
+local storage, and configured Telegram delivery pipeline. Access restrictions,
+not-ready deferrals, and retries still apply. Repeated requests reuse existing
+jobs; successful or uncertain deliveries are not resent, and blocked jobs
+still require the existing recovery workflow.
+
+Extension providers can opt in through `resolve_media_url`; the Panel displays
+URL instructions for providers that implement it. Older extensions retain their
+source identifier input and reject explicit `url` requests as unsupported.
+
+The command form also works: `/origin add youtube url "https://youtu.be/abcdefghijk"`.
+
+### Manage subscriptions
+
 The panel buttons can:
 
 - add, enable, disable, and remove YouTube, Twitch, and enabled extension

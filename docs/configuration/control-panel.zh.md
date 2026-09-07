@@ -115,6 +115,37 @@ reaction 是否来自当前 Panel 用户。Panel 因而明确分成两种视图�
 
 ## 来源管理
 
+### 只备份一个视频
+
+选择 `➕ YouTube` 后，仍可发送 `@handle [显示名称]` 来订阅频道；也可以直接
+发送视频链接，或使用显式的 `url` 写法：
+
+```text
+https://www.youtube.com/watch?v=abcdefghijk
+url "https://youtu.be/abcdefghijk"
+```
+
+支持 YouTube watch、youtu.be 短链接、Shorts、live 和 embed 视频链接。
+链接附带播放列表或分享参数时，仅提取其中的视频 ID；纯播放列表链接会被拒绝。
+普通频道 URL 继续用于订阅，`url "频道链接"` 会报错。
+
+Twitch 在选择来源类型、录制模式后，同样可以发送
+`https://www.twitch.tv/videos/123456` 或 `url "https://www.twitch.tv/videos/123456"`。
+核心使用已配置的 Twitch API 凭据按视频 ID 查询实际类型（VOD、Highlights 或 Uploads），
+不扫描主播频道，也不会因选了直播录制模式而开始录制频道。暂不支持 Clips 或频道直播 URL。
+
+每次只接受一个视频链接。单视频任务不写入 `sources.toml`，不会持续订阅来源；跳过
+全局来源关键词过滤和新视频下载延迟，随后沿用下载、转换、本地保存和已配置的 Telegram
+投递流程。权限限制、未就绪视频等待和失败重试仍然生效。重复提交同一视频会复用已有任务，
+不会重新发送已成功或送达状态不确定的投递；阻断任务仍需按原有流程处理。
+
+扩展来源需实现可选的 `resolve_media_url` 接口才支持此模式；支持后，Panel 会自动显示
+URL 输入提示。旧扩展继续使用原来的来源标识输入，显式 `url` 会提示暂不支持。
+
+命令方式也支持：`/origin add youtube url "https://youtu.be/abcdefghijk"`。
+
+### 管理订阅
+
 Panel 按钮可以：
 
 - 添加、启用、停用和移除 YouTube、Twitch 及已启用扩展的来源；

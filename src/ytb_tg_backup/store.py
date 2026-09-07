@@ -3670,6 +3670,7 @@ class Store:
         decision_reason: str | None = None,
         max_failures: int = 5,
         job_payload: dict[str, object] | None = None,
+        preserve_existing: bool = False,
     ) -> tuple[int, bool]:
         now = now_iso()
         existing = self.conn.execute(
@@ -3693,6 +3694,7 @@ class Store:
               visibility=excluded.visibility,
               metadata_json=excluded.metadata_json,
               last_seen_at=excluded.last_seen_at
+            WHERE NOT ?
             """,
             (
                 candidate.provider,
@@ -3707,6 +3709,7 @@ class Store:
                 json.dumps(candidate.metadata, ensure_ascii=False, sort_keys=True),
                 now,
                 now,
+                preserve_existing,
             ),
         )
         media_id = int(
@@ -5224,7 +5227,7 @@ class Store:
         return list(
             self.conn.execute(
                 """
-                SELECT o.id, o.name, oi.disposition
+                SELECT o.id, o.name, o.kind, o.managed_by, oi.disposition
                 FROM origin_items oi JOIN origins o ON o.id=oi.origin_id
                 WHERE oi.media_id=? ORDER BY oi.first_seen_at, o.id
                 """,
@@ -5440,6 +5443,25 @@ class Store:
             ),
         )
         return video_id
+
+    def enqueue_single_video(self, candidate: MediaCandidate, *, max_failures: int = 5) -> int:
+        """Link an explicit request without subscribing or replacing known metadata."""
+        origin_id = f"manual-url:{candidate.provider}"
+        self.upsert_origin(
+            Origin(
+                id=origin_id, provider=candidate.provider, kind="manual_url",
+                external_id=origin_id, name=f"手动备份 · {candidate.provider}",
+                enabled=False,
+            ),
+            # Like CLI manual origins, retain this relationship across catalog
+            # refreshes and exclude it from managed subscriptions.
+            managed_by="legacy",
+        )
+        media_id, _ = self.upsert_discovered(
+            origin_id, candidate, decision_code="manual_url",
+            max_failures=max_failures, preserve_existing=True,
+        )
+        return media_id
 
     def upsert_subscription(
         self,

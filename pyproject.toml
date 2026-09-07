@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asmr-tg-backup"
-version = "0.6.7"
+version = "0.6.8"
 description = "Extensible media archiving with yt-dlp and optional Telegram delivery."
 readme = "README.md"
 license = "Apache-2.0"

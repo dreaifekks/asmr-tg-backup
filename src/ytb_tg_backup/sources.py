@@ -117,6 +117,34 @@ class TwitchHelixSource:
         self.http = http
         self._access_token = config.access_token
 
+    def resolve_video(self, url: str) -> MediaCandidate:
+        from .single_video import twitch_video_id
+
+        video_id = twitch_video_id(url)
+        self._validate_config()
+        payload = self._api_json("videos", {"id": video_id})
+        rows = _payload_list(payload, "data")
+        if len(rows) != 1 or not isinstance(rows[0], dict) or str(rows[0].get("id")) != video_id:
+            raise ValueError("找不到这个 Twitch 视频，可能已删除或无权访问")
+        raw = rows[0]
+        kind = {"archive": "vod", "highlight": "highlight", "upload": "upload"}.get(raw.get("type"))
+        if kind is None:
+            raise ValueError("不支持这个 Twitch 视频类型")
+        return MediaCandidate(
+            provider="twitch", content_kind=kind, external_id=video_id,
+            title=str(raw.get("title") or video_id),
+            url=f"https://www.twitch.tv/videos/{video_id}",
+            published_at=str(raw.get("published_at") or raw.get("created_at") or "") or None,
+            visibility=str(raw.get("viewable") or "public"),
+            metadata={
+                "broadcaster_id": str(raw.get("user_id") or ""),
+                "stream_id": raw.get("stream_id"),
+                "duration": raw.get("duration"),
+                "thumbnail_url": raw.get("thumbnail_url"),
+                "muted_segments": raw.get("muted_segments"),
+            },
+        )
+
     def discover(self, origin: Origin, checkpoint: str | None = None) -> DiscoveryResult:
         self._validate_config()
         previous = _decode_twitch_checkpoint(checkpoint)

@@ -31,6 +31,8 @@ from .source_catalog import (
     normalized_source_identity,
 )
 from .store import Store
+from .single_video import split_media_url, youtube_video
+from .sources import TwitchHelixSource
 from .youtube import resolve_channel_id
 
 
@@ -367,6 +369,58 @@ class ControlBot:
                 return f"error: {exc}"
         return self._origin_usage()
 
+    def _single_video_add(self, provider: str, args: list[str]) -> str | None:
+        if not args:
+            return None
+        explicit = args[0].lower() == "url"
+        values = args[1:] if explicit else args
+        if explicit and (len(values) != 1):
+            raise ValueError('请发送：url "https://视频链接"，每次只提交一个视频')
+        if not values:
+            return None
+        url = values[0]
+        if not explicit and not url.lower().startswith(("https://", "http://")):
+            return None
+        split_media_url(url)
+        if provider == "youtube":
+            candidate = youtube_video(url)
+        elif provider == "twitch":
+            if len(values) != 1:
+                raise ValueError("单视频备份每次只接受一个 URL")
+            candidate = TwitchHelixSource(self.config.twitch, self.connection).resolve_video(url)
+        elif provider in self._panel_extension_providers():
+            definition = self.source_catalog.providers.definition(provider)
+            if definition.resolve_media_url is None:
+                if explicit:
+                    raise ValueError("此来源扩展尚未支持单视频 URL 备份")
+                return None
+            candidate = definition.resolve_media_url(url)
+        else:
+            raise ValueError(f"不支持此来源的单视频 URL：{provider}")
+        if candidate is None:
+            if explicit:
+                raise ValueError("url 模式需要单视频链接，不能使用频道或搜索链接")
+            return None
+        if len(values) != 1:
+            raise ValueError("单视频备份每次只接受一个 URL")
+        if candidate.provider != provider or not candidate.external_id or not candidate.content_kind:
+            raise ValueError("来源返回了无效的视频标识")
+        split_media_url(candidate.url)
+        media_id = self.store.enqueue_single_video(candidate, max_failures=self.config.app.max_attempts)
+        job = self.store.conn.execute(
+            "SELECT state FROM jobs WHERE media_id=? AND job_type='download'",
+            (media_id,),
+        ).fetchone()
+        status = {
+            "queued": "已加入单视频备份队列",
+            "retry": "已在备份队列中等待重试",
+            "running": "此视频正在备份",
+            "succeeded": "此视频已下载，沿用现有投递状态",
+            "blocked": "此视频已有阻断任务，请查看任务状态",
+            "cancelled": "此视频已有取消任务，请查看任务状态",
+        }.get(str(job["state"]), "此视频已有备份任务")
+        return f"{status}：{candidate.external_id}\n仅处理这个视频，不订阅频道。"
+
     def _origin_add(
         self,
         args: list[str],
@@ -379,6 +433,14 @@ class ControlBot:
             return self._origin_usage()
         provider = args[0].lower()
         remaining = list(args[1:])
+        url_args = remaining
+        if provider == "youtube" and url_args[0].lower() == "uploads":
+            url_args = url_args[1:]
+        elif provider == "twitch" and url_args[0].lower() in TWITCH_KINDS:
+            url_args = url_args[1:]
+        single_reply = self._single_video_add(provider, url_args)
+        if single_reply is not None:
+            return single_reply
         if provider == "youtube":
             kind = "uploads"
             if remaining and remaining[0].lower() == "uploads":
@@ -1292,11 +1354,17 @@ class ControlBot:
                 "add_youtube": (
                     "添加 YouTube 来源\n\n"
                     "请发送：@handle [显示名称]\n"
-                    "也可以发送 UC channel ID。"
+                    "也可以发送 UC channel ID。\n\n"
+                    "仅备份一个视频：直接发送视频 URL，\n"
+                    '或 url "https://www.youtube.com/watch?v=..."。\n'
+                    "单视频模式不订阅频道，并跳过来源过滤器。"
                 ),
                 "add_twitch": (
                     "添加 Twitch 来源\n\n"
                     "请发送：主播登录名 [显示名称]\n"
+                    "仅备份一个视频：发送 https://www.twitch.tv/videos/123456\n"
+                    '或 url "https://www.twitch.tv/videos/123456"。\n'
+                    "单视频模式不订阅频道；视频类型自动识别。\n"
                     f"来源类型：{_twitch_kind_label(str(state.get('twitch_kind') or ''))}。"
                     + (
                         "\n本频道模式："
@@ -1331,6 +1399,8 @@ class ControlBot:
                         f"来源类型：{provider}/{kind}\n"
                         "来源标识包含空格时，请使用引号包住。"
                     )
+                    if providers.definition(provider).resolve_media_url is not None:
+                        text += '\n\n仅备份一个视频：直接发送视频 URL，或 url "https://..."。'
             else:
                 text = prompts.get(str(awaiting), "等待输入")
             if flash_error:

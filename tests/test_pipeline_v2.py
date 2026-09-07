@@ -30,6 +30,33 @@ def candidate(external_id: str) -> MediaCandidate:
 
 
 class PipelineV2Test(unittest.TestCase):
+    def test_manual_video_bypasses_filter_and_delay_and_delivers_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, media_id = self._service_with_media(root, "manual-video")
+            self.addCleanup(service.close)
+            service.config = replace(
+                service.config,
+                app=replace(service.config.app, download_delay_seconds=86400),
+            )
+            service.store.enqueue_single_video(candidate("manual-video"))
+            service.store.reconcile_source_catalog([], source_filter="does-not-match-anything")
+            sources = mock.Mock()
+            service._poll_origins(live_recording=None, sources=sources)
+            sources.get.assert_not_called()
+            artifact_path = root / "manual.m4a"
+            artifact_path.write_bytes(b"audio")
+            downloader = self._downloader(artifact_path)
+            telegram = mock.Mock()
+            telegram.upload.return_value = 321
+            self.assertEqual(self._run_one(service, downloader, telegram, owner="download"), 1)
+            self.assertEqual(self._run_one(service, downloader, telegram, owner="delivery"), 1)
+            self.assertEqual(service.store.enqueue_single_video(candidate("manual-video")), media_id)
+            self.assertEqual(self._run_one(service, downloader, telegram, owner="duplicate"), 0)
+            downloader.download.assert_called_once()
+            telegram.upload.assert_called_once()
+            self.assertEqual(service.store.conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0], 1)
+
     def test_standard_download_cancellation_is_deferred_for_clean_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

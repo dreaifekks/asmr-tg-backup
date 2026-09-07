@@ -424,6 +424,18 @@ If every media URL from the provider needs a route capability such as
 `websocket`, declare it in `SourceProviderDefinition.route_features`; a network
 policy can then reject incompatible endpoints before starting yt-dlp.
 
+Providers can optionally define `SourceProviderDefinition.resolve_media_url`, a
+callable taking a URL and returning one `MediaCandidate`. Use the same provider,
+content kind, external ID, and metadata as normal discovery so downloads and
+deliveries deduplicate. Validate the host and exact video path, strip collection
+parameters, and return a canonical single-video URL. Return `None` for a valid
+subscription URL, or raise `ValueError` for invalid or unsupported input. This
+resolver must not subscribe, enumerate collections, or download media. Return
+ordinary video/archive candidates, not channel live-recording candidates that
+require an enabled origin. The core queues the candidate durably and displays
+single-video input instructions in the Panel. The default is `None`, preserving
+existing extension registration; explicit `url` requests then report unsupported.
+
 An extension can optionally keep onboarding outside its runtime object by
 publishing a setup entry point with the same ID:
 

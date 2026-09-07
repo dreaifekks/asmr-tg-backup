@@ -379,6 +379,14 @@ Entry-point factory 返回带 `ExtensionManifest` 和 `register`、`start`、`st
 `SourceProviderDefinition.route_features` 中声明；网络 policy 就能在启动 yt-dlp 前
 排除不兼容端点。
 
+提供方可选实现 `SourceProviderDefinition.resolve_media_url`：接收一个 URL，返回
+一个 `MediaCandidate`。provider、content_kind、external_id 和元数据必须与正常发现
+保持一致，才能复用下载和投递去重。校验域名和具体视频路径，去掉合集参数，返回规范的
+单视频 URL；有效订阅 URL 返回 `None`，无效或不支持的输入抛出 `ValueError`。
+解析器不能订阅来源、遍历合集或下载媒体。返回普通视频/归档候选，不要返回依赖启用来源
+的频道直播录制候选。核心负责持久入队，并自动在 Panel 显示单视频输入提示。该字段默认
+为 `None`，旧扩展无需修改注册代码；此时显式 `url` 请求会提示暂不支持。
+
 扩展也可以使用相同 ID 发布独立 setup entry point，把安装交互留在扩展仓库而不是
 runtime 对象中：
 

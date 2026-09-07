@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from .models import DiscoveryResult, Origin
+from .models import DiscoveryResult, MediaCandidate, Origin
 
 
 EXTENSION_API_LEVEL = 1
@@ -156,6 +156,9 @@ class SourceProviderDefinition:
     seed_content_kind: OriginText
     poll_variant: OriginText
     route_features: frozenset[str] = frozenset()
+    # Return one canonical candidate, None for a subscription URL, or raise
+    # ValueError for unsupported URLs. Existing extensions need not implement it.
+    resolve_media_url: Callable[[str], MediaCandidate | None] | None = None
 
     def __post_init__(self) -> None:
         provider = self.provider.strip().lower()

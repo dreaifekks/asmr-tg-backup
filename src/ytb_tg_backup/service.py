@@ -1008,7 +1008,11 @@ class BackupService:
 
         source_filter_pattern, source_filter = self._compiled_source_filter(store)
         origin_rows = store.media_origins(job.media_id)
-        if source_filter is not None and not any(
+        manual_request = any(
+            row["kind"] == "manual_url" and row["managed_by"] == "legacy"
+            for row in origin_rows
+        )
+        if not manual_request and source_filter is not None and not any(
             text_matches_source_filter(source_filter, row["id"], row["name"], media["title"])
             for row in origin_rows
         ):
@@ -1040,7 +1044,7 @@ class BackupService:
                 return
             force_redownload = True
 
-        if not live_recording and not self._download_delay_elapsed(str(media["first_seen_at"])):
+        if not manual_request and not live_recording and not self._download_delay_elapsed(str(media["first_seen_at"])):
             store.defer_job(job, reason_code="download_delay", error="waiting for download delay", retry_seconds=60)
             return
 
