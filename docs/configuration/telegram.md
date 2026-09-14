@@ -74,6 +74,11 @@ bot token and does not replace it.
 
 ## Transport selection
 
+When FFmpeg is enabled, uploaded thumbnails are square JPEGs up to 320×320:
+the source image is center-cropped to a square, then scaled proportionally without
+stretching or adding borders. This applies to newly uploaded media; existing
+messages keep their covers.
+
 `upload_transport` selects the media uploader:
 
 - `mtproto` uploads through one persistent MTProto client and does not need a

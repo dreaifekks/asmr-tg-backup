@@ -745,7 +745,9 @@ class Downloader:
                 "-i",
                 str(source),
                 "-vf",
-                "scale='min(320,iw)':'min(320,ih)':force_original_aspect_ratio=decrease",
+                # Center-crop a square cover without stretching or adding borders.
+                "crop='min(iw,ih)':'min(iw,ih)':(iw-ow)/2:(ih-oh)/2:exact=1,"
+                "scale='min(320,iw)':-1,setsar=1",
                 "-frames:v",
                 "1",
                 "-q:v",

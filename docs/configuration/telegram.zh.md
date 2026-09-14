@@ -68,6 +68,10 @@ ASMR_TG_MTPROTO_API_HASH=0123456789abcdef0123456789abcdef
 
 ## 选择 transport
 
+启用 FFmpeg 时，上传封面会生成最大 320×320 的正方形 JPEG：原图居中裁切为正方形
+（横图裁左右、竖图裁上下），再等比缩小，不拉伸、不补黑边。此处理适用于新上传的
+媒体，已有消息的封面保持原样。
+
 `upload_transport` 决定媒体上传器：
 
 - `mtproto` 通过一个持久化 MTProto client 上传，不需要额外 Bot API 服务；
