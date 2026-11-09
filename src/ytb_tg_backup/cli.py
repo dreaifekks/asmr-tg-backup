@@ -405,6 +405,10 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(args.config or "config.toml")
     _configure_logging(config.app.log_level)
 
+    if args.command == "status":
+        _print_status(config, args.limit)
+        return 0
+
     service = BackupService(config)
     try:
         if args.command == "init":
@@ -432,10 +436,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "process":
             service.initialize()
             service.process_pending()
-            return 0
-        if args.command == "status":
-            service.initialize()
-            _print_status(config, args.limit)
             return 0
         if args.command == "enqueue":
             service.initialize()
@@ -585,17 +585,22 @@ def _configure_logging(level: str) -> None:
 
 
 def _print_status(config, limit: int) -> None:
-    store = Store(config.db_path)
-    store.initialize()
-    counts = store.counts_by_status()
-    if counts:
-        print("counts:")
-        for status, count in sorted(counts.items()):
-            print(f"  {status}: {count}")
-    else:
+    if not config.db_path.exists():
         print("counts: none")
-    print("recent:")
-    for row in store.list_recent(limit):
-        error = f" error={row['last_error']}" if row["last_error"] else ""
-        print(f"  {row['status']:13} {row['video_id']} {row['title']}{error}")
-    store.close()
+        print("recent:")
+        return
+    store = Store(config.db_path, readonly=True)
+    try:
+        counts = store.counts_by_status()
+        if counts:
+            print("counts:")
+            for status, count in sorted(counts.items()):
+                print(f"  {status}: {count}")
+        else:
+            print("counts: none")
+        print("recent:")
+        for row in store.list_recent(limit):
+            error = f" error={row['last_error']}" if row["last_error"] else ""
+            print(f"  {row['status']:13} {row['video_id']} {row['title']}{error}")
+    finally:
+        store.close()

@@ -434,8 +434,15 @@ class Subscription:
 class Store:
     CURRENT_SCHEMA_VERSION = 2
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, readonly: bool = False):
         self.path = path
+        self._readonly = readonly
+        self._closed = True
+        if readonly:
+            self.conn = sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=30)
+            self.conn.row_factory = sqlite3.Row
+            self._closed = False
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             self.path.parent.chmod(0o700)
@@ -458,7 +465,8 @@ class Store:
             return
         self.conn.close()
         self._closed = True
-        self._harden_sqlite_permissions()
+        if not self._readonly:
+            self._harden_sqlite_permissions()
 
     def __del__(self) -> None:
         try:

@@ -33,6 +33,38 @@ class CliTest(unittest.TestCase):
             legacy_sources_declared=False,
         )
 
+    def test_status_reads_database_without_starting_service_or_changing_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(f'[app]\ndata_dir = "{tmp}"')
+            config = load_config(config_path)
+
+            def status() -> str:
+                output = io.StringIO()
+                with (
+                    mock.patch("ytb_tg_backup.cli.BackupService", side_effect=AssertionError("status started service")),
+                    redirect_stdout(output),
+                ):
+                    self.assertEqual(main(["status", "--config", str(config_path)]), 0)
+                return output.getvalue()
+
+            self.assertEqual(status(), "counts: none\nrecent:\n")
+            self.assertFalse(config.db_path.exists())
+
+            store = Store(config.db_path)
+            store.initialize()
+            store.enqueue_manual("https://www.youtube.com/watch?v=abcdefghijk", title="Example")
+            store.close()
+            before = config.db_path.read_bytes()
+            mode = config.db_path.stat().st_mode
+            output = status()
+            self.assertIn("seen: 1", output)
+            self.assertIn("Example", output)
+            self.assertEqual(config.db_path.read_bytes(), before)
+            self.assertEqual(config.db_path.stat().st_mode, mode)
+            self.assertFalse(config.sources.path.exists())
+
     def test_version_does_not_load_config(self):
         output = io.StringIO()
         with (
