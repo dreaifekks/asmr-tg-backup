@@ -44,81 +44,26 @@ class ControlBotTest(unittest.TestCase):
     def test_http_429_uses_retry_after_and_blocks_immediate_follow_up(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
-            config_path.write_text(
-                f"""
-[app]
-data_dir = "{tmp}"
-
-[telegram]
-bot_token = "secret-token"
-""".strip()
-            )
-            bot = ControlBot(
-                load_config(config_path),
-                mock.Mock(),
-                logging.getLogger("test"),
-            )
-            response = HTTPError(
-                "https://api.telegram.org/botsecret-token/getUpdates",
-                429,
-                "Too Many Requests",
-                {"Retry-After": "17"},
-                BytesIO(
-                    b'{"ok":false,"error_code":429,'
-                    b'"description":"Too Many Requests"}'
-                ),
-            )
-            with mock.patch(
-                "ytb_tg_backup.control.urlopen",
-                side_effect=response,
+            config_path.write_text(f'[app]\ndata_dir = "{tmp}"\n[telegram]\nbot_token = "secret-token"')
+            config = load_config(config_path)
+            for headers, parameters, delay in (
+                ({"Retry-After": "17"}, {}, 17),
+                ({}, {"retry_after": 23}, 23),
             ):
-                with self.assertRaises(ControlApiError) as raised:
-                    bot._api("getUpdates", {})
-
-            self.assertEqual(raised.exception.status, 429)
-            self.assertEqual(raised.exception.error_code, 429)
-            self.assertEqual(raised.exception.retry_after, 17)
-            with mock.patch("ytb_tg_backup.control.urlopen") as follow_up:
-                with self.assertRaises(ControlApiError) as gated:
-                    bot._api("getUpdates", {})
-            follow_up.assert_not_called()
-            self.assertGreaterEqual(gated.exception.retry_after, 16)
-
-    def test_routed_429_parses_telegram_retry_after(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.toml"
-            config_path.write_text(
-                f"""
-[app]
-data_dir = "{tmp}"
-
-[telegram]
-bot_token = "secret-token"
-""".strip()
-            )
-            connection = mock.Mock()
-            connection.request.return_value = HttpResponse(
-                429,
-                "https://api.telegram.org/botsecret-token/getUpdates",
-                {},
-                (
-                    b'{"ok":false,"error_code":429,'
-                    b'"description":"Too Many Requests",'
-                    b'"parameters":{"retry_after":23}}'
-                ),
-            )
-            bot = ControlBot(
-                load_config(config_path),
-                mock.Mock(),
-                logging.getLogger("test"),
-                connection=connection,
-            )
-
-            with self.assertRaises(ControlApiError) as raised:
-                bot._api("getUpdates", {})
-
-            self.assertEqual(raised.exception.retry_after, 23)
-            self.assertEqual(connection.request.call_count, 1)
+                with self.subTest(delay=delay):
+                    bot = ControlBot(config, mock.Mock(), logging.getLogger("test"))
+                    error = HTTPError(
+                        "https://api.telegram.org/botsecret-token/getUpdates", 429,
+                        "Too Many Requests", headers,
+                        BytesIO(json.dumps({"ok": False, "error_code": 429, "parameters": parameters}).encode()),
+                    )
+                    with mock.patch("ytb_tg_backup.network.urlopen", side_effect=error) as request:
+                        with self.assertRaises(ControlApiError) as raised:
+                            bot._api("getUpdates", {})
+                        self.assertEqual(raised.exception.retry_after, delay)
+                        with self.assertRaises(ControlApiError):
+                            bot._api("getUpdates", {})
+                        request.assert_called_once()
 
     def test_panel_edit_rate_limit_does_not_fall_back_to_send(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -171,6 +116,7 @@ bot_token = "secret-token"
             bot = ControlBot(config, mock.Mock(), logging.getLogger("test"))
             response = mock.MagicMock()
             response.__enter__.return_value = response
+            response.status = 200
             response.read.return_value = b'{"ok": true, "result": true}'
             opener = mock.Mock()
             opener.open.return_value = response
@@ -178,14 +124,14 @@ bot_token = "secret-token"
 
             with (
                 mock.patch(
-                    "ytb_tg_backup.control.ProxyHandler",
+                    "ytb_tg_backup.network.ProxyHandler",
                     return_value=proxy_handler,
                 ) as proxy_handler_factory,
                 mock.patch(
-                    "ytb_tg_backup.control.build_opener",
+                    "ytb_tg_backup.network.build_opener",
                     return_value=opener,
                 ) as build_opener,
-                mock.patch("ytb_tg_backup.control.urlopen") as urlopen,
+                mock.patch("ytb_tg_backup.network.urlopen") as urlopen,
             ):
                 result = bot._api("getMe", {}, request_timeout_seconds=17)
 
@@ -216,12 +162,13 @@ bot_token = "secret-token"
             bot = ControlBot(config, mock.Mock(), logging.getLogger("test"))
             response = mock.MagicMock()
             response.__enter__.return_value = response
+            response.status = 200
             response.read.return_value = b'{"ok": true, "result": true}'
 
             with (
-                mock.patch("ytb_tg_backup.control.build_opener") as build_opener,
+                mock.patch("ytb_tg_backup.network.build_opener") as build_opener,
                 mock.patch(
-                    "ytb_tg_backup.control.urlopen",
+                    "ytb_tg_backup.network.urlopen",
                     return_value=response,
                 ) as urlopen,
             ):
@@ -548,7 +495,7 @@ default_routes = ["live"]
             self.assertFalse(bot._authorized({"from": {"id": 123}, "chat": {"id": -100}, "message_thread_id": 99}))
             self.assertFalse(bot._authorized({"from": {"id": 456}, "chat": {"id": -200}, "message_thread_id": 99}))
 
-            def fake_resolve(channel_ref: str, yt_dlp: str) -> str:
+            def fake_resolve(channel_ref: str, yt_dlp: str, connection) -> str:
                 self.assertEqual(channel_ref, "@nightmare")
                 return "UCnightmare11111111111111"
 

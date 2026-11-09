@@ -1,38 +1,28 @@
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 import unittest
 from unittest import mock
 
 from ytb_tg_backup.config import TwitchConfig
+from ytb_tg_backup.extension_api import HttpResponse
+from ytb_tg_backup.extensions import RuntimeBuilder
 from ytb_tg_backup.models import MediaCandidate, Origin
 from ytb_tg_backup.network import ConnectionRuntime
 from ytb_tg_backup.sources import (
     RssSource,
     SourceError,
-    SourceRegistry,
+    register_builtin_source_providers,
     TwitchHelixSource,
     YouTubePublicSource,
     _next_tokyo_noon,
 )
 from ytb_tg_backup.youtube import list_recent_channel_videos
-
-
-class _JsonResponse:
-    def __init__(self, payload):
-        self.body = json.dumps(payload).encode("utf-8")
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, traceback):
-        return False
-
-    def read(self, size: int = -1):
-        return self.body if size < 0 else self.body[:size]
 
 
 def _twitch_origin(*, bootstrap: str = "all") -> Origin:
@@ -255,54 +245,32 @@ class TwitchHelixSourceTest(unittest.TestCase):
         self.assertEqual(api_json.call_count, 2)
 
     def test_401_refreshes_app_token_and_retries_once(self):
+        http = mock.Mock()
         source = TwitchHelixSource(
-            TwitchConfig(
-                client_id="client-id",
-                access_token="expired-token",
-                client_secret="client-secret",
-            )
+            TwitchConfig(client_id="client-id", access_token="expired-token", client_secret="client-secret"),
+            http,
         )
-        unauthorized = HTTPError(
-            "https://api.twitch.tv/helix/videos",
-            401,
-            "Unauthorized",
-            {},
-            None,
-        )
-        self.addCleanup(unauthorized.close)
         success = {
             "data": [_video("200", published_at="2026-07-22T12:00:00Z")],
             "pagination": {},
         }
-
-        with mock.patch(
-            "ytb_tg_backup.sources.urlopen",
-            side_effect=(
-                unauthorized,
-                _JsonResponse({"access_token": "fresh-token"}),
-                _JsonResponse(success),
-            ),
-        ) as urlopen:
-            result = source.discover(_twitch_origin(bootstrap="latest"))
-
+        http.request.side_effect = [
+            HttpResponse(401, "", {}, b"{}"),
+            HttpResponse(200, "", {}, b'{"access_token":"fresh-token"}'),
+            HttpResponse(200, "", {}, json.dumps(success).encode()),
+        ]
+        result = source.discover(_twitch_origin(bootstrap="latest"))
         self.assertEqual([item.external_id for item in result.items], ["200"])
         self.assertEqual(source._access_token, "fresh-token")
-        self.assertEqual(urlopen.call_count, 3)
-
-        first_request = urlopen.call_args_list[0].args[0]
-        oauth_request = urlopen.call_args_list[1].args[0]
-        retry_request = urlopen.call_args_list[2].args[0]
-        self.assertEqual(first_request.get_header("Authorization"), "Bearer expired-token")
-        self.assertEqual(retry_request.get_header("Authorization"), "Bearer fresh-token")
-        self.assertEqual(urlsplit(oauth_request.full_url).path, "/oauth2/token")
-        self.assertEqual(
-            parse_qs(oauth_request.data.decode("ascii")),
-            {
-                "client_id": ["client-id"],
-                "client_secret": ["client-secret"],
-                "grant_type": ["client_credentials"],
-            },
-        )
+        self.assertEqual(http.request.call_count, 3)
+        first, oauth, retry = [call.args[0] for call in http.request.call_args_list]
+        self.assertEqual(first.headers["Authorization"], "Bearer expired-token")
+        self.assertEqual(retry.headers["Authorization"], "Bearer fresh-token")
+        self.assertEqual(urlsplit(oauth.url).path, "/oauth2/token")
+        self.assertEqual(parse_qs(oauth.body.decode()), {
+            "client_id": ["client-id"], "client_secret": ["client-secret"],
+            "grant_type": ["client_credentials"],
+        })
 
     def test_deleted_checkpoint_uses_published_watermark_as_safe_boundary(self):
         source = TwitchHelixSource(
@@ -604,7 +572,11 @@ class RssSourceTest(unittest.TestCase):
 
 class SourceRegistryTest(unittest.TestCase):
     def test_registry_contains_youtube_and_twitch_adapters(self):
-        registry = SourceRegistry(TwitchConfig())
+        builder = RuntimeBuilder()
+        register_builtin_source_providers(builder.scoped("core"), SimpleNamespace(twitch=TwitchConfig()))
+        registry = builder.build(
+            host=mock.Mock(), logger=logging.getLogger("test"), data_dir=Path("."),
+        ).create_source_registry()
 
         youtube = registry.get("youtube")
         twitch = registry.get("twitch")
@@ -614,7 +586,11 @@ class SourceRegistryTest(unittest.TestCase):
         self.assertEqual(twitch.provider, "twitch")
 
     def test_registry_rejects_unknown_provider(self):
-        registry = SourceRegistry(TwitchConfig())
+        builder = RuntimeBuilder()
+        register_builtin_source_providers(builder.scoped("core"), SimpleNamespace(twitch=TwitchConfig()))
+        registry = builder.build(
+            host=mock.Mock(), logger=logging.getLogger("test"), data_dir=Path("."),
+        ).create_source_registry()
 
         with self.assertRaises(SourceError) as caught:
             registry.get("unknown")

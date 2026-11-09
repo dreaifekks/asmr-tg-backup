@@ -12,7 +12,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, urlopen
 
 from .config import Config, TwitchConfig
 from .downloader import yt_dlp_command
@@ -28,7 +27,7 @@ from .extension_api import (
 )
 from .feed import fetch_feed, parse_feed
 from .models import DiscoveryResult, MediaCandidate, Origin
-from .network import NetworkScope
+from .network import ConnectionRuntime, NetworkScope
 from .youtube import list_recent_channel_videos, youtube_channel_feed_url
 
 
@@ -216,7 +215,7 @@ class TwitchHelixSource:
 
     def __init__(self, config: TwitchConfig, http: HttpClient | None = None):
         self.config = config
-        self.http = http
+        self.http = http or ConnectionRuntime()
         self._access_token = config.access_token
 
     def resolve_video(self, url: str) -> MediaCandidate:
@@ -466,67 +465,52 @@ class TwitchHelixSource:
         if not self._access_token:
             self._refresh_app_token()
         url = f"{self.config.api_base}/{path}?{urlencode(params)}"
-        request = Request(
-            url,
+        request = HttpRequest(
+            url=url,
             headers={
                 "Authorization": f"Bearer {self._access_token}",
                 "Client-Id": self.config.client_id,
                 "User-Agent": "asmr-tg-backup/0.1",
             },
+            timeout_seconds=self.config.request_timeout_seconds,
         )
         try:
-            if self.http is None:
-                with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
-                    payload = _read_json_response(response, label="Twitch API")
-            else:
-                response = self.http.request(
-                    HttpRequest(
-                        url=url,
-                        headers={str(key): str(value) for key, value in request.header_items()},
-                        timeout_seconds=self.config.request_timeout_seconds,
+            response = self.http.request(
+                request,
+                RouteRequest(
+                    scope=(
+                        NetworkScope.SOURCE_NOTIFICATION
+                        if path == "streams"
+                        else NetworkScope.ORIGIN_RESOLVE
+                        if path == "users"
+                        else NetworkScope.SOURCE_DISCOVERY
                     ),
-                    RouteRequest(
-                        scope=(
-                            NetworkScope.SOURCE_NOTIFICATION
-                            if path == "streams"
-                            else NetworkScope.ORIGIN_RESOLVE
-                            if path == "users"
-                            else NetworkScope.SOURCE_DISCOVERY
-                        ),
-                        provider="twitch",
-                        target_url=url,
-                    ),
-                )
-                if response.status == 401 and retry_auth and self.config.client_secret:
-                    self._refresh_app_token()
-                    return self._api_json(path, params, retry_auth=False)
-                if response.status == 429:
-                    reset_at = _int_header(response.headers, "Ratelimit-Reset")
-                    retry_after = max(1, reset_at - int(time.time())) if reset_at else None
-                    raise SourceError(
-                        "Twitch API HTTP 429",
-                        code="rate_limited",
-                        retry_after=retry_after,
-                    )
-                if response.status in {401, 403}:
-                    raise SourceError(
-                        f"Twitch API HTTP {response.status}",
-                        code="auth_invalid",
-                    )
-                if not 200 <= response.status < 300:
-                    raise SourceError(
-                        f"Twitch API HTTP {response.status}",
-                        code="http_error",
-                    )
-                payload = json.loads(response.body.decode("utf-8"))
-        except HTTPError as exc:
-            if exc.code == 401 and retry_auth and self.config.client_secret:
+                    provider="twitch",
+                    target_url=url,
+                ),
+            )
+            if response.status == 401 and retry_auth and self.config.client_secret:
                 self._refresh_app_token()
                 return self._api_json(path, params, retry_auth=False)
-            reset_at = _int_header(exc.headers, "Ratelimit-Reset") if exc.code == 429 else None
-            retry_after = max(1, reset_at - int(time.time())) if reset_at else None
-            code = "rate_limited" if exc.code == 429 else "auth_invalid" if exc.code in {401, 403} else "http_error"
-            raise SourceError(f"Twitch API HTTP {exc.code}", code=code, retry_after=retry_after) from None
+            if response.status == 429:
+                reset_at = _int_header(response.headers, "Ratelimit-Reset")
+                retry_after = max(1, reset_at - int(time.time())) if reset_at else None
+                raise SourceError(
+                    "Twitch API HTTP 429",
+                    code="rate_limited",
+                    retry_after=retry_after,
+                )
+            if response.status in {401, 403}:
+                raise SourceError(
+                    f"Twitch API HTTP {response.status}",
+                    code="auth_invalid",
+                )
+            if not 200 <= response.status < 300:
+                raise SourceError(
+                    f"Twitch API HTTP {response.status}",
+                    code="http_error",
+                )
+            payload = json.loads(response.body.decode("utf-8"))
         except (URLError, TimeoutError) as exc:
             raise SourceError(f"Twitch API request failed: {exc}", code="network_error") from None
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
@@ -538,9 +522,9 @@ class TwitchHelixSource:
     def _refresh_app_token(self) -> None:
         if not self.config.client_id or not self.config.client_secret:
             raise SourceError("Twitch app token cannot be refreshed without client_secret", code="auth_missing")
-        request = Request(
-            f"{self.config.oauth_base}/token",
-            data=urlencode(
+        request = HttpRequest(
+            url=f"{self.config.oauth_base}/token",
+            body=urlencode(
                 {
                     "client_id": self.config.client_id,
                     "client_secret": self.config.client_secret,
@@ -549,34 +533,23 @@ class TwitchHelixSource:
             ).encode("ascii"),
             headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "asmr-tg-backup/0.1"},
             method="POST",
+            timeout_seconds=self.config.request_timeout_seconds,
         )
         try:
-            if self.http is None:
-                with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
-                    payload = _read_json_response(response, label="Twitch OAuth")
-            else:
-                response = self.http.request(
-                    HttpRequest(
-                        url=request.full_url,
-                        method="POST",
-                        headers={str(key): str(value) for key, value in request.header_items()},
-                        body=request.data,
-                        timeout_seconds=self.config.request_timeout_seconds,
-                    ),
-                    RouteRequest(
-                        scope=NetworkScope.SOURCE_DISCOVERY,
-                        provider="twitch",
-                        target_url=request.full_url,
-                    ),
+            response = self.http.request(
+                request,
+                RouteRequest(
+                    scope=NetworkScope.SOURCE_DISCOVERY,
+                    provider="twitch",
+                    target_url=request.url,
+                ),
+            )
+            if not 200 <= response.status < 300:
+                raise SourceError(
+                    f"Twitch OAuth HTTP {response.status}",
+                    code="auth_invalid",
                 )
-                if not 200 <= response.status < 300:
-                    raise SourceError(
-                        f"Twitch OAuth HTTP {response.status}",
-                        code="auth_invalid",
-                    )
-                payload = json.loads(response.body.decode("utf-8"))
-        except HTTPError as exc:
-            raise SourceError(f"Twitch OAuth HTTP {exc.code}", code="auth_invalid") from None
+            payload = json.loads(response.body.decode("utf-8"))
         except (URLError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise SourceError(f"Twitch OAuth failed: {exc}", code="auth_invalid") from None
         token = payload.get("access_token") if isinstance(payload, dict) else None
@@ -588,39 +561,16 @@ class TwitchHelixSource:
 class SourceRegistry:
     def __init__(
         self,
-        twitch: TwitchConfig | tuple[SourceProviderDefinition, ...],
-        context: SourceAdapterContext | None = None,
-        *,
-        youtube_fetcher: Callable[[str], bytes] = fetch_feed,
-        rss_fetcher: Callable[[str], bytes] = fetch_feed,
+        definitions: tuple[SourceProviderDefinition, ...],
+        context: SourceAdapterContext,
     ):
-        if isinstance(twitch, tuple):
-            if context is None:
-                raise ValueError("extension source registry requires adapter context")
-            self._defaults: dict[str, SourceAdapter] = {}
-            self._adapters: dict[tuple[str, str], SourceAdapter] = {}
-            for definition in twitch:
-                adapter = definition.adapter_factory(context)
-                self._defaults[definition.provider] = adapter
-                for kind in definition.kinds:
-                    self._adapters[(definition.provider, kind)] = adapter
-            return
-        youtube = YouTubePublicSource(youtube_fetcher)
-        rss = RssSource(rss_fetcher)
-        twitch_source = TwitchHelixSource(twitch)
-        self._defaults: dict[str, SourceAdapter] = {
-            "youtube": youtube,
-            "rss": rss,
-            "twitch": twitch_source,
-        }
-        self._adapters: dict[tuple[str, str], SourceAdapter] = {
-            ("youtube", "uploads"): youtube,
-            ("youtube", "vod_after_live"): youtube,
-            ("rss", "feed"): rss,
-            ("twitch", "vods"): twitch_source,
-            ("twitch", "highlights"): twitch_source,
-            ("twitch", "uploads"): twitch_source,
-        }
+        self._defaults: dict[str, SourceAdapter] = {}
+        self._adapters: dict[tuple[str, str], SourceAdapter] = {}
+        for definition in definitions:
+            adapter = definition.adapter_factory(context)
+            self._defaults[definition.provider] = adapter
+            for kind in definition.kinds:
+                self._adapters[(definition.provider, kind)] = adapter
 
     def get(self, provider: str, kind: str | None = None) -> SourceAdapter:
         try:
@@ -984,11 +934,3 @@ def _payload_list(payload: dict[str, object], key: str) -> list[object]:
     if not isinstance(value, list):
         raise SourceError(f"Twitch API response field {key!r} is not a list", code="invalid_response")
     return value
-
-
-def _read_json_response(response: object, *, label: str) -> object:
-    max_bytes = 5 * 1024 * 1024
-    payload = response.read(max_bytes + 1)  # type: ignore[attr-defined]
-    if len(payload) > max_bytes:
-        raise SourceError(f"{label} response exceeds {max_bytes} bytes", code="invalid_response")
-    return json.loads(payload.decode("utf-8"))

@@ -11,14 +11,12 @@ import secrets
 import shlex
 import time
 from typing import Any
-from urllib.error import HTTPError
-from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from .config import Config
 from .extension_api import HttpRequest, RouteRequest
 from .extensions import SourceProviderCatalog
 from .models import Origin
-from .network import ConnectionRuntime, NetworkScope, is_loopback_url
+from .network import ConnectionRuntime, NetworkScope
 from .source_filter import (
     DEFAULT_SOURCE_FILTER_PATTERN,
     SOURCE_FILTER_STATE_KEY,
@@ -74,7 +72,7 @@ class ControlBot:
         self.config = config
         self.store = store
         self.logger = logger
-        self.connection = connection
+        self.connection = connection or ConnectionRuntime()
         self.source_catalog = SourceCatalogManager(
             config.sources.path,
             store,
@@ -448,17 +446,11 @@ class ControlBot:
             if not remaining:
                 return "usage: /origin add youtube [uploads] <@handle|channel_id> [name]"
             source_ref = remaining[0]
-            if self.connection is None:
-                external_id = resolve_channel_id(
-                    source_ref,
-                    self.config.download.yt_dlp,
-                )
-            else:
-                external_id = resolve_channel_id(
-                    source_ref,
-                    self.config.download.yt_dlp,
-                    self.connection,
-                )
+            external_id = resolve_channel_id(
+                source_ref,
+                self.config.download.yt_dlp,
+                self.connection,
+            )
         elif provider == "twitch":
             kind = "vods"
             if remaining and remaining[0].lower() in TWITCH_KINDS:
@@ -2500,63 +2492,38 @@ class ControlBot:
         )
         endpoint = f"{api_base}/bot{self.config.telegram.bot_token}/{method}"
         body = json.dumps(payload).encode("utf-8")
-        if self.connection is None:
-            request = Request(
-                endpoint,
-                data=body,
-                headers={"Content-Type": "application/json"},
+        response = self.connection.request(
+            HttpRequest(
+                url=endpoint,
                 method="POST",
-            )
-            try:
-                if is_loopback_url(api_base):
-                    open_request = build_opener(ProxyHandler({})).open
-                else:
-                    open_request = urlopen
-                with open_request(request, timeout=request_timeout_seconds) as response:
-                    parsed = json.loads(response.read().decode("utf-8"))
-            except HTTPError as exc:
-                try:
-                    error_body = exc.read().decode("utf-8", errors="replace")
-                finally:
-                    exc.close()
-                raise self._control_api_error(
-                    status=int(exc.code),
-                    body=error_body,
-                    headers=exc.headers,
-                ) from exc
-        else:
-            response = self.connection.request(
-                HttpRequest(
-                    url=endpoint,
-                    method="POST",
-                    headers={"Content-Type": "application/json"},
-                    body=body,
-                    timeout_seconds=request_timeout_seconds,
+                headers={"Content-Type": "application/json"},
+                body=body,
+                timeout_seconds=request_timeout_seconds,
+            ),
+            RouteRequest(
+                scope=(
+                    NetworkScope.TELEGRAM_CONTROL_RECEIVE
+                    if method == "getUpdates"
+                    else NetworkScope.TELEGRAM_CONTROL_SEND
                 ),
-                RouteRequest(
-                    scope=(
-                        NetworkScope.TELEGRAM_CONTROL_RECEIVE
-                        if method == "getUpdates"
-                        else NetworkScope.TELEGRAM_CONTROL_SEND
-                    ),
-                    target_url=endpoint,
-                    phase="receive" if method == "getUpdates" else "sending",
-                    idempotent=method in {
-                        "getUpdates",
-                        "getMe",
-                        "getChat",
-                        "answerCallbackQuery",
-                    },
-                ),
+                target_url=endpoint,
+                phase="receive" if method == "getUpdates" else "sending",
+                idempotent=method in {
+                    "getUpdates",
+                    "getMe",
+                    "getChat",
+                    "answerCallbackQuery",
+                },
+            ),
+        )
+        if not 200 <= response.status < 300:
+            error_body = response.body.decode("utf-8", errors="replace")
+            raise self._control_api_error(
+                status=int(response.status),
+                body=error_body,
+                headers=response.headers,
             )
-            if not 200 <= response.status < 300:
-                error_body = response.body.decode("utf-8", errors="replace")
-                raise self._control_api_error(
-                    status=int(response.status),
-                    body=error_body,
-                    headers=response.headers,
-                )
-            parsed = json.loads(response.body.decode("utf-8"))
+        parsed = json.loads(response.body.decode("utf-8"))
         if not parsed.get("ok"):
             raise self._control_api_error(status=None, parsed=parsed)
         return parsed
