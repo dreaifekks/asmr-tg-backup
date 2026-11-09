@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import getpass
-import json
 import os
 from pathlib import Path
 import pwd
@@ -11,13 +10,13 @@ import socket
 import string
 import subprocess
 import sys
-import tempfile
 import time
 from urllib.parse import urlsplit
 
 from .config import load_config, resolve_mtproto_credentials
 from .network import is_loopback_url
 from .service import BackupService
+from .utils import atomic_replace, toml_value as _toml_string
 
 
 LOCAL_API_HOST = "127.0.0.1"
@@ -1139,10 +1138,6 @@ def _write_setup_config(output_path: Path, setup: SetupAnswers) -> None:
     _write_private_file(output_path, content)
 
 
-def _toml_string(value: str) -> str:
-    return json.dumps(value, ensure_ascii=False)
-
-
 def _write_private_file(path: Path, content: bytes) -> None:
     _ensure_directory(path.parent)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -1177,31 +1172,7 @@ def _replace_private_file(path: Path, content: bytes) -> None:
     if path.is_symlink():
         raise SetupTargetExistsError(f"refusing symlink for private file: {path}")
     _ensure_directory(path.parent)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        dir=path.parent,
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as output:
-            descriptor = -1
-            output.write(content)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary_path, path)
-        path.chmod(0o600)
-    except BaseException:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+    atomic_replace(path, content)
 
 
 def _ensure_directory(path: Path) -> None:

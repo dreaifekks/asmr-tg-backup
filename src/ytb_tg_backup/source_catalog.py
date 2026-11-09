@@ -4,12 +4,9 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import fcntl
-import json
 import math
 import os
 from pathlib import Path
-import re
-import tempfile
 import tomllib
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +15,12 @@ from .source_filter import (
     DEFAULT_SOURCE_FILTER_PATTERN,
     SOURCE_FILTER_STATE_KEY,
     compile_source_filter,
+)
+from .utils import (
+    atomic_replace as _atomic_replace,
+    fsync_directory as _fsync_directory,
+    toml_key as _toml_key,
+    toml_value,
 )
 
 if TYPE_CHECKING:
@@ -44,7 +47,6 @@ _ORIGIN_FIELDS = {
     "bootstrap",
     "credential_ref",
 }
-_BARE_TOML_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 class SourceCatalogError(ValueError):
@@ -695,23 +697,9 @@ def _default_origin_kind(
     return "feed"
 
 
-def _toml_key(key: str) -> str:
-    return key if _BARE_TOML_KEY.fullmatch(key) else json.dumps(key, ensure_ascii=False)
-
-
 def _toml_value(value: object) -> str:
     _validate_option_value(value, label="catalog value")
-    if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False)
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return repr(value)
-    if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
-    raise SourceCatalogError("unsupported TOML value")
+    return toml_value(value)
 
 
 @contextmanager
@@ -724,37 +712,4 @@ def _directory_lock(directory: Path, *, exclusive: bool = True) -> Iterator[None
         yield
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
-
-
-def _atomic_replace(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as file_handle:
-            descriptor = -1
-            file_handle.write(content)
-            file_handle.flush()
-            os.fsync(file_handle.fileno())
-        os.replace(temporary_path, path)
-        path.chmod(0o600)
-        _fsync_directory(path.parent)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        temporary_path.unlink(missing_ok=True)
-
-
-def _fsync_directory(directory: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(directory, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
         os.close(descriptor)

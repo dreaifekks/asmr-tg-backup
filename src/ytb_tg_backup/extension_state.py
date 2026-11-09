@@ -4,19 +4,23 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import fcntl
-import json
 import os
 from pathlib import Path
 import re
-import tempfile
 import tomllib
 from typing import Any
+
+from .utils import (
+    atomic_replace,
+    fsync_directory as _fsync_directory,
+    toml_key as _toml_key,
+    toml_value,
+)
 
 
 MANAGED_EXTENSION_SCHEMA = 1
 MANAGED_EXTENSION_MARKER = "# Managed by `asmr-tg-backup extensions`."
 _EXTENSION_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
-_BARE_TOML_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 class ExtensionStateError(ValueError):
@@ -215,27 +219,7 @@ def extension_state_lock(config_path: str | Path) -> Iterator[None]:
 def replace_private_file(path: Path, content: bytes) -> None:
     if path.is_symlink():
         raise ExtensionStateError(f"refusing symlink for private file: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    temporary = Path(temporary_name)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = -1
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        path.chmod(0o600)
-        _fsync_directory(path.parent)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+    atomic_replace(path, content)
 
 
 def restore_private_file(path: Path, previous: bytes | None) -> None:
@@ -281,35 +265,13 @@ def _render_mapping(
         _render_mapping(lines, table_path, table)
 
 
-def _toml_key(value: str) -> str:
-    return value if _BARE_TOML_KEY.fullmatch(value) else json.dumps(value, ensure_ascii=False)
-
-
 def _toml_value(value: object) -> str:
-    if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False)
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return repr(value)
-    if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
-    raise ExtensionStateError(
-        f"unsupported extension config value: {type(value).__name__}"
-    )
+    try:
+        return toml_value(value)
+    except ValueError as exc:
+        raise ExtensionStateError(str(exc)) from None
 
 
 def _validate_extension_id(value: str) -> None:
     if not _EXTENSION_ID.fullmatch(value):
         raise ExtensionStateError(f"invalid extension id: {value!r}")
-
-
-def _fsync_directory(directory: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(directory, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
