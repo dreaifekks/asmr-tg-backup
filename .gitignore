@@ -22,6 +22,7 @@ settings/
 *.local.toml
 outputs/
 work/
+/promo/
 downloads/
 download-archive.txt
 *.db
