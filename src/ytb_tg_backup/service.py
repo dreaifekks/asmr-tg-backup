@@ -863,10 +863,6 @@ class BackupService:
                 bot = self._new_control_bot(store)
                 while not self._stop_event.is_set():
                     bot.process_once()
-                    store.get_panel_snapshot(
-                        self._source_filter_pattern(store),
-                        max_age_seconds=30,
-                    )
             except ControlApiError as exc:
                 retry_after = max(1, int(exc.retry_after or 1))
                 self.logger.warning(

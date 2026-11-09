@@ -230,13 +230,6 @@ CREATE TABLE IF NOT EXISTS bot_state (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS panel_snapshots (
-  cache_key TEXT PRIMARY KEY,
-  payload_json TEXT NOT NULL,
-  dirty INTEGER NOT NULL DEFAULT 1,
-  generated_at TEXT NOT NULL
-);
 """
 
 DISK_RESOURCE_CTE = """
@@ -430,7 +423,7 @@ class Store:
         )
         if int(current) >= self.CURRENT_SCHEMA_VERSION:
             self.conn.executescript(V2_SCHEMA)
-            self._ensure_panel_snapshot_support()
+            self._remove_panel_cache()
             self._recover_incomplete_disk_purges()
             self._recover_incomplete_archive_moves()
             self._ensure_compatibility_views()
@@ -441,7 +434,7 @@ class Store:
         if has_v1:
             self._backup_v1()
         self.conn.executescript(V2_SCHEMA)
-        self._ensure_panel_snapshot_support()
+        self._remove_panel_cache()
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             self._recover_incomplete_disk_purges()
@@ -636,53 +629,18 @@ class Store:
                 ),
             )
 
-    def _ensure_panel_snapshot_support(self) -> None:
-        """Keep the materialized panel row dirty when its source data changes."""
-        trigger_statements: list[str] = []
-        for table in (
-            "origins",
-            "origin_poll_state",
-            "media_items",
-            "origin_items",
-            "jobs",
-            "artifacts",
-            "deliveries",
-        ):
-            for operation in ("INSERT", "UPDATE", "DELETE"):
-                trigger_statements.append(
-                    f"""
-                    CREATE TRIGGER IF NOT EXISTS panel_snapshot_dirty_{table}_{operation.lower()}
-                    AFTER {operation} ON {table}
-                    BEGIN
-                      INSERT INTO panel_snapshots(
-                        cache_key, payload_json, dirty, generated_at
-                      ) VALUES ('global', '{{}}', 1, '')
-                      ON CONFLICT(cache_key) DO UPDATE SET dirty=1;
-                    END;
-                    """
-                )
-
-        # Panel navigation state and the Telegram update offset do not affect
-        # displayed metrics. Only the global filter is part of the snapshot.
-        for operation, condition in (
-            ("INSERT", "NEW.key='source_filter_pattern'"),
-            ("UPDATE", "NEW.key='source_filter_pattern' OR OLD.key='source_filter_pattern'"),
-            ("DELETE", "OLD.key='source_filter_pattern'"),
-        ):
-            trigger_statements.append(
-                f"""
-                CREATE TRIGGER IF NOT EXISTS panel_snapshot_dirty_bot_state_{operation.lower()}
-                AFTER {operation} ON bot_state
-                WHEN {condition}
-                BEGIN
-                  INSERT INTO panel_snapshots(
-                    cache_key, payload_json, dirty, generated_at
-                  ) VALUES ('global', '{{}}', 1, '')
-                  ON CONFLICT(cache_key) DO UPDATE SET dirty=1;
-                END;
-                """
-            )
-        self.conn.executescript("\n".join(trigger_statements))
+    def _remove_panel_cache(self) -> None:
+        """Remove obsolete cache state when opening an older database."""
+        if not self._table_exists("panel_snapshots"):
+            return
+        triggers = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name GLOB 'panel_snapshot_dirty_*'"
+        ).fetchall()
+        for row in triggers:
+            name = str(row[0]).replace('"', '""')
+            self.conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+        self.conn.execute("DROP TABLE IF EXISTS panel_snapshots")
 
     # ------------------------------------------------------------------
     # Provider-neutral origin and discovery API
@@ -3406,37 +3364,9 @@ class Store:
             self.conn.rollback()
             raise
 
-    def get_panel_snapshot(
-        self,
-        source_filter_pattern: str | None,
-        *,
-        max_age_seconds: int = 30,
-        force: bool = False,
-    ) -> dict[str, object]:
-        row = self.conn.execute(
-            "SELECT payload_json, dirty, generated_at FROM panel_snapshots WHERE cache_key='global'"
-        ).fetchone()
-        if row is not None and not force and not bool(row["dirty"]):
-            try:
-                generated_at = datetime.fromisoformat(str(row["generated_at"]))
-                if generated_at.tzinfo is None:
-                    generated_at = generated_at.replace(tzinfo=timezone.utc)
-                age = (datetime.now(timezone.utc) - generated_at.astimezone(timezone.utc)).total_seconds()
-                payload = json.loads(str(row["payload_json"]))
-                if (
-                    age <= max_age_seconds
-                    and isinstance(payload, dict)
-                    and payload.get("version") == 2
-                    and payload.get("source_filter_pattern") == source_filter_pattern
-                ):
-                    return payload
-            except (TypeError, ValueError, json.JSONDecodeError):
-                pass
-        return self._rebuild_panel_snapshot(source_filter_pattern)
-
-    def _rebuild_panel_snapshot(self, source_filter_pattern: str | None) -> dict[str, object]:
+    def get_panel_summary(self, source_filter_pattern: str | None) -> dict[str, object]:
         generated_at = now_iso()
-        self.conn.execute("BEGIN IMMEDIATE")
+        self.conn.execute("BEGIN")
         try:
             origins = [
                 {
@@ -3458,7 +3388,6 @@ class Store:
                 for row in self.list_origin_statuses()
             ]
             payload: dict[str, object] = {
-                "version": 2,
                 "generated_at": generated_at,
                 "source_filter_pattern": source_filter_pattern,
                 "origins": origins,
@@ -3466,17 +3395,6 @@ class Store:
                 "providers": self.counts_by_provider(),
                 "jobs": self.job_counts(),
             }
-            self.conn.execute(
-                """
-                INSERT INTO panel_snapshots(cache_key, payload_json, dirty, generated_at)
-                VALUES ('global', ?, 0, ?)
-                ON CONFLICT(cache_key) DO UPDATE SET
-                  payload_json=excluded.payload_json,
-                  dirty=0,
-                  generated_at=excluded.generated_at
-                """,
-                (json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True), generated_at),
-            )
             self.conn.commit()
             return payload
         except Exception:

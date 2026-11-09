@@ -9,7 +9,6 @@ from unittest import mock
 
 import ytb_tg_backup.store as store_module
 from ytb_tg_backup.models import MediaCandidate, Origin
-from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
 from ytb_tg_backup.store import Store, now_iso
 
 
@@ -313,56 +312,37 @@ class StoreV2Test(unittest.TestCase):
             self.assertTrue(persisted["is_favorite"])
             reopened.close()
 
-    def test_panel_snapshot_is_materialized_and_invalidated_by_relevant_changes(self):
+    def test_panel_summary_reads_current_data_after_old_cache_is_removed(self):
         with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp) / "state.db")
+            path = Path(tmp) / "state.db"
+            store = Store(path)
             store.initialize()
             store.upsert_origin(Origin("yt", "youtube", "uploads", "YT", "UC-1"))
             store.upsert_discovered("yt", candidate("youtube", "first"))
-
-            first = store.get_panel_snapshot("ASMR")
-            cached_row = store.conn.execute(
-                "SELECT dirty, generated_at FROM panel_snapshots WHERE cache_key='global'"
-            ).fetchone()
-            self.assertEqual(cached_row["dirty"], 0)
-            self.assertEqual(first["providers"], {"youtube": 1})
-            self.assertEqual(first["source_filter_pattern"], "ASMR")
-
-            store.set_bot_state("control_panel_v1:chat:user", "{}")
-            self.assertEqual(
-                store.conn.execute(
-                    "SELECT dirty FROM panel_snapshots WHERE cache_key='global'"
-                ).fetchone()[0],
-                0,
-            )
-            second = store.get_panel_snapshot("ASMR")
-            self.assertEqual(second["generated_at"], first["generated_at"])
-
+            # Simulate the cache left by an installed 0.6.x database.
+            store.conn.executescript("""
+                CREATE TABLE panel_snapshots (cache_key TEXT PRIMARY KEY, dirty INTEGER);
+                INSERT INTO panel_snapshots VALUES ('global', 0);
+                CREATE TRIGGER panel_snapshot_dirty_media_items_update
+                AFTER UPDATE ON media_items BEGIN
+                    UPDATE panel_snapshots SET dirty=1;
+                END;
+            """)
+            store.initialize()
+            self.assertEqual(store.conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name GLOB 'panel_snapshot*'"
+            ).fetchone()[0], 0)
             store.upsert_discovered("yt", candidate("youtube", "second"))
-            self.assertEqual(
-                store.conn.execute(
-                    "SELECT dirty FROM panel_snapshots WHERE cache_key='global'"
-                ).fetchone()[0],
-                1,
-            )
-            third = store.get_panel_snapshot("ASMR")
-            self.assertEqual(third["providers"], {"youtube": 2})
-            self.assertEqual(
-                store.conn.execute(
-                    "SELECT dirty FROM panel_snapshots WHERE cache_key='global'"
-                ).fetchone()[0],
-                0,
-            )
-
-            store.set_bot_state(SOURCE_FILTER_STATE_KEY, "sleep")
-            self.assertEqual(
-                store.conn.execute(
-                    "SELECT dirty FROM panel_snapshots WHERE cache_key='global'"
-                ).fetchone()[0],
-                1,
-            )
-            refreshed = store.get_panel_snapshot("sleep")
-            self.assertEqual(refreshed["source_filter_pattern"], "sleep")
+            store.close()
+            reader = Store(path, readonly=True)
+            try:
+                summary = reader.get_panel_summary("ASMR")
+                self.assertEqual(summary["providers"], {"youtube": 2})
+                self.assertEqual(summary["summary"]["known"], 2)
+                self.assertEqual(summary["source_filter_pattern"], "ASMR")
+                self.assertEqual(summary["origins"][0]["item_count"], 2)
+            finally:
+                reader.close()
 
     def test_provider_namespace_and_many_origin_relationships(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -38,7 +38,6 @@ PANEL_STATE_PREFIX = "control_panel_v1"
 PANEL_PAGE_SIZE = 6
 RESOURCE_PAGE_SIZE = 6
 REACTION_PAGE_SIZE = 6
-PANEL_SNAPSHOT_MAX_AGE_SECONDS = 30
 PANEL_REVISION_SEPARATOR = "~"
 TWITCH_KINDS = {"vods", "highlights", "uploads"}
 TWITCH_LOGIN_PATTERN = re.compile(r"[a-zA-Z0-9_]{1,25}")
@@ -743,23 +742,13 @@ class ControlBot:
             )
             return
         if action == "refresh":
-            self._panel_snapshot(force=True)
             state.update({"view": "home", "awaiting": None})
             return
-        if action == "origins":
+        if action in {"origins", "originsrefresh"}:
             page = int(parts[2]) if len(parts) > 2 else 0
             state.update({"view": "origins", "page": max(0, page), "awaiting": None})
             return
-        if action == "originsrefresh":
-            page = int(parts[2]) if len(parts) > 2 else 0
-            self._panel_snapshot(force=True)
-            state.update({"view": "origins", "page": max(0, page), "awaiting": None})
-            return
-        if action == "stats":
-            state.update({"view": "stats", "awaiting": None})
-            return
-        if action == "statsrefresh":
-            self._panel_snapshot(force=True)
+        if action in {"stats", "statsrefresh"}:
             state.update({"view": "stats", "awaiting": None})
             return
         if action in {"reactions", "reactionsrefresh"}:
@@ -1062,7 +1051,6 @@ class ControlBot:
             mode = parts[3]
             self._ensure_source_catalog()
             self.source_catalog.set_recording_mode(str(row["id"]), mode)
-            self._panel_snapshot(force=True)
             state.update(
                 {
                     "view": "origins",
@@ -1433,7 +1421,7 @@ class ControlBot:
         return text, _inline_keyboard(keyboard)
 
     def _render_home_panel(self) -> tuple[str, list[list[dict[str, str]]]]:
-        snapshot = self._panel_snapshot()
+        snapshot = self._panel_summary()
         origins = [
             row
             for row in snapshot["origins"]
@@ -1532,7 +1520,7 @@ class ControlBot:
     ) -> tuple[str, list[list[dict[str, str]]]]:
         rows = [
             row
-            for row in self._panel_snapshot()["origins"]
+            for row in self._panel_summary()["origins"]
             if row["managed_by"] == "catalog"
         ]
         page_count = max(1, (len(rows) + PANEL_PAGE_SIZE - 1) // PANEL_PAGE_SIZE)
@@ -2088,7 +2076,7 @@ class ControlBot:
         return "\n".join(lines), keyboard
 
     def _render_stats_panel(self) -> tuple[str, list[list[dict[str, str]]]]:
-        snapshot = self._panel_snapshot()
+        snapshot = self._panel_summary()
         summary = snapshot["summary"]
         providers = snapshot["providers"]
         jobs = snapshot["jobs"]
@@ -2386,13 +2374,9 @@ class ControlBot:
             return DEFAULT_SOURCE_FILTER_PATTERN
         return pattern or None
 
-    def _panel_snapshot(self, *, force: bool = False) -> dict[str, Any]:
+    def _panel_summary(self) -> dict[str, Any]:
         self._ensure_source_catalog()
-        return self.store.get_panel_snapshot(
-            self._source_filter_pattern(),
-            max_age_seconds=PANEL_SNAPSHOT_MAX_AGE_SECONDS,
-            force=force,
-        )
+        return self.store.get_panel_summary(self._source_filter_pattern())
 
     def _stats(self) -> str:
         summary = self.store.backup_summary()
