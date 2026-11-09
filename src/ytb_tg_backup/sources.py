@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import re
 import socket
 import time
@@ -14,6 +15,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from .config import Config, TwitchConfig
+from .downloader import yt_dlp_command
 from .extension_api import (
     ExtensionRegistrar,
     HttpClient,
@@ -27,7 +29,7 @@ from .extension_api import (
 from .feed import fetch_feed, parse_feed
 from .models import DiscoveryResult, MediaCandidate, Origin
 from .network import NetworkScope
-from .youtube import youtube_channel_feed_url
+from .youtube import list_recent_channel_videos, youtube_channel_feed_url
 
 
 TOKYO_TIMEZONE = timezone(timedelta(hours=9), name="Asia/Tokyo")
@@ -36,19 +38,53 @@ TWITCH_USER_CACHE_FIELDS = (
     "broadcaster_id",
     "broadcaster_refresh_after",
 )
+# A successful feed poll returns the channel's newest videos, so while the
+# feed fails, the fallback lists only videos published after the last
+# successful poll. Channel tabs show the last 24 hours as "N minutes/hours
+# ago", which yt-dlp turns into times from 30 minutes early to 90 minutes
+# late, so the margin covers a feed that lists new videos up to 90 minutes
+# late. Older videos show "N days ago", which yt-dlp rounds to the nearest
+# UTC midnight, as recent as 12 hours ago; the age limit keeps the listing
+# window shorter than that.
+YOUTUBE_FEED_LAG_MARGIN = timedelta(hours=2)
+YOUTUBE_FALLBACK_MAX_AGE = timedelta(hours=10)
 
 
 class YouTubePublicSource:
     provider = "youtube"
 
-    def __init__(self, fetcher: Callable[[str], bytes] = fetch_feed):
+    def __init__(
+        self,
+        fetcher: Callable[[str], bytes] = fetch_feed,
+        fallback: Callable[[str, datetime], list[MediaCandidate]] | None = None,
+        logger: logging.Logger = logging.getLogger("asmr_tg_backup"),
+    ):
         self.fetcher = fetcher
+        self.fallback = fallback
+        self.logger = logger
 
     def discover(self, origin: Origin, checkpoint: str | None = None) -> DiscoveryResult:
         if origin.kind not in {"uploads", "vod_after_live"}:
             raise SourceError(f"unsupported YouTube origin kind: {origin.kind}", code="invalid_origin")
         url = youtube_channel_feed_url(origin.external_id)
-        entries = parse_feed(self.fetcher(url), origin.id, origin.name)
+        try:
+            payload = self.fetcher(url)
+        except (SourceError, OSError) as exc:
+            code = _youtube_feed_fallback_code(exc)
+            if self.fallback is None or code is None:
+                raise
+            if checkpoint is None:
+                # Without a feed poll that returned videos nothing marks which
+                # videos the feed already covered, and the source has not
+                # picked its initial seed. Both are left to the feed.
+                self.logger.info(
+                    "youtube rss failed origin=%s code=%s; fallback=skipped: no successful rss poll yet",
+                    origin.id,
+                    code,
+                )
+                raise
+            return self._discover_with_fallback(origin, checkpoint, exc, code)
+        entries = parse_feed(payload, origin.id, origin.name)
         return DiscoveryResult(
             items=[
                 MediaCandidate(
@@ -61,8 +97,74 @@ class YouTubePublicSource:
                     updated_at=entry.updated_at,
                 )
                 for entry in entries
-            ]
+            ],
+            # An empty feed shows no video it covered, so it neither enables
+            # the fallback nor moves its boundary.
+            cursor=(
+                _encode_youtube_checkpoint(datetime.now(timezone.utc))
+                if entries
+                else checkpoint
+            ),
         )
+
+    def _discover_with_fallback(
+        self,
+        origin: Origin,
+        checkpoint: str,
+        feed_error: Exception,
+        code: str,
+    ) -> DiscoveryResult:
+        since = max(
+            datetime.now(timezone.utc) - YOUTUBE_FALLBACK_MAX_AGE,
+            _decode_youtube_checkpoint(checkpoint) - YOUTUBE_FEED_LAG_MARGIN,
+        )
+        try:
+            items = self.fallback(origin.external_id, since)
+        except Exception as exc:
+            self.logger.warning(
+                "youtube rss failed origin=%s code=%s; fallback=yt-dlp failed: %s: %s",
+                origin.id,
+                code,
+                type(exc).__name__,
+                exc,
+            )
+            # Keep the poll failure, including its code, exactly as without the fallback.
+            raise feed_error from None
+        self.logger.info(
+            "youtube rss failed origin=%s code=%s; fallback=yt-dlp items=%d",
+            origin.id,
+            code,
+            len(items),
+        )
+        # Only a successful feed poll moves the boundary forward.
+        return DiscoveryResult(items=items, cursor=checkpoint)
+
+
+def _youtube_feed_fallback_code(exc: Exception) -> str | None:
+    """Return the failure code when a YouTube feed error warrants the fallback.
+
+    The official feed intermittently answers 404 or 5xx for channels that
+    exist; network failures and timeouts are equally transient.
+    """
+    if isinstance(exc, SourceError):
+        code = exc.code
+    elif isinstance(exc, HTTPError):
+        code = f"http_{exc.code}"
+    else:
+        return "network_error"
+    return code if code == "http_404" or code.startswith("http_5") else None
+
+
+def _encode_youtube_checkpoint(feed_success_at: datetime) -> str:
+    return json.dumps(
+        {"feed_success_at": feed_success_at.isoformat(timespec="seconds"), "version": 1},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _decode_youtube_checkpoint(checkpoint: str) -> datetime:
+    return datetime.fromisoformat(json.loads(checkpoint)["feed_success_at"])
 
 
 class RssSource:
@@ -545,7 +647,15 @@ def register_builtin_source_providers(
                     url,
                     provider="youtube",
                     scope=NetworkScope.SOURCE_NOTIFICATION,
-                )
+                ),
+                # Core always builds adapter contexts around ConnectionRuntime.
+                fallback=lambda channel_id, since: list_recent_channel_videos(
+                    channel_id,
+                    since,
+                    yt_dlp_command(config.download.yt_dlp),
+                    context.http,
+                ),
+                logger=context.logger,
             ),
             validate_origin=lambda origin: origin,
             identity=_generic_origin_identity,

@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from datetime import datetime
+import json
+import math
 import re
 import subprocess
+from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from .extension_api import HttpRequest, RouteRequest
+from .models import MediaCandidate
 from .network import ConnectionRuntime, NetworkScope
 
 YOUTUBE_FEED_BASE_URL = "https://www.youtube.com/feeds/videos.xml"
 CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{20,}$")
 HANDLE_RE = re.compile(r"^@[\w.-]{3,30}$", re.UNICODE)
 YOUTUBE_CHANNEL_HOSTS = frozenset({"youtube.com", "www.youtube.com"})
+
+# Feed fallback: channel tabs listed with yt-dlp while the RSS feed fails.
+FALLBACK_TABS = ("streams", "videos")
+FALLBACK_TAB_LIMIT = 15
+FALLBACK_TIMEOUT_SECONDS = 30
 
 
 def is_channel_id(value: str) -> bool:
@@ -20,6 +31,98 @@ def is_channel_id(value: str) -> bool:
 
 def youtube_channel_feed_url(channel_id: str) -> str:
     return f"{YOUTUBE_FEED_BASE_URL}?channel_id={quote(channel_id.strip(), safe='')}"
+
+
+def list_recent_channel_videos(
+    channel_id: str,
+    since: datetime,
+    yt_dlp_command: Sequence[str],
+    connection: ConnectionRuntime,
+) -> list[MediaCandidate]:
+    """List a channel's live and recent videos, newest first, while its feed fails.
+
+    Channel tabs only show relative times ("3 hours ago"), which yt-dlp turns
+    into rounded timestamps. Entries older than ``since`` or without a time
+    are dropped unless they are live, so the fallback cannot queue videos the
+    feed already covered. Upcoming entries are dropped whatever time they
+    carry; a scheduled stream is listed once it is live or has a recording.
+    Members-only entries are dropped because the feed does not include them
+    either.
+    """
+    cutoff = since.timestamp()
+    ranked: dict[str, tuple[float, MediaCandidate]] = {}
+    for tab in FALLBACK_TABS:
+        for entry in _list_channel_tab(channel_id, tab, yt_dlp_command, connection):
+            if entry.get("availability") == "subscriber_only" or entry.get("live_status") == "is_upcoming":
+                continue
+            timestamp = entry.get("timestamp")
+            if entry.get("live_status") == "is_live":
+                rank = math.inf
+            elif timestamp is not None and timestamp >= cutoff:
+                rank = timestamp
+            else:
+                continue
+            video_id = str(entry["id"])
+            ranked[video_id] = (
+                rank,
+                MediaCandidate(
+                    provider="youtube",
+                    content_kind="video",
+                    external_id=video_id,
+                    title=str(entry.get("title") or video_id),
+                    url=f"https://www.youtube.com/watch?v={video_id}",
+                    # The relative time is only precise enough for the cutoff;
+                    # the next successful feed poll stores the exact time.
+                    published_at=None,
+                ),
+            )
+    return [
+        candidate
+        for _, candidate in sorted(ranked.values(), key=lambda item: item[0], reverse=True)
+    ]
+
+
+def _list_channel_tab(
+    channel_id: str,
+    tab: str,
+    yt_dlp_command: Sequence[str],
+    connection: ConnectionRuntime,
+) -> list[dict[str, Any]]:
+    url = f"https://www.youtube.com/channel/{quote(channel_id.strip(), safe='')}/{tab}"
+    cmd = [
+        *yt_dlp_command,
+        # The listing is parsed, so user yt-dlp config must not reshape it.
+        "--ignore-config",
+        "--no-warnings",
+        "--flat-playlist",
+        "--playlist-end",
+        str(FALLBACK_TAB_LIMIT),
+        "--extractor-args",
+        "youtubetab:approximate_date",
+        "--dump-single-json",
+    ]
+    with connection.route(
+        RouteRequest(
+            scope=NetworkScope.SOURCE_DISCOVERY,
+            provider="youtube",
+            target_url=url,
+        )
+    ) as route:
+        completed = subprocess.run(
+            [*cmd, *route.yt_dlp_args(), url],
+            text=True,
+            capture_output=True,
+            timeout=FALLBACK_TIMEOUT_SECONDS,
+            env=route.process_environment(),
+        )
+        if f"does not have a {tab} tab" in completed.stderr:
+            return []
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"yt-dlp /{tab} listing exited with {completed.returncode}: "
+                f"{completed.stderr.strip()[-300:]}"
+            )
+    return json.loads(completed.stdout)["entries"]
 
 
 def resolve_channel_id(

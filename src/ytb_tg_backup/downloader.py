@@ -489,10 +489,7 @@ class Downloader:
         return DownloadResult(file_path=output, file_size=output.stat().st_size)
 
     def _yt_dlp_command(self) -> list[str]:
-        configured = self.config.download.yt_dlp
-        if configured == "yt-dlp" and importlib.util.find_spec("yt_dlp") is not None:
-            return [sys.executable, "-m", "yt_dlp"]
-        return [configured]
+        return yt_dlp_command(self.config.download.yt_dlp)
 
     def shrink_audio_for_upload(
         self,
@@ -1055,6 +1052,12 @@ def _safe_provider_name(provider: str | None) -> str:
     value = provider or "unknown"
     cleaned = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in value)
     return cleaned or "unknown"
+
+
+def yt_dlp_command(configured: str) -> list[str]:
+    if configured == "yt-dlp" and importlib.util.find_spec("yt_dlp") is not None:
+        return [sys.executable, "-m", "yt_dlp"]
+    return [configured]
 
 
 def _live_output_template(template: str, attempt_token: str) -> str:

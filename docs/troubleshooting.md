@@ -41,6 +41,45 @@ Do not edit `state.db` to configure a source. In Compose, confirm that the
 container mounts the writable `./settings` directory at `/settings`, rather
 than bind-mounting only `sources.toml`; atomic replacement needs the directory.
 
+## YouTube feed polls fail with HTTP 404 or 500
+
+YouTube's channel RSS feed intermittently answers 404 or 5xx for channels that
+exist. When the feed request fails with 404, a 5xx status, a network error, or
+a timeout, the same poll lists the channel's `/streams` and `/videos` tabs with
+the configured `[download].yt_dlp` instead, and the log shows:
+
+```text
+youtube rss failed origin=<origin-id> code=http_404; fallback=yt-dlp items=3
+```
+
+The listing keeps live streams and the videos published since two hours
+before the source's last successful feed poll, at most 10 hours back, so it
+does not queue videos the feed already covered. Channel pages show older
+videos only as "N days ago", too coarse to tell whether the feed listed them;
+after a longer outage, those wait for the feed to recover. The listing
+skips scheduled streams, which are listed once they go live or have a
+recording; members-only entries, which the feed omits too; and Shorts, which
+the feed picks up once it recovers. Publish times stay empty until the next
+successful feed poll fills them in. If the listing also fails, the poll fails
+with the original feed error and the next poll retries:
+
+```text
+youtube rss failed origin=<origin-id> code=http_404; fallback=yt-dlp failed: TimeoutExpired: ...
+origin poll failed id=<origin-id> provider=youtube code=http_404: youtube source HTTP 404
+```
+
+The listing needs the time of the source's last successful feed poll that
+returned videos; a feed with no videos does not count. A newly added source, an
+existing source after upgrading, and a source whose `bootstrap` was just
+changed to `all` have none until the feed lists videos once. Until then a
+failed feed poll fails and retries as before, so only the feed decides where a
+new source starts:
+
+```text
+youtube rss failed origin=<origin-id> code=http_404; fallback=skipped: no successful rss poll yet
+origin poll failed id=<origin-id> provider=youtube code=http_404: youtube source HTTP 404
+```
+
 ## `ffmpeg`, `ffprobe`, or `curl` is missing
 
 The PyPI package cannot install operating-system binaries. Install `ffmpeg` and

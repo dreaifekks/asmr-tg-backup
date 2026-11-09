@@ -40,6 +40,38 @@ asmr-tg-backup sources apply --config /path/to/config.toml
 不要直接编辑 `state.db` 来配置来源。Compose 应把可写的 `./settings` 目录挂载到
 `/settings`，而不是只绑定 `sources.toml` 单个文件；原子替换需要目录可写。
 
+## YouTube RSS 轮询返回 HTTP 404 或 500
+
+YouTube 频道 RSS 会间歇性地对存在的频道返回 404 或 5xx。RSS 请求遇到 404、5xx、
+网络错误或超时时，同一轮轮询会改用配置的 `[download].yt_dlp` 列出频道的 `/streams`
+和 `/videos` 标签页，日志中会出现：
+
+```text
+youtube rss failed origin=<origin-id> code=http_404; fallback=yt-dlp items=3
+```
+
+列表只保留正在直播的条目，以及该来源上次 RSS 轮询成功前 2 小时之后发布的视频，
+最多回溯 10 小时，不会把 RSS 已经覆盖过的视频加入队列。频道页对更早的视频只显示
+“N 天前”，精度不足以判断 RSS 是否列过；RSS 断得更久时，这些视频等 RSS 恢复后再
+发现。预定直播会被跳过，开播或有录像后再列出；会员限定条目同样不在 RSS 中，因此
+也会被跳过；Shorts 不列出，等 RSS 恢复后再发现。发布时间先留空，下一次 RSS 轮询
+成功时补上。如果列表也失败，本轮按原来的 RSS 错误记为失败，下一轮照常重试：
+
+```text
+youtube rss failed origin=<origin-id> code=http_404; fallback=yt-dlp failed: TimeoutExpired: ...
+origin poll failed id=<origin-id> provider=youtube code=http_404: youtube source HTTP 404
+```
+
+列表需要该来源上次 RSS 轮询成功、且返回了视频的时间；没有任何视频的 RSS 不算。
+新加的来源、升级后的已有来源，以及刚把 `bootstrap` 改成 `all` 的来源，在 RSS
+列出过一次视频之前都没有这个时间。在此之前，RSS 失败的轮询照旧记为失败并重试，
+因此新来源从哪里开始只由 RSS 决定：
+
+```text
+youtube rss failed origin=<origin-id> code=http_404; fallback=skipped: no successful rss poll yet
+origin poll failed id=<origin-id> provider=youtube code=http_404: youtube source HTTP 404
+```
+
 ## 缺少 `ffmpeg`、`ffprobe` 或 `curl`
 
 PyPI 包不能安装操作系统二进制。需要媒体处理能力时，请使用主机包管理器安装

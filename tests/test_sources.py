@@ -1,12 +1,15 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
-from urllib.error import HTTPError
+import logging
+import subprocess
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 import unittest
 from unittest import mock
 
 from ytb_tg_backup.config import TwitchConfig
-from ytb_tg_backup.models import Origin
+from ytb_tg_backup.models import MediaCandidate, Origin
+from ytb_tg_backup.network import ConnectionRuntime
 from ytb_tg_backup.sources import (
     RssSource,
     SourceError,
@@ -15,6 +18,7 @@ from ytb_tg_backup.sources import (
     YouTubePublicSource,
     _next_tokyo_noon,
 )
+from ytb_tg_backup.youtube import list_recent_channel_videos
 
 
 class _JsonResponse:
@@ -321,6 +325,246 @@ class TwitchHelixSourceTest(unittest.TestCase):
         self.assertEqual([item.external_id for item in result.items], ["new"])
         self.assertEqual(json.loads(result.cursor)["external_id"], "new")
         api_json.assert_called_once()
+
+
+YOUTUBE_FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <yt:videoId>feed1</yt:videoId>
+    <title>Feed video</title>
+    <link rel="alternate" href="https://www.youtube.com/watch?v=feed1"/>
+    <published>2026-11-09T01:00:00+00:00</published>
+  </entry>
+</feed>
+"""
+
+
+def _youtube_origin(kind: str = "uploads") -> Origin:
+    return Origin(
+        id="yt-example",
+        provider="youtube",
+        kind=kind,
+        name="YouTube Example",
+        external_id="UCabcdefghij1234567890",
+    )
+
+
+def _fallback_candidate(video_id: str) -> MediaCandidate:
+    return MediaCandidate(
+        provider="youtube",
+        content_kind="video",
+        external_id=video_id,
+        title=f"ASMR {video_id}",
+        url=f"https://www.youtube.com/watch?v={video_id}",
+        published_at=None,
+    )
+
+
+def _failing_fetcher(exc: Exception):
+    def fetch(_url: str) -> bytes:
+        raise exc
+
+    return fetch
+
+
+def _feed_checkpoint(feed_success_at: datetime) -> str:
+    return f'{{"feed_success_at":"{feed_success_at.isoformat(timespec="seconds")}","version":1}}'
+
+
+def _feed_success_hours_ago(hours: float) -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=hours)
+
+
+class YouTubePublicSourceTest(unittest.TestCase):
+    logger = logging.getLogger("test.youtube_fallback")
+
+    def test_feed_404_5xx_and_network_errors_use_yt_dlp_fallback(self):
+        failures = (
+            (SourceError("youtube source HTTP 404", code="http_404"), "http_404"),
+            (SourceError("youtube source HTTP 500", code="http_500"), "http_500"),
+            (SourceError("youtube source HTTP 503", code="http_503"), "http_503"),
+            (URLError("connection reset"), "network_error"),
+            (TimeoutError("timed out"), "network_error"),
+        )
+        feed_success_at = _feed_success_hours_ago(3)
+        checkpoint = _feed_checkpoint(feed_success_at)
+        for kind in ("uploads", "vod_after_live"):
+            for feed_error, code in failures:
+                with self.subTest(kind=kind, code=code):
+                    fallback = mock.Mock(return_value=[_fallback_candidate("fresh1")])
+                    source = YouTubePublicSource(
+                        _failing_fetcher(feed_error),
+                        fallback=fallback,
+                        logger=self.logger,
+                    )
+
+                    with self.assertLogs(self.logger, logging.INFO) as logs:
+                        result = source.discover(_youtube_origin(kind), checkpoint)
+
+                    # Videos up to two hours older than the last successful feed
+                    # poll may still have been missing from that feed.
+                    fallback.assert_called_once_with(
+                        "UCabcdefghij1234567890",
+                        feed_success_at - timedelta(hours=2),
+                    )
+                    self.assertEqual([item.external_id for item in result.items], ["fresh1"])
+                    # Only a successful feed poll moves the boundary.
+                    self.assertEqual(result.cursor, checkpoint)
+                    self.assertEqual(
+                        logs.output,
+                        [
+                            "INFO:test.youtube_fallback:youtube rss failed origin=yt-example "
+                            f"code={code}; fallback=yt-dlp items=1"
+                        ],
+                    )
+
+    def test_fallback_lists_at_most_10_hours_back(self):
+        # Beyond 12 hours the listing would see "N days ago" times rounded to
+        # a UTC midnight, which cannot place a video relative to the feed.
+        fallback = mock.Mock(return_value=[])
+        source = YouTubePublicSource(
+            _failing_fetcher(SourceError("youtube source HTTP 404", code="http_404")),
+            fallback=fallback,
+            logger=self.logger,
+        )
+        checkpoint = _feed_checkpoint(_feed_success_hours_ago(30))
+
+        before = datetime.now(timezone.utc)
+        with self.assertLogs(self.logger, logging.INFO):
+            result = source.discover(_youtube_origin(), checkpoint)
+        after = datetime.now(timezone.utc)
+
+        since = fallback.call_args.args[1]
+        self.assertLessEqual(before - timedelta(hours=10), since)
+        self.assertLessEqual(since, after - timedelta(hours=10))
+        self.assertEqual(result.cursor, checkpoint)
+
+    def test_feed_failure_without_checkpoint_raises_without_fallback(self):
+        # New sources and sources that have not had a successful feed poll
+        # since upgrading leave discovery, including the initial seed, to the feed.
+        for feed_error, code in (
+            (SourceError("youtube source HTTP 404", code="http_404"), "http_404"),
+            (URLError("connection reset"), "network_error"),
+        ):
+            with self.subTest(code=code):
+                fallback = mock.Mock()
+                source = YouTubePublicSource(
+                    _failing_fetcher(feed_error),
+                    fallback=fallback,
+                    logger=self.logger,
+                )
+
+                with (
+                    self.assertLogs(self.logger, logging.INFO) as logs,
+                    self.assertRaises(type(feed_error)) as caught,
+                ):
+                    source.discover(_youtube_origin(), None)
+
+                self.assertIs(caught.exception, feed_error)
+                fallback.assert_not_called()
+                self.assertEqual(
+                    logs.output,
+                    [
+                        "INFO:test.youtube_fallback:youtube rss failed origin=yt-example "
+                        f"code={code}; fallback=skipped: no successful rss poll yet"
+                    ],
+                )
+
+    def test_successful_feed_records_feed_success_time(self):
+        fallback = mock.Mock()
+        source = YouTubePublicSource(lambda _url: YOUTUBE_FEED, fallback=fallback)
+        previous = _feed_checkpoint(_feed_success_hours_ago(3))
+
+        before = datetime.now(timezone.utc).replace(microsecond=0)
+        result = source.discover(_youtube_origin(), previous)
+        after = datetime.now(timezone.utc)
+
+        fallback.assert_not_called()
+        self.assertEqual([item.external_id for item in result.items], ["feed1"])
+        self.assertEqual(result.items[0].published_at, "2026-11-09T01:00:00+00:00")
+        feed_success_at = datetime.fromisoformat(json.loads(result.cursor)["feed_success_at"])
+        self.assertEqual(result.cursor, _feed_checkpoint(feed_success_at))
+        self.assertLessEqual(before, feed_success_at)
+        self.assertLessEqual(feed_success_at, after)
+
+    def test_empty_feed_neither_creates_nor_moves_checkpoint(self):
+        # An empty feed shows no video it covered: a source that has only seen
+        # empty feeds keeps waiting for the feed, and an existing boundary stays.
+        empty_feed = (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            b'<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom">\n</feed>\n'
+        )
+        source = YouTubePublicSource(lambda _url: empty_feed, fallback=mock.Mock())
+        for checkpoint in (None, _feed_checkpoint(_feed_success_hours_ago(3))):
+            with self.subTest(checkpoint=checkpoint):
+                result = source.discover(_youtube_origin(), checkpoint)
+
+                self.assertEqual(result.items, [])
+                self.assertEqual(result.cursor, checkpoint)
+
+    def test_other_feed_errors_are_raised_without_fallback(self):
+        bad_request = HTTPError("https://www.youtube.com/feeds/videos.xml", 400, "Bad Request", {}, None)
+        self.addCleanup(bad_request.close)
+        for feed_error in (
+            SourceError("youtube source HTTP 403", code="http_403"),
+            SourceError("youtube source HTTP 429", code="http_429"),
+            bad_request,
+        ):
+            with self.subTest(error=str(feed_error)):
+                fallback = mock.Mock()
+                source = YouTubePublicSource(_failing_fetcher(feed_error), fallback=fallback)
+
+                with self.assertRaises(type(feed_error)) as caught:
+                    source.discover(_youtube_origin(), _feed_checkpoint(_feed_success_hours_ago(3)))
+
+                self.assertIs(caught.exception, feed_error)
+                fallback.assert_not_called()
+
+    def test_failed_fallback_raises_original_feed_error_and_logs_reason(self):
+        feed_error = SourceError("youtube source HTTP 404", code="http_404")
+        timeout = subprocess.TimeoutExpired(["yt-dlp"], 30)
+        source = YouTubePublicSource(
+            _failing_fetcher(feed_error),
+            fallback=lambda channel_id, since: list_recent_channel_videos(
+                channel_id,
+                since,
+                ["yt-dlp"],
+                ConnectionRuntime(),
+            ),
+            logger=self.logger,
+        )
+
+        with (
+            mock.patch("ytb_tg_backup.youtube.subprocess.run", side_effect=timeout) as run,
+            self.assertLogs(self.logger, logging.WARNING) as logs,
+            self.assertRaises(SourceError) as caught,
+        ):
+            source.discover(_youtube_origin(), _feed_checkpoint(_feed_success_hours_ago(3)))
+
+        self.assertIs(caught.exception, feed_error)
+        self.assertEqual(caught.exception.code, "http_404")
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn(
+            "youtube rss failed origin=yt-example code=http_404; fallback=yt-dlp failed: TimeoutExpired:",
+            logs.output[0],
+        )
+        self.assertIn("timed out after 30 seconds", logs.output[0])
+
+    def test_failed_fallback_after_network_error_keeps_original_exception(self):
+        feed_error = URLError("connection refused")
+        source = YouTubePublicSource(
+            _failing_fetcher(feed_error),
+            fallback=mock.Mock(side_effect=RuntimeError("yt-dlp /streams listing exited with 1")),
+            logger=self.logger,
+        )
+
+        with self.assertLogs(self.logger, logging.WARNING) as logs, self.assertRaises(URLError) as caught:
+            source.discover(_youtube_origin(), _feed_checkpoint(_feed_success_hours_ago(3)))
+
+        self.assertIs(caught.exception, feed_error)
+        self.assertIn("code=network_error; fallback=yt-dlp failed: RuntimeError:", logs.output[0])
 
 
 class RssSourceTest(unittest.TestCase):

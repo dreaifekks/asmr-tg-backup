@@ -1,7 +1,10 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import sqlite3
+import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -12,6 +15,27 @@ from ytb_tg_backup.feed import FeedEntry
 from ytb_tg_backup.models import Origin
 from ytb_tg_backup.service import BackupService
 from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
+
+
+def _youtube_feed_response(*video_ids_and_published):
+    entries = "".join(
+        f"""
+  <entry>
+    <yt:videoId>{video_id}</yt:videoId>
+    <title>ASMR {video_id}</title>
+    <link rel="alternate" href="https://www.youtube.com/watch?v={video_id}"/>
+    <published>{published}</published>
+  </entry>"""
+        for video_id, published in video_ids_and_published
+    )
+    return HttpResponse(
+        200,
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC123",
+        {},
+        f"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom">{entries}
+</feed>""".encode(),
+    )
 
 
 class BackupServiceTest(unittest.TestCase):
@@ -879,6 +903,275 @@ data_dir = "{tmp}"
 
         probe.assert_not_called()
         self.assertEqual(row, ("ignored", "source filter ignored: /ASMR/i"))
+
+    def _youtube_fallback_config(self, tmp):
+        config_path = Path(tmp) / "config.toml"
+        config_path.write_text(
+            f"""
+[app]
+data_dir = "{tmp}"
+
+[download]
+yt_dlp = "/opt/custom/yt-dlp"
+
+[[channels]]
+id = "asmr"
+name = "ASMR"
+channel_id = "UC123"
+enabled = true
+""".strip()
+        )
+        return load_config(config_path)
+
+    def test_youtube_feed_fallback_queues_only_videos_after_last_feed_success(self):
+        def tab_listing(cmd, **_kwargs):
+            now = int(time.time())
+            entries = {
+                "streams": [
+                    {"id": "upcoming1", "title": "ASMR upcoming1", "live_status": "is_upcoming", "timestamp": None},
+                    {"id": "fresh1", "title": "ASMR fresh1", "live_status": "was_live", "timestamp": now - 3600},
+                    {"id": "gap1", "title": "ASMR gap1", "live_status": "was_live", "timestamp": now - 48 * 3600},
+                    {"id": "seed1", "title": "ASMR seed1", "live_status": "was_live", "timestamp": now - 52 * 3600},
+                ],
+                "videos": [
+                    {"id": "stream8h", "title": "ASMR stream8h", "live_status": None, "timestamp": now - 8 * 3600},
+                    {"id": "old1", "title": "ASMR old1", "live_status": None, "timestamp": now - 30 * 86400},
+                ],
+            }[cmd[-1].rsplit("/", 1)[-1]]
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({"entries": entries}), "")
+
+        feed_responses = [
+            _youtube_feed_response(("seed1", "2026-11-08T10:00:00+00:00")),
+            HttpResponse(404, "https://www.youtube.com/feeds/videos.xml?channel_id=UC123", {}, b""),
+            _youtube_feed_response(
+                ("fresh1", "2026-11-09T05:06:07+00:00"),
+                ("seed1", "2026-11-08T10:00:00+00:00"),
+            ),
+        ]
+        # The fallback runs while the last successful feed poll is 5 hours old,
+        # so it may list videos from the last 7 hours only. stream8h and gap1
+        # are older than that, like videos the feed listed too long ago to stay
+        # in its newest entries.
+        stale_success_at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=5)
+        stale_checkpoint = (
+            f'{{"feed_success_at":"{stale_success_at.isoformat()}","version":1}}'
+        )
+        test_started_at = datetime.now(timezone.utc).replace(microsecond=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._youtube_fallback_config(tmp)
+            service = BackupService(config)
+            try:
+                with (
+                    mock.patch(
+                        "ytb_tg_backup.network.UrllibHttpTransport.request",
+                        side_effect=feed_responses,
+                    ),
+                    mock.patch(
+                        "ytb_tg_backup.youtube.subprocess.run",
+                        side_effect=tab_listing,
+                    ) as yt_dlp,
+                ):
+                    service.poll_once(process=False)
+                    self.assertEqual(yt_dlp.call_count, 0)
+                    service.store.record_origin_poll_success("asmr", cursor=stale_checkpoint)
+                    service.poll_once(process=False)
+                    self.assertEqual(yt_dlp.call_count, 2)
+                    self.assertEqual(
+                        [(call.args[0][0], call.args[0][-1]) for call in yt_dlp.call_args_list],
+                        [
+                            ("/opt/custom/yt-dlp", "https://www.youtube.com/channel/UC123/streams"),
+                            ("/opt/custom/yt-dlp", "https://www.youtube.com/channel/UC123/videos"),
+                        ],
+                    )
+                    conn = sqlite3.connect(config.db_path)
+                    after_fallback = conn.execute(
+                        "SELECT external_id, published_at FROM media_items ORDER BY external_id"
+                    ).fetchall()
+                    poll_state_after_fallback = conn.execute(
+                        "SELECT cursor, last_error_code FROM origin_poll_state WHERE origin_id='asmr'"
+                    ).fetchone()
+                    conn.close()
+                    service.poll_once(process=False)
+                    self.assertEqual(yt_dlp.call_count, 2)
+
+                conn = sqlite3.connect(config.db_path)
+                media = conn.execute(
+                    "SELECT external_id, published_at FROM media_items ORDER BY external_id"
+                ).fetchall()
+                jobs = conn.execute(
+                    """
+                    SELECT mi.external_id, COUNT(*)
+                    FROM jobs j JOIN media_items mi ON mi.id=j.media_id
+                    WHERE j.job_type='download'
+                    GROUP BY mi.external_id
+                    ORDER BY mi.external_id
+                    """
+                ).fetchall()
+                cursor_after_recovery = conn.execute(
+                    "SELECT cursor FROM origin_poll_state WHERE origin_id='asmr'"
+                ).fetchone()[0]
+                conn.close()
+            finally:
+                service.close()
+
+        # The fallback queues fresh1 only: upcoming1 is upcoming, and stream8h,
+        # gap1, and old1 are older than the boundary. The poll succeeds, leaves
+        # the exact time to the feed, and keeps the boundary in place.
+        self.assertEqual(
+            after_fallback,
+            [("fresh1", None), ("seed1", "2026-11-08T10:00:00+00:00")],
+        )
+        self.assertEqual(poll_state_after_fallback, (stale_checkpoint, None))
+        self.assertEqual(
+            media,
+            [
+                ("fresh1", "2026-11-09T05:06:07+00:00"),
+                ("seed1", "2026-11-08T10:00:00+00:00"),
+            ],
+        )
+        self.assertEqual(jobs, [("fresh1", 1), ("seed1", 1)])
+        # The recovered feed moves the boundary to its own success time.
+        feed_success_at = datetime.fromisoformat(json.loads(cursor_after_recovery)["feed_success_at"])
+        self.assertGreaterEqual(feed_success_at, test_started_at)
+
+    def test_youtube_feed_fallback_after_long_outage_lists_only_last_10_hours(self):
+        # The feed last succeeded 30 hours ago. dayold1 was published over a day
+        # ago, before that success; its tab shows "1 day ago", which yt-dlp can
+        # round to 12 hours ago. The listing window stays at 10 hours.
+        def tab_listing(cmd, **_kwargs):
+            now = int(time.time())
+            entries = {
+                "streams": [
+                    {"id": "fresh1", "title": "ASMR fresh1", "live_status": "was_live", "timestamp": now - 3600},
+                    {"id": "dayold1", "title": "ASMR dayold1", "live_status": "was_live", "timestamp": now - 12 * 3600},
+                ],
+                "videos": [],
+            }[cmd[-1].rsplit("/", 1)[-1]]
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({"entries": entries}), "")
+
+        stale_success_at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=30)
+        stale_checkpoint = (
+            f'{{"feed_success_at":"{stale_success_at.isoformat()}","version":1}}'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._youtube_fallback_config(tmp)
+            service = BackupService(config)
+            try:
+                with (
+                    mock.patch(
+                        "ytb_tg_backup.network.UrllibHttpTransport.request",
+                        side_effect=[
+                            _youtube_feed_response(("seed1", "2026-11-08T10:00:00+00:00")),
+                            HttpResponse(404, "https://www.youtube.com/feeds/videos.xml?channel_id=UC123", {}, b""),
+                        ],
+                    ),
+                    mock.patch("ytb_tg_backup.youtube.subprocess.run", side_effect=tab_listing),
+                ):
+                    service.poll_once(process=False)
+                    service.store.record_origin_poll_success("asmr", cursor=stale_checkpoint)
+                    service.poll_once(process=False)
+
+                conn = sqlite3.connect(config.db_path)
+                media = conn.execute("SELECT external_id FROM media_items ORDER BY external_id").fetchall()
+                jobs = conn.execute(
+                    """
+                    SELECT mi.external_id
+                    FROM jobs j JOIN media_items mi ON mi.id=j.media_id
+                    WHERE j.job_type='download'
+                    ORDER BY mi.external_id
+                    """
+                ).fetchall()
+                poll_state = conn.execute(
+                    "SELECT cursor, last_error_code FROM origin_poll_state WHERE origin_id='asmr'"
+                ).fetchone()
+                conn.close()
+            finally:
+                service.close()
+
+        self.assertEqual(media, [("fresh1",), ("seed1",)])
+        self.assertEqual(jobs, [("fresh1",), ("seed1",)])
+        self.assertEqual(poll_state, (stale_checkpoint, None))
+
+    def test_youtube_new_source_is_seeded_by_feed_not_fallback(self):
+        not_found = HttpResponse(404, "https://www.youtube.com/feeds/videos.xml?channel_id=UC123", {}, b"")
+        seeding_feed = _youtube_feed_response(
+            ("new2", "2026-11-09T05:00:00+00:00"),
+            ("new1", "2026-11-08T05:00:00+00:00"),
+        )
+        # Before the feed has listed videos, the source has no boundary: a
+        # failed poll neither lists channel tabs nor seeds anything. An empty
+        # feed counts as not having listed videos.
+        cases = (
+            ("first poll fails", [not_found], [(None, "http_404", 0)]),
+            (
+                "empty feed, then a failed poll",
+                [_youtube_feed_response(), not_found],
+                [(None, None, 0), (None, "http_404", 0)],
+            ),
+        )
+        for label, early_responses, expected_states in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                config = self._youtube_fallback_config(tmp)
+                service = BackupService(config)
+                try:
+                    with (
+                        mock.patch(
+                            "ytb_tg_backup.network.UrllibHttpTransport.request",
+                            side_effect=[*early_responses, seeding_feed],
+                        ),
+                        mock.patch("ytb_tg_backup.youtube.subprocess.run") as yt_dlp,
+                    ):
+                        states = []
+                        for _ in early_responses:
+                            service.poll_once(process=False)
+                            conn = sqlite3.connect(config.db_path)
+                            states.append(
+                                conn.execute(
+                                    """
+                                    SELECT ps.cursor, ps.last_error_code,
+                                      (SELECT COUNT(*) FROM origin_items WHERE origin_id='asmr')
+                                    FROM origin_poll_state ps WHERE ps.origin_id='asmr'
+                                    """
+                                ).fetchone()
+                            )
+                            # The retry delay has passed.
+                            conn.execute("UPDATE origin_poll_state SET next_poll_at=NULL WHERE origin_id='asmr'")
+                            conn.commit()
+                            conn.close()
+                        service.poll_once(process=False)
+
+                    conn = sqlite3.connect(config.db_path)
+                    items = conn.execute(
+                        """
+                        SELECT mi.external_id, oi.disposition, oi.decision_code
+                        FROM origin_items oi JOIN media_items mi ON mi.id=oi.media_id
+                        WHERE oi.origin_id='asmr'
+                        ORDER BY mi.external_id
+                        """
+                    ).fetchall()
+                    jobs = conn.execute(
+                        """
+                        SELECT mi.external_id
+                        FROM jobs j JOIN media_items mi ON mi.id=j.media_id
+                        WHERE j.job_type='download'
+                        """
+                    ).fetchall()
+                    cursor = conn.execute(
+                        "SELECT cursor FROM origin_poll_state WHERE origin_id='asmr'"
+                    ).fetchone()[0]
+                    conn.close()
+                finally:
+                    service.close()
+
+                yt_dlp.assert_not_called()
+                self.assertEqual(states, expected_states)
+                # The feed then seeds the newest video as usual and sets the boundary.
+                self.assertEqual(
+                    items,
+                    [("new1", "ignored", "initial_seed"), ("new2", "eligible", None)],
+                )
+                self.assertEqual(jobs, [("new2",)])
+                self.assertEqual(json.loads(cursor)["version"], 1)
 
 
 if __name__ == "__main__":
