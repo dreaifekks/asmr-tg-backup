@@ -11,8 +11,7 @@ from unittest import mock
 from ytb_tg_backup.config import load_config
 from ytb_tg_backup.control import ControlApiError
 from ytb_tg_backup.extension_api import HttpResponse
-from ytb_tg_backup.feed import FeedEntry
-from ytb_tg_backup.models import Origin
+from ytb_tg_backup.models import MediaCandidate, Origin
 from ytb_tg_backup.service import BackupService
 from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
 
@@ -880,11 +879,12 @@ data_dir = "{tmp}"
             config = load_config(config_path)
             service = BackupService(config)
             service.initialize()
-            service.store.upsert_entry(
-                FeedEntry(
-                    feed_id="db:live@Patra_Suou",
-                    feed_name="周防パトラ (live)",
-                    video_id="game1",
+            service.store.upsert_origin(Origin(
+                "yt", "youtube", "uploads", "周防パトラ", "UC-1"
+            ))
+            service.store.upsert_discovered(
+                "yt", MediaCandidate(
+                    provider="youtube", content_kind="video", external_id="game1",
                     title="Game stream",
                     url="https://www.youtube.com/watch?v=game1",
                     published_at=None,

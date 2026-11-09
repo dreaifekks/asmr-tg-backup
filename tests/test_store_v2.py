@@ -10,7 +10,59 @@ from unittest import mock
 import ytb_tg_backup.store as store_module
 from ytb_tg_backup.models import MediaCandidate, Origin
 from ytb_tg_backup.source_filter import SOURCE_FILTER_STATE_KEY
-from ytb_tg_backup.store import LEGACY_SCHEMA, Store, now_iso
+from ytb_tg_backup.store import Store, now_iso
+
+
+LEGACY_SCHEMA = """
+PRAGMA journal_mode=WAL;
+
+CREATE TABLE IF NOT EXISTS videos (
+  video_id TEXT PRIMARY KEY,
+  feed_id TEXT NOT NULL,
+  feed_name TEXT NOT NULL,
+  title TEXT NOT NULL,
+  url TEXT NOT NULL,
+  published_at TEXT,
+  updated_at TEXT,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_retry_at TEXT,
+  file_path TEXT,
+  file_size INTEGER,
+  telegram_message_id INTEGER,
+  last_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  routes_json TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  created_by TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bot_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+"""
+
+
+def queue_delivery(store: Store, media_id: int, destination_key: str) -> int:
+    job_id = store._ensure_job(
+        media_id,
+        "telegram_delivery",
+        destination_key,
+        max_failures=5,
+        payload={"destination_key": destination_key},
+    )
+    store.conn.commit()
+    return job_id
 
 
 def candidate(
@@ -312,121 +364,6 @@ class StoreV2Test(unittest.TestCase):
             refreshed = store.get_panel_snapshot("sleep")
             self.assertEqual(refreshed["source_filter_pattern"], "sleep")
 
-    def test_control_origin_management_cannot_mutate_config_origins(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp) / "state.db")
-            store.initialize()
-            store.upsert_origin(Origin("config-yt", "youtube", "uploads", "Config", "UC-config"))
-            twitch = Origin(
-                "db:twitch:vods:example",
-                "twitch",
-                "vods",
-                "Example",
-                "example",
-            )
-
-            self.assertTrue(store.upsert_control_origin(twitch, created_by="123"))
-            self.assertFalse(store.upsert_control_origin(twitch, created_by="123"))
-            rows = {str(row["id"]): row for row in store.list_origin_statuses()}
-            self.assertEqual(rows[twitch.id]["managed_by"], "control")
-            self.assertEqual(rows["config-yt"]["managed_by"], "config")
-
-            self.assertTrue(store.set_control_origin_enabled(twitch.id, False))
-            self.assertFalse(store.set_control_origin_enabled("config-yt", False))
-            self.assertFalse(
-                bool(store.conn.execute("SELECT enabled FROM origins WHERE id=?", (twitch.id,)).fetchone()[0])
-            )
-            self.assertFalse(store.delete_control_origin("config-yt"))
-            self.assertTrue(store.delete_control_origin(twitch.id))
-            self.assertIsNotNone(store.conn.execute("SELECT 1 FROM origins WHERE id='config-yt'").fetchone())
-
-    def test_control_twitch_recording_mode_preserves_options_and_invalidates_poll_state(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp) / "state.db")
-            store.initialize()
-            twitch = Origin(
-                "db:twitch:vods:example",
-                "twitch",
-                "vods",
-                "Example",
-                "example",
-                options={
-                    "created_from": "telegram_panel",
-                    "language": "ja",
-                    "recording_mode": "vod",
-                },
-            )
-            store.upsert_control_origin(twitch, created_by="123")
-            store.record_origin_poll_success(
-                twitch.id,
-                cursor='{"external_id":"old-vod"}',
-            )
-            store.get_panel_snapshot(None, force=True)
-
-            self.assertTrue(
-                store.set_control_twitch_recording_mode(twitch.id, "live")
-            )
-
-            row = store.conn.execute(
-                "SELECT options_json FROM origins WHERE id=?",
-                (twitch.id,),
-            ).fetchone()
-            options = json.loads(str(row["options_json"]))
-            self.assertEqual(
-                options,
-                {
-                    "created_from": "telegram_panel",
-                    "language": "ja",
-                    "recording_mode": "live",
-                },
-            )
-            self.assertIsNone(store.get_origin_checkpoint(twitch.id))
-            self.assertEqual(
-                store.conn.execute(
-                    "SELECT dirty FROM panel_snapshots WHERE cache_key='global'"
-                ).fetchone()["dirty"],
-                1,
-            )
-            snapshot = store.get_panel_snapshot(None)
-            twitch_snapshot = next(
-                origin
-                for origin in snapshot["origins"]
-                if origin["id"] == twitch.id
-            )
-            self.assertEqual(twitch_snapshot["recording_mode"], "live")
-
-            config_twitch = Origin(
-                "config-twitch",
-                "twitch",
-                "vods",
-                "Config Twitch",
-                "config",
-            )
-            highlight = Origin(
-                "db:twitch:highlights:example",
-                "twitch",
-                "highlights",
-                "Highlights",
-                "example",
-            )
-            store.upsert_origin(config_twitch)
-            store.upsert_control_origin(highlight, created_by="123")
-            self.assertFalse(
-                store.set_control_twitch_recording_mode(
-                    config_twitch.id,
-                    "live",
-                )
-            )
-            self.assertFalse(
-                store.set_control_twitch_recording_mode(
-                    highlight.id,
-                    "live",
-                )
-            )
-            with self.assertRaisesRegex(ValueError, "recording_mode"):
-                store.set_control_twitch_recording_mode(twitch.id, "archive")
-            store.close()
-
     def test_provider_namespace_and_many_origin_relationships(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.db")
@@ -633,7 +570,7 @@ class StoreV2Test(unittest.TestCase):
             path = Path(tmp) / "abc.m4a"
             path.write_bytes(b"audio")
             store.complete_download(download, path=path, size_bytes=5)
-            store.ensure_delivery_job(media_id, "telegram:@archive")
+            queue_delivery(store, media_id, "telegram:@archive")
             delivery = store.claim_next_job(("telegram_delivery",), owner="worker", lease_seconds=60)
             store.mark_delivery_sending(delivery)
             expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
@@ -655,7 +592,7 @@ class StoreV2Test(unittest.TestCase):
             path = Path(tmp) / "abc.m4a"
             path.write_bytes(b"audio")
             artifact_id = store.complete_download(download, path=path, size_bytes=5)
-            store.ensure_delivery_job(media_id, "telegram:@archive")
+            queue_delivery(store, media_id, "telegram:@archive")
             delivery = store.claim_next_job(
                 ("telegram_delivery",), owner="worker", lease_seconds=60
             )
@@ -733,7 +670,7 @@ class StoreV2Test(unittest.TestCase):
             store.initialize()
             store.upsert_origin(Origin("yt", "youtube", "uploads", "YT", "UC-1"))
             media_id, _ = store.upsert_discovered("yt", candidate("youtube", "abc"))
-            store.ensure_delivery_job(media_id, "telegram:@archive")
+            queue_delivery(store, media_id, "telegram:@archive")
             delivery = store.claim_next_job(
                 ("telegram_delivery",), owner="worker", lease_seconds=60
             )
@@ -772,7 +709,7 @@ class StoreV2Test(unittest.TestCase):
             store.initialize()
             store.upsert_origin(Origin("yt", "youtube", "uploads", "YT", "UC-1"))
             media_id, _ = store.upsert_discovered("yt", candidate("youtube", "abc"))
-            store.ensure_delivery_job(media_id, "telegram:@archive")
+            queue_delivery(store, media_id, "telegram:@archive")
             delivery = store.claim_next_job(("telegram_delivery",), owner="worker", lease_seconds=60)
             expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
             store.conn.execute("UPDATE jobs SET lease_until=? WHERE id=?", (expired, delivery.id))
@@ -846,7 +783,8 @@ class StoreV2Test(unittest.TestCase):
                 ],
             )
 
-            extra_job_id = store.ensure_delivery_job(
+            extra_job_id = queue_delivery(
+                store,
                 old_media_id,
                 "telegram:@extra",
             )
@@ -1234,7 +1172,7 @@ class StoreV2Test(unittest.TestCase):
 
             def add_job_after_copy(*args, **kwargs):
                 copied = original_copy(*args, **kwargs)
-                store.ensure_delivery_job(media_id, "telegram:@new")
+                queue_delivery(store, media_id, "telegram:@new")
                 return copied
 
             with mock.patch.object(
@@ -1640,7 +1578,8 @@ class StoreV2Test(unittest.TestCase):
                 ],
             )
 
-            extra_job_id = store.ensure_delivery_job(
+            extra_job_id = queue_delivery(
+                store,
                 delivered_media_id,
                 "telegram:@extra",
             )
@@ -1705,7 +1644,8 @@ class StoreV2Test(unittest.TestCase):
                 "UPDATE artifacts SET created_at=?, updated_at=? WHERE id=?",
                 (old_merge, old_merge, master_id),
             )
-            delivery_job_id = store.ensure_delivery_job(
+            delivery_job_id = queue_delivery(
+                store,
                 media_id,
                 "telegram:@archive",
             )
@@ -2269,7 +2209,7 @@ class StoreV2Test(unittest.TestCase):
             original_purge = Store._purge_reserved_files
 
             def queue_delivery_after_reservation(active_store: Store, **kwargs):
-                contender.ensure_delivery_job(media_id, "telegram:@new")
+                queue_delivery(contender, media_id, "telegram:@new")
                 return original_purge(active_store, **kwargs)
 
             try:
@@ -3859,7 +3799,7 @@ class StoreV2Test(unittest.TestCase):
             original_purge = Store._purge_reserved_files
 
             def add_job_after_reservation(active_store: Store, **kwargs):
-                second.ensure_delivery_job(media_id, "telegram:@late")
+                queue_delivery(second, media_id, "telegram:@late")
                 return original_purge(active_store, **kwargs)
 
             with mock.patch.object(
@@ -3973,7 +3913,7 @@ class StoreV2Test(unittest.TestCase):
                 destination_key="telegram:@archive",
                 remote_id="100",
             )
-            store.ensure_delivery_job(youtube_id, "telegram:@other")
+            queue_delivery(store, youtube_id, "telegram:@other")
 
             twitch_path = twitch_dir / "second.m4a"
             twitch_path.write_bytes(b"two-two")
@@ -4097,7 +4037,7 @@ class StoreV2Test(unittest.TestCase):
                 path=path,
                 size_bytes=5,
             )
-            store.ensure_delivery_job(media_id, "telegram:@archive")
+            queue_delivery(store, media_id, "telegram:@archive")
             delivery = store.claim_next_job(
                 ("telegram_delivery",),
                 owner="delivery",
@@ -5318,25 +5258,6 @@ class StoreV2Test(unittest.TestCase):
                 backup.close()
             store.initialize()
             self.assertEqual(list(tmp_path.glob("state.db.bak-v1-*")), backups_before)
-
-    def test_removed_config_origins_are_disabled_without_touching_control_origins(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp) / "state.db")
-            store.initialize()
-            store.upsert_origin(Origin("keep", "youtube", "uploads", "Keep", "UC-keep"))
-            store.upsert_origin(Origin("removed", "youtube", "uploads", "Removed", "UC-removed"))
-            store.upsert_origin(
-                Origin("db:dynamic", "youtube", "uploads", "Dynamic", "UC-dynamic"),
-                managed_by="control",
-            )
-
-            store.disable_missing_config_origins({"keep"})
-
-            states = {
-                row["id"]: bool(row["enabled"])
-                for row in store.conn.execute("SELECT id, enabled FROM origins")
-            }
-            self.assertEqual(states, {"keep": True, "removed": False, "db:dynamic": True})
 
     def test_origin_source_identity_is_immutable(self):
         with tempfile.TemporaryDirectory() as tmp:

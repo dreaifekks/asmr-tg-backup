@@ -802,11 +802,6 @@ class TwitchLiveServiceTest(unittest.TestCase):
                     "initialize",
                     side_effect=AssertionError("heartbeat must not initialize Store"),
                 ) as initialize,
-                mock.patch.object(
-                    Store,
-                    "renew_lease",
-                    side_effect=AssertionError("heartbeat must use lightweight SQL"),
-                ) as renew_lease,
             ):
                 self.assertTrue(heartbeat.start())
                 heartbeat.stop()
@@ -818,7 +813,6 @@ class TwitchLiveServiceTest(unittest.TestCase):
             self.assertGreater(lease_after, lease_before)
             self.assertFalse(heartbeat.lost_event.is_set())
             initialize.assert_not_called()
-            renew_lease.assert_not_called()
             service.store.close()
 
     def test_lease_heartbeat_returns_false_when_sqlite_cannot_open(self):

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import errno
 import hashlib
@@ -12,54 +11,11 @@ import sqlite3
 import stat
 import uuid
 
-from .feed import FeedEntry
 from .models import ClaimedJob, MediaCandidate, Origin
 
 
 StorageRoots = Path | Sequence[Path]
 
-
-LEGACY_SCHEMA = """
-PRAGMA journal_mode=WAL;
-
-CREATE TABLE IF NOT EXISTS videos (
-  video_id TEXT PRIMARY KEY,
-  feed_id TEXT NOT NULL,
-  feed_name TEXT NOT NULL,
-  title TEXT NOT NULL,
-  url TEXT NOT NULL,
-  published_at TEXT,
-  updated_at TEXT,
-  first_seen_at TEXT NOT NULL,
-  last_seen_at TEXT NOT NULL,
-  status TEXT NOT NULL,
-  attempts INTEGER NOT NULL DEFAULT 0,
-  next_retry_at TEXT,
-  file_path TEXT,
-  file_size INTEGER,
-  telegram_message_id INTEGER,
-  last_error TEXT
-);
-
-CREATE TABLE IF NOT EXISTS subscriptions (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  channel_id TEXT NOT NULL,
-  routes_json TEXT NOT NULL,
-  enabled INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL,
-  created_by TEXT,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS bot_state (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-"""
-
-# Kept as a compatibility alias for migration fixtures and external imports.
-SCHEMA = LEGACY_SCHEMA
 
 V2_SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -420,15 +376,6 @@ media_groups AS (
 DELIVERY_PROCESS_RETENTION_SOURCE = "delivery_process_retention"
 LIVE_PROCESS_ARTIFACT_ROLES = frozenset({"live_segment"})
 DELIVERY_PROCESS_ARTIFACT_ROLES = frozenset({"telegram_upload"})
-
-
-@dataclass(frozen=True)
-class Subscription:
-    id: str
-    name: str
-    channel_id: str
-    routes: list[str]
-    enabled: bool
 
 
 class Store:
@@ -955,94 +902,6 @@ class Store:
                 """
             )
         )
-
-    def upsert_control_origin(
-        self,
-        origin: Origin,
-        *,
-        created_by: str | None,
-        max_failures: int = 5,
-    ) -> bool:
-        existing = self.conn.execute(
-            "SELECT managed_by FROM origins WHERE id=?",
-            (origin.id,),
-        ).fetchone()
-        if existing is not None and str(existing["managed_by"]) != "control":
-            raise ValueError(f"origin {origin.id!r} is managed by config and cannot be changed from Telegram")
-        self.upsert_origin(
-            origin,
-            managed_by="control",
-            created_by=created_by,
-            max_failures=max_failures,
-        )
-        return existing is None
-
-    def set_control_origin_enabled(self, origin_id: str, enabled: bool) -> bool:
-        cursor = self.conn.execute(
-            """
-            UPDATE origins SET enabled=?, updated_at=?
-            WHERE id=? AND managed_by='control'
-            """,
-            (int(enabled), now_iso(), origin_id),
-        )
-        self.conn.commit()
-        return cursor.rowcount == 1
-
-    def set_control_twitch_recording_mode(
-        self,
-        origin_id: str,
-        recording_mode: str,
-    ) -> bool:
-        mode = recording_mode.lower().strip()
-        if mode not in {"vod", "live"}:
-            raise ValueError("recording_mode must be 'vod' or 'live'")
-        row = self.conn.execute(
-            """
-            SELECT options_json
-            FROM origins
-            WHERE id=? AND managed_by='control'
-              AND provider='twitch' AND kind='vods'
-            """,
-            (origin_id,),
-        ).fetchone()
-        if row is None:
-            return False
-        try:
-            options = json.loads(str(row["options_json"] or "{}"))
-        except json.JSONDecodeError as exc:
-            raise ValueError("origin options_json is invalid") from exc
-        if not isinstance(options, dict):
-            raise ValueError("origin options_json must be an object")
-        options["recording_mode"] = mode
-        now = now_iso()
-        self.conn.execute(
-            """
-            UPDATE origins SET options_json=?, updated_at=?
-            WHERE id=? AND managed_by='control'
-              AND provider='twitch' AND kind='vods'
-            """,
-            (
-                json.dumps(options, ensure_ascii=False, sort_keys=True),
-                now,
-                origin_id,
-            ),
-        )
-        # Make the new mode eligible for polling as soon as its worker wakes.
-        # The service's mode reconciliation also updates its durable marker.
-        self.conn.execute(
-            "DELETE FROM origin_poll_state WHERE origin_id=?",
-            (origin_id,),
-        )
-        self.conn.commit()
-        return True
-
-    def delete_control_origin(self, origin_id: str) -> bool:
-        cursor = self.conn.execute(
-            "DELETE FROM origins WHERE id=? AND managed_by='control'",
-            (origin_id,),
-        )
-        self.conn.commit()
-        return cursor.rowcount == 1
 
     def counts_by_provider(self) -> dict[str, int]:
         return {
@@ -3624,21 +3483,6 @@ class Store:
             self.conn.rollback()
             raise
 
-    def disable_missing_config_origins(self, configured_ids: set[str]) -> int:
-        if configured_ids:
-            placeholders = ",".join("?" for _ in configured_ids)
-            cursor = self.conn.execute(
-                f"UPDATE origins SET enabled=0, updated_at=? WHERE managed_by='config' AND id NOT IN ({placeholders})",
-                (now_iso(), *sorted(configured_ids)),
-            )
-        else:
-            cursor = self.conn.execute(
-                "UPDATE origins SET enabled=0, updated_at=? WHERE managed_by='config' AND enabled!=0",
-                (now_iso(),),
-            )
-        self.conn.commit()
-        return cursor.rowcount
-
     def delete_origin(self, origin_id: str) -> bool:
         cursor = self.conn.execute("DELETE FROM origins WHERE id = ?", (origin_id,))
         self.conn.commit()
@@ -3913,17 +3757,6 @@ class Store:
                 "artifact path is reserved for transfer to the archive directory"
             )
 
-    def ensure_delivery_job(self, media_id: int, destination_key: str, *, max_failures: int = 5) -> int:
-        job_id = self._ensure_job(
-            media_id,
-            "telegram_delivery",
-            destination_key,
-            max_failures=max_failures,
-            payload={"destination_key": destination_key},
-        )
-        self.conn.commit()
-        return job_id
-
     def ensure_delivery_jobs_for_ready_artifacts(self, destination_key: str, *, max_failures: int = 5) -> int:
         media_rows = self.conn.execute(
             """
@@ -4044,17 +3877,6 @@ class Store:
         except Exception:
             self.conn.rollback()
             raise
-
-    def renew_lease(self, job: ClaimedJob, lease_seconds: int) -> bool:
-        cursor = self.conn.execute(
-            """
-            UPDATE jobs SET lease_until=?, updated_at=?
-            WHERE id=? AND state='running' AND lease_token=?
-            """,
-            (future_iso(lease_seconds), now_iso(), job.id, job.lease_token),
-        )
-        self.conn.commit()
-        return cursor.rowcount == 1
 
     def defer_job(self, job: ClaimedJob, *, reason_code: str, error: str, retry_seconds: int) -> None:
         self._finish_running_job(
@@ -5410,28 +5232,6 @@ class Store:
     # ------------------------------------------------------------------
     # Compatibility API for the existing CLI/control surface
 
-    def has_entries_for_feed(self, feed_id: str) -> bool:
-        return self.origin_has_items(feed_id)
-
-    def upsert_entry(self, entry: FeedEntry, *, status: str = "seen", last_error: str | None = None) -> bool:
-        self._ensure_legacy_origin(entry.feed_id, entry.feed_name)
-        _, created = self.upsert_discovered(
-            entry.feed_id,
-            MediaCandidate(
-                provider="youtube",
-                content_kind="video",
-                external_id=entry.video_id,
-                title=entry.title,
-                url=entry.url,
-                published_at=entry.published_at,
-                updated_at=entry.updated_at,
-            ),
-            disposition="ignored" if status == "ignored" else "eligible",
-            decision_code="legacy_status" if status == "ignored" else None,
-            decision_reason=last_error,
-        )
-        return created
-
     def enqueue_manual(self, url: str, feed_id: str = "manual", feed_name: str = "Manual", title: str | None = None) -> str:
         from .feed import extract_video_id
 
@@ -5470,143 +5270,6 @@ class Store:
             max_failures=max_failures, preserve_existing=True,
         )
         return media_id
-
-    def upsert_subscription(
-        self,
-        *,
-        sub_id: str,
-        name: str,
-        channel_id: str,
-        routes: list[str],
-        created_by: str | None,
-    ) -> bool:
-        origin_id = f"db:{sub_id}"
-        created = self.conn.execute("SELECT 1 FROM origins WHERE id=?", (origin_id,)).fetchone() is None
-        clean_routes = [route.strip("/") for route in routes if route.strip("/")] or ["live"]
-        self.upsert_origin(
-            Origin(
-                id=origin_id,
-                provider="youtube",
-                kind="uploads",
-                external_id=channel_id,
-                name=name,
-                enabled=True,
-                options={"routes": clean_routes, "subscription_id": sub_id},
-            ),
-            managed_by="control",
-            created_by=created_by,
-        )
-        return created
-
-    def delete_subscription(self, sub_id: str) -> bool:
-        return self.delete_origin(f"db:{sub_id}")
-
-    def list_subscriptions(self) -> list[Subscription]:
-        rows = self.conn.execute(
-            "SELECT * FROM origins WHERE managed_by='control' AND provider='youtube' ORDER BY id"
-        ).fetchall()
-        result = []
-        for row in rows:
-            options = json.loads(str(row["options_json"] or "{}"))
-            result.append(
-                Subscription(
-                    id=str(options.get("subscription_id") or str(row["id"]).removeprefix("db:")),
-                    name=str(row["name"]),
-                    channel_id=str(row["external_id"]),
-                    routes=[str(route) for route in options.get("routes", ["live"])],
-                    enabled=bool(row["enabled"]),
-                )
-            )
-        return result
-
-    def list_pending(self, limit: int, max_attempts: int, include_downloaded: bool) -> list[sqlite3.Row]:
-        statuses = ["seen", "waiting_ready", "failed"]
-        if include_downloaded:
-            statuses.append("downloaded")
-        placeholders = ",".join("?" for _ in statuses)
-        return list(
-            self.conn.execute(
-                f"SELECT * FROM ({self._legacy_status_query()}) WHERE status IN ({placeholders}) LIMIT ?",
-                (*statuses, limit),
-            )
-        )
-
-    def begin_download(self, video_id: str) -> None:
-        media_id = self._youtube_media_id(video_id)
-        if media_id is None:
-            return
-        now = now_iso()
-        self._ensure_job(media_id, "download", "", max_failures=5)
-        self.conn.execute(
-            "UPDATE jobs SET state='running', failure_count=failure_count+1, lease_owner='legacy', lease_token='legacy', lease_until=?, updated_at=? WHERE media_id=? AND job_type='download'",
-            (future_iso(900), now, media_id),
-        )
-        self.conn.commit()
-
-    def mark_waiting(self, video_id: str, reason: str, retry_seconds: int) -> None:
-        self._legacy_set_job(video_id, "download", "retry", reason, retry_seconds, "not_ready")
-
-    def update_title(self, video_id: str, title: str | None) -> None:
-        if title:
-            self.conn.execute(
-                "UPDATE media_items SET title=? WHERE provider='youtube' AND external_id=?",
-                (title, video_id),
-            )
-            self.conn.commit()
-
-    def mark_failed(self, video_id: str, error: str, retry_seconds: int) -> None:
-        media_id = self._youtube_media_id(video_id)
-        if media_id is None:
-            return
-        if self.get_artifact(media_id) is not None:
-            self._legacy_set_job(video_id, "telegram_delivery", "retry", error, retry_seconds, "delivery_failed")
-        else:
-            self._legacy_set_job(video_id, "download", "retry", error, retry_seconds, "download_failed")
-
-    def mark_blocked(self, video_id: str, error: str) -> None:
-        media_id = self._youtube_media_id(video_id)
-        job_type = "telegram_delivery" if media_id and self.get_artifact(media_id) is not None else "download"
-        self._legacy_set_job(video_id, job_type, "blocked", error, 0, "blocked")
-
-    def mark_ignored(self, video_id: str, reason: str) -> None:
-        media_id = self._youtube_media_id(video_id)
-        if media_id is None:
-            return
-        self.conn.execute(
-            "UPDATE origin_items SET disposition='ignored', decision_code='source_filter', decision_reason=? WHERE media_id=?",
-            (reason, media_id),
-        )
-        self.conn.execute("DELETE FROM jobs WHERE media_id=? AND job_type='download' AND state!='succeeded'", (media_id,))
-        self.conn.commit()
-
-    def mark_downloaded(self, video_id: str, file_path: Path, file_size: int) -> None:
-        media_id = self._youtube_media_id(video_id)
-        if media_id is None:
-            return
-        self.record_artifact(media_id, role="master", path=file_path, size_bytes=file_size)
-        self.conn.execute(
-            "UPDATE jobs SET state='succeeded', last_error=NULL, reason_code=NULL, lease_owner=NULL, lease_token=NULL, lease_until=NULL, finished_at=?, updated_at=? WHERE media_id=? AND job_type='download'",
-            (now_iso(), now_iso(), media_id),
-        )
-        self.conn.commit()
-
-    def mark_uploaded(self, video_id: str, message_id: int) -> None:
-        media_id = self._youtube_media_id(video_id)
-        if media_id is None:
-            return
-        artifact = self.get_artifact(media_id)
-        if artifact is None:
-            return
-        now = now_iso()
-        self.conn.execute(
-            "INSERT OR REPLACE INTO deliveries(media_id, artifact_id, sink, destination_key, remote_id, delivered_at) VALUES (?, ?, 'telegram', 'telegram:legacy', ?, ?)",
-            (media_id, int(artifact["id"]), str(message_id), now),
-        )
-        self.conn.execute(
-            "UPDATE jobs SET state='succeeded', finished_at=?, updated_at=?, last_error=NULL WHERE media_id=? AND job_type='telegram_delivery'",
-            (now, now, media_id),
-        )
-        self.conn.commit()
 
     def list_recent(self, limit: int = 20) -> list[sqlite3.Row]:
         return list(self.conn.execute(f"SELECT * FROM ({self._legacy_status_query()}) LIMIT ?", (limit,)))
@@ -5812,37 +5475,6 @@ class Store:
             ),
             managed_by="legacy",
         )
-
-    def _youtube_media_id(self, external_id: str) -> int | None:
-        row = self.conn.execute(
-            "SELECT id FROM media_items WHERE provider='youtube' AND external_id=? ORDER BY id LIMIT 1",
-            (external_id,),
-        ).fetchone()
-        return int(row["id"]) if row else None
-
-    def _legacy_set_job(
-        self,
-        video_id: str,
-        job_type: str,
-        state: str,
-        error: str,
-        retry_seconds: int,
-        reason_code: str,
-    ) -> None:
-        media_id = self._youtube_media_id(video_id)
-        if media_id is None:
-            return
-        target = "telegram:legacy" if job_type == "telegram_delivery" else ""
-        self._ensure_job(media_id, job_type, target, max_failures=5)
-        self.conn.execute(
-            """
-            UPDATE jobs SET state=?, available_at=?, reason_code=?, last_error=?,
-              lease_owner=NULL, lease_token=NULL, lease_until=NULL, updated_at=?
-            WHERE media_id=? AND job_type=? AND target_key=?
-            """,
-            (state, future_iso(retry_seconds), reason_code, error, now_iso(), media_id, job_type, target),
-        )
-        self.conn.commit()
 
     def _legacy_status_query(self) -> str:
         return """
