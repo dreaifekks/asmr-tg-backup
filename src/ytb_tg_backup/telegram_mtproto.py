@@ -56,7 +56,6 @@ def _load_telethon() -> _TelethonBindings:
         raise TelegramUploadError(
             "Telethon is required for telegram.upload_transport=mtproto",
             code="dependency_missing",
-            fallback_safe=True,
             transport="mtproto",
         ) from exc
     return _TelethonBindings(
@@ -223,7 +222,6 @@ class MtprotoTransport(TelegramTransport):
                     f"Telegram MTProto upload timed out after {int(timeout)} seconds",
                     code="timeout",
                     uncertain=False,
-                    fallback_safe=True,
                 ) from exc
             except Exception as exc:
                 raise self._translate_error(exc, commit_started=False) from exc
@@ -246,7 +244,6 @@ class MtprotoTransport(TelegramTransport):
                     f"Telegram MTProto upload timed out after {int(timeout)} seconds",
                     code="timeout",
                     uncertain=True,
-                    fallback_safe=False,
                 ) from exc
             except Exception as exc:
                 raise self._translate_error(exc, commit_started=True) from exc
@@ -310,7 +307,6 @@ class MtprotoTransport(TelegramTransport):
                 "Telegram MTProto reported success without a valid message id",
                 code="invalid_response",
                 uncertain=True,
-                fallback_safe=False,
             ) from exc
 
     async def _ensure_client(self) -> Any:
@@ -370,7 +366,6 @@ class MtprotoTransport(TelegramTransport):
                         "Telegram MTProto session belongs to a different bot; remove the "
                         "session file or restore the matching bot token",
                         code="session_identity_mismatch",
-                        fallback_safe=True,
                     )
             except BaseException as exc:
                 try:
@@ -586,7 +581,6 @@ class MtprotoTransport(TelegramTransport):
                 f"Telegram MTProto rate limited the upload for {retry_after} seconds",
                 code="flood_wait",
                 uncertain=False,
-                fallback_safe=False,
                 retry_after=retry_after,
             )
         if isinstance(exc, bindings.rpc_error):
@@ -594,13 +588,11 @@ class MtprotoTransport(TelegramTransport):
                 f"Telegram MTProto rejected the upload: {self._redact(str(exc))[:500]}",
                 code=_rpc_error_code(exc),
                 uncertain=False,
-                fallback_safe=not commit_started,
             )
         return self._error(
             f"Telegram MTProto upload failed: {self._redact(str(exc))[:500]}",
             code="transport_error",
             uncertain=commit_started,
-            fallback_safe=not commit_started,
         )
 
     def _error(
@@ -609,14 +601,12 @@ class MtprotoTransport(TelegramTransport):
         *,
         code: str,
         uncertain: bool = False,
-        fallback_safe: bool | None = None,
         retry_after: int | None = None,
     ) -> TelegramUploadError:
         return TelegramUploadError(
             message,
             code=code,
             uncertain=uncertain,
-            fallback_safe=fallback_safe,
             retry_after=retry_after,
             transport=self.transport_name,
         )

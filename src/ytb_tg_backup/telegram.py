@@ -153,7 +153,6 @@ class TelegramUploader:
                 "Telegram reported success without a valid message_id",
                 code="invalid_response",
                 uncertain=True,
-                fallback_safe=False,
             ) from exc
 
     def _upload_media_group(
@@ -268,14 +267,12 @@ class TelegramUploader:
                 "Telegram reported media-group success without valid message_ids",
                 code="invalid_response",
                 uncertain=True,
-                fallback_safe=False,
             ) from exc
         if len(message_ids) != total:
             raise self._error(
                 "Telegram returned an incomplete media-group result",
                 code="invalid_response",
                 uncertain=True,
-                fallback_safe=False,
             )
         return message_ids
 
@@ -312,7 +309,6 @@ class TelegramUploader:
                 f"Telegram upload timed out after {upload_timeout_seconds} seconds",
                 code="timeout",
                 uncertain=True,
-                fallback_safe=False,
             ) from None
         except subprocess.CalledProcessError as exc:
             response_body, http_status = _split_curl_output(exc.stdout or exc.output or "")
@@ -324,7 +320,6 @@ class TelegramUploader:
                 f"Telegram upload command failed with exit code {exc.returncode}{suffix}",
                 code=f"http_{http_status}" if http_status is not None else "transport_error",
                 uncertain=ambiguous_http or exc.returncode not in {3, 5, 6, 7, 22, 60, 77},
-                fallback_safe=False,
                 retry_after=retry_after,
             ) from None
         response_body, _ = _split_curl_output(completed.stdout)
@@ -336,14 +331,12 @@ class TelegramUploader:
                 f"Telegram returned non-JSON response: {response}",
                 code="invalid_response",
                 uncertain=True,
-                fallback_safe=False,
             ) from exc
         if not isinstance(payload, dict):
             raise self._error(
                 "Telegram returned a non-object response",
                 code="invalid_response",
                 uncertain=True,
-                fallback_safe=False,
             )
         if not payload.get("ok"):
             error_payload = _redact_bot_token(str(payload), self.config.bot_token)
@@ -351,7 +344,6 @@ class TelegramUploader:
             raise self._error(
                 f"Telegram upload failed: {error_payload}",
                 code=f"http_{error_code}" if isinstance(error_code, int) else "api_error",
-                fallback_safe=False,
                 retry_after=_bot_api_retry_after(payload),
             )
         return payload
@@ -394,14 +386,12 @@ class TelegramUploader:
         *,
         code: str,
         uncertain: bool = False,
-        fallback_safe: bool | None = None,
         retry_after: int | None = None,
     ) -> TelegramUploadError:
         return TelegramUploadError(
             message,
             code=code,
             uncertain=uncertain,
-            fallback_safe=fallback_safe,
             retry_after=retry_after,
             transport=self.transport_name,
         )
@@ -565,6 +555,5 @@ def create_telegram_transport(
     raise TelegramUploadError(
         f"unsupported telegram.upload_transport: {value}",
         code="configuration",
-        fallback_safe=True,
         transport=transport or None,
     )

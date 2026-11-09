@@ -456,10 +456,10 @@ class MtprotoTransportTest(unittest.TestCase):
 
     def test_precommit_and_postcommit_errors_expose_retry_safety(self):
         cases = (
-            ("upload", False, True, 0),
-            ("send", True, False, 1),
+            ("upload", False, 0),
+            ("send", True, 1),
         )
-        for failure_stage, uncertain, fallback_safe, callback_count in cases:
+        for failure_stage, uncertain, callback_count in cases:
             with self.subTest(failure_stage=failure_stage):
                 events: list[object] = []
                 clients: list[_FakeTelethonClient] = []
@@ -510,7 +510,6 @@ class MtprotoTransportTest(unittest.TestCase):
                 self.assertEqual(error.transport, "mtproto")
                 self.assertEqual(error.code, "transport_error")
                 self.assertEqual(error.uncertain, uncertain)
-                self.assertEqual(error.fallback_safe, fallback_safe)
                 self.assertEqual(len(callbacks), callback_count)
                 self.assertIn("<redacted>", str(error))
                 self.assertNotIn("test-api-hash", str(error))
@@ -552,7 +551,6 @@ class MtprotoTransportTest(unittest.TestCase):
         self.assertEqual(error.code, "flood_wait")
         self.assertEqual(error.retry_after, 23)
         self.assertFalse(error.uncertain)
-        self.assertFalse(error.fallback_safe)
 
     def test_stale_session_identity_is_rejected_before_upload(self):
         events: list[object] = []
@@ -593,7 +591,6 @@ class MtprotoTransportTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "session_identity_mismatch")
         self.assertFalse(raised.exception.uncertain)
-        self.assertTrue(raised.exception.fallback_safe)
         self.assertEqual(callbacks, [])
         event_names = [item[0] if isinstance(item, tuple) else item for item in events]
         self.assertNotIn("upload", event_names)
@@ -1192,7 +1189,6 @@ class TelegramCaptionTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, "http_429")
         self.assertEqual(raised.exception.retry_after, 17)
         self.assertFalse(raised.exception.uncertain)
-        self.assertFalse(raised.exception.fallback_safe)
 
     def test_upload_sanitizes_external_id_before_building_temp_path(self):
         captured: dict[str, Path] = {}

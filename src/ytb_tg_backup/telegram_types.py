@@ -18,14 +18,12 @@ class TelegramUploadError(RuntimeError):
         *,
         code: str = "telegram_error",
         uncertain: bool = False,
-        fallback_safe: bool | None = None,
         retry_after: int | None = None,
         transport: str | None = None,
     ):
         super().__init__(message)
         self.code = code
         self.uncertain = uncertain
-        self.fallback_safe = not uncertain if fallback_safe is None else fallback_safe
         self.retry_after = retry_after
         self.transport = transport
 
